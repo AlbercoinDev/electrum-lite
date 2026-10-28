@@ -88,6 +88,13 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:50001")]
         address: SocketAddr,
     },
+    /// Continuously display local synchronization and pruning status; Ctrl+C to stop.
+    Monitor {
+        #[arg(long, default_value = "127.0.0.1:50001")]
+        address: SocketAddr,
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
     /// Copy a closed matching archive/index generation into a NEW backup directory.
     Backup {
         #[arg(long)]
@@ -250,28 +257,51 @@ fn main() -> Result<()> {
                 .block_on(electrum_lite::electrum::serve(options))?;
         }
         Command::Health { address } => {
-            use std::io::{BufRead, Read, Write};
-            ensure!(
-                address.ip().is_loopback(),
-                "health endpoint must be loopback"
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&health(address, cli.network)?)?
             );
-            let mut stream =
-                std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))?;
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(90)))?;
-            stream.write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.health\",\"params\":[]}\n",
-            )?;
-            let mut line = String::new();
-            std::io::BufReader::new(stream)
-                .take(65536)
-                .read_line(&mut line)?;
-            let result: serde_json::Value = serde_json::from_str(&line)?;
-            ensure!(result.get("error").is_none(), "health request failed");
+        }
+        Command::Monitor { address, interval } => {
             ensure!(
-                result["result"]["network"] == cli.network.name(),
-                "health endpoint network mismatch"
+                (1..=3600).contains(&interval),
+                "interval must be between 1 and 3600 seconds"
             );
-            println!("{}", serde_json::to_string_pretty(&result["result"])?);
+            let mut previous: Option<(u64, std::time::Instant)> = None;
+            loop {
+                match health(address, cli.network) {
+                    Ok(value) => {
+                        let now = std::time::Instant::now();
+                        let height = value["indexed_tip"]["height"].as_u64();
+                        let speed = height.zip(previous).and_then(|(h, (old, time))| {
+                            h.checked_sub(old)
+                                .map(|delta| delta as f64 / now.duration_since(time).as_secs_f64())
+                        });
+                        if let Some(height) = height {
+                            previous = Some((height, now));
+                        }
+                        let lag = value["core_height"]
+                            .as_u64()
+                            .zip(height)
+                            .map(|(core, index)| core.saturating_sub(index));
+                        println!(
+                            "{}",
+                            json!({"observed_unix_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"status":value["status"],"ready":value["ready"],"indexed_tip":value["indexed_tip"],"core_height":value["core_height"],"core_tip":value["core_tip"],"core_observation_age_seconds":value["core_observation_age_seconds"],"blocks_behind_observed_core":lag,"blocks_per_second_since_last_sample":speed,"core_initialblockdownload":value["core_initialblockdownload"],"core_connections":value["core_connections"],"core_network_active":value["core_network_active"],"core_pruned":value["core_pruned"],"core_automatic_pruning":value["core_automatic_pruning"],"core_prune_height":value["core_prune_height"],"next_required_height":value["next_required_height"],"historical_blocks_missing":value["historical_blocks_missing"],"archive_bytes":value["archive_bytes"],"index_bytes":value["index_bytes"],"free_bytes":value["free_bytes"],"last_error":value["last_error"]})
+                        );
+                        if value["core_automatic_pruning"] == true {
+                            eprintln!("WARNING: Core automatic pruning can delete blocks before indexing; configure manual pruning and preserve history.");
+                        }
+                        if value["historical_blocks_missing"] == true {
+                            eprintln!("ERROR: required historical blocks are already pruned; restore trusted history. Do not delete index data.");
+                        }
+                    }
+                    Err(error) => {
+                        previous = None;
+                        eprintln!("Monitor: {error:#}; retrying");
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval));
+            }
         }
         Command::MigrateIndex { backup_dir } => {
             let archive = Archive::open(&cli.data_dir, cli.network, false)?;
@@ -438,6 +468,31 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn health(address: SocketAddr, chain: Chain) -> Result<serde_json::Value> {
+    use std::io::{BufRead, Read, Write};
+    ensure!(
+        address.ip().is_loopback(),
+        "health endpoint must be loopback"
+    );
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(90)))?;
+    stream.write_all(
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.health\",\"params\":[]}\n",
+    )?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .take(65536)
+        .read_line(&mut line)?;
+    let result: serde_json::Value = serde_json::from_str(&line)?;
+    ensure!(result.get("error").is_none(), "health request failed");
+    ensure!(
+        result["result"]["network"] == chain.name(),
+        "health endpoint network mismatch"
+    );
+    Ok(result["result"].clone())
 }
 
 fn core(chain: Chain, endpoint: Option<String>, cookie: PathBuf) -> Result<Core> {

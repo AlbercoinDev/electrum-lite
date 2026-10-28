@@ -110,6 +110,9 @@ def main():
                     try:
                         client = wait(lambda: Electrum(electrum_port), timeout=120)
                         wait(lambda: client.request("server.health")["ready"], timeout=120)
+                        health = client.request("server.health")
+                        assert health["core_pruned"] is True and health["core_automatic_pruning"] is False
+                        assert health["core_prune_height"] >= 10 and health["historical_blocks_missing"] is False
                         assert client.request("blockchain.transaction.get", [target_txid]) == target_raw
                         branch = client.request("blockchain.transaction.get_merkle", [target_txid, 10])
                         assert proof(target_txid, branch["merkle"], branch["pos"]) == expected_root

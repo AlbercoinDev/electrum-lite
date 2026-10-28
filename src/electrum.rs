@@ -138,6 +138,38 @@ struct State {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     core_info: Value,
     core_network: Value,
+    observed_at: Option<Instant>,
+    catching_up: bool,
+}
+
+// Only expose predefined diagnostics; underlying errors may include local paths or RPC data.
+fn diagnostic(error: &anyhow::Error) -> &'static str {
+    let details = format!("{error:#}");
+    if details.contains("historical blocks were already pruned") {
+        "required historical blocks are already pruned; restore trusted history"
+    } else if details.contains("free-space threshold") {
+        "free-space threshold reached"
+    } else if details.contains("mempool")
+        && (details.contains("budget") || details.contains("response exceeds"))
+    {
+        "mempool budget exceeded; increase limits only if resources permit"
+    } else if details.contains("mempool snapshot warming") {
+        "mempool snapshot warming; retrying"
+    } else if details.contains("reorg exceeds") || details.contains("undo") {
+        "reorg exceeds available undo; separate chain recovery required"
+    } else if details.contains("network mismatch") || details.contains("genesis mismatch") {
+        "Core network or genesis mismatch"
+    } else if details.contains("RPC cookie") {
+        "cannot read or validate Core RPC cookie"
+    } else if details.contains("RPC transport") {
+        "Core RPC unavailable; check endpoint and Core"
+    } else if details.contains("Core RPC failed") {
+        "Core RPC failed; check Core status and historical block availability"
+    } else if details.contains("Core changed") || details.contains("Core reorg") {
+        "Core chain changed during synchronization; retrying"
+    } else {
+        "synchronization or storage error; preserve data and check Core and disk"
+    }
 }
 
 impl State {
@@ -151,12 +183,15 @@ impl State {
             fs2::available_space(self.archive.directory())? >= self.options.min_free_bytes,
             "free-space threshold reached"
         );
+        self.core_info = self.options.core.verify(self.options.chain)?;
+        self.observed_at = Some(Instant::now());
+        self.core_network = self.options.core.call("getnetworkinfo", json!([]))?;
         if let Err(error) = sync::batch(
             &mut self.store,
             &mut self.archive,
             &self.options.core,
             self.options.chain,
-            200,
+            20,
             None,
             Some(&self.stop),
         ) {
@@ -165,9 +200,14 @@ impl State {
         }
         let info = self.options.core.verify(self.options.chain)?;
         self.core_info = info.clone();
+        self.observed_at = Some(Instant::now());
         self.core_info["mempool"] = self.options.core.call("getmempoolinfo", json!([]))?;
         self.core_network = self.options.core.call("getnetworkinfo", json!([]))?;
         let tip = self.store.stats()?.tip.context("index empty")?;
+        self.catching_up = info["blocks"]
+            .as_u64()
+            .is_some_and(|h| h > u64::from(tip.0));
+        self.last_error = None;
         if info["blocks"].as_u64() != Some(u64::from(tip.0))
             || info["initialblockdownload"] != false
         {
@@ -306,12 +346,27 @@ impl State {
             }
             "server.health" => {
                 let stats = self.store.stats()?;
+                let next = stats.tip.map_or(0, |(height, _)| u64::from(height) + 1);
+                let floor = self.core_info["pruneheight"].as_u64();
+                let missing = floor.is_some_and(|floor| next.max(1) < floor);
+                let status = if self.last_error.is_some() {
+                    "error"
+                } else if self.ready {
+                    "ready"
+                } else if self.catching_up {
+                    "indexing"
+                } else {
+                    "waiting_for_core_or_mempool"
+                };
                 return Ok(json!({
                     "version":env!("CARGO_PKG_VERSION"),"network":self.options.chain,
                     "ready":self.guard().is_ok(),
                     "indexed_tip":stats.tip.map(|(height,hash)|json!({"height":height,"hash":hash})),
                     "core_tip":self.core_info["bestblockhash"],"core_height":self.core_info["blocks"],
                     "core_initialblockdownload":self.core_info["initialblockdownload"],
+                    "core_pruned":self.core_info["pruned"],"core_automatic_pruning":self.core_info["automatic_pruning"],
+                    "core_prune_height":floor,"next_required_height":next,"historical_blocks_missing":missing,
+                    "core_observation_age_seconds":self.observed_at.map(|t|t.elapsed().as_secs()),"status":status,
                     "core_network_active":self.core_network["networkactive"],"core_connections":self.core_network["connections"],
                     "core_mempool_transactions":self.core_info["mempool"]["size"],"core_mempool_vbytes":self.core_info["mempool"]["bytes"],
                     "transactions":stats.transactions,"utxos":stats.utxos,"history_entries":stats.history,
@@ -822,6 +877,8 @@ pub async fn serve(options: Options) -> Result<()> {
             stop: worker_stop,
             core_info: Value::Null,
             core_network: Value::Null,
+            observed_at: None,
+            catching_up: false,
         };
         state.options.listen = listen;
         let _ = boot.send(());
@@ -832,13 +889,19 @@ pub async fn serve(options: Options) -> Result<()> {
                 break;
             }
             if updated.elapsed() >= period {
-                if state.refresh().is_err() {
+                if let Err(error) = state.refresh() {
                     state.ready = false;
-                    state.last_error=Some("synchronization/mempool reconciliation failed; verify Core, budgets and disk");
+                    state.catching_up = false;
+                    state.last_error = Some(diagnostic(&error));
                 }
                 updated = Instant::now();
             }
-            match rx.recv_timeout(period.saturating_sub(updated.elapsed())) {
+            let wait = if state.catching_up {
+                Duration::ZERO
+            } else {
+                period.saturating_sub(updated.elapsed())
+            };
+            match rx.recv_timeout(wait) {
                 Ok(Request::Call(method, params, reply)) => {
                     let _ = reply.send(state.call(&method, &params));
                 }
@@ -846,7 +909,11 @@ pub async fn serve(options: Options) -> Result<()> {
                     let _ = reply.send(state.snapshot(scripts));
                 }
                 Ok(Request::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if state.catching_up {
+                        updated = Instant::now() - period;
+                    }
+                }
             }
         }
         Ok(())
@@ -891,6 +958,18 @@ pub async fn serve(options: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_is_specific_without_leaking_error_details() {
+        let error = anyhow::anyhow!(
+            "required historical blocks were already pruned; restore trusted history"
+        );
+        assert!(diagnostic(&error).contains("already pruned"));
+        let secret = anyhow::anyhow!("sensitive-cookie-and-wallet-data");
+        assert!(!diagnostic(&secret).contains("sensitive"));
+        let error = anyhow::anyhow!("mempool byte budget exceeded");
+        assert!(diagnostic(&error).contains("mempool budget"));
+    }
 
     fn state(root: &std::path::Path) -> State {
         let chain = Chain::Regtest;
@@ -940,6 +1019,8 @@ mod tests {
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             core_info: Value::Null,
             core_network: Value::Null,
+            observed_at: None,
+            catching_up: false,
         }
     }
 

@@ -23,7 +23,7 @@ No hay GUI, servidor público, TLS nativo, telemetría ni dependencia de servido
 Para el paquete Linux x86-64 experimental (ejecutable e instalador sin sudo),
 consulta [instalación, conexión y uso](docs/install-linux.md). El paquete se
 adjunta a la [release existente](https://github.com/AlbercoinDev/electrum-lite/releases/tag/v0.0.1-beta.1),
-pero procede del commit `5145bd3` de main, **no del código del tag original**.
+pero cada paquete identifica su commit de main, **no el código del tag original**.
 El tag no se modifica. Para regenerarlo desde una
 compilación release verificada: `cargo fetch --locked` y
 `python3 scripts/package_linux.py` (Python 3.11+, salida en `dist/`, sin subir archivos).
@@ -125,6 +125,8 @@ En otra terminal:
 ```
 
 Comprueba `ready`, tip local/Core, IBD, conexiones/red activa, espacio, tamaños de archivo/base y presupuesto de mempool. `ready` significa coherencia con el **Core observado**, no conexión garantizada al resto de Bitcoin. Core sin pares o con red desactivada puede estar atrasado. Ctrl+C/SIGTERM detiene el servicio; no ejecuta poda automática.
+
+Para observar progreso continuamente: `./target/release/electrum-lite --network signet monitor --address 127.0.0.1:60601`. Emite JSON cada cinco segundos con velocidad entre muestras, retraso frente al Core observado, espacio y alertas de poda; `--interval` cambia el periodo. Las observaciones pueden quedar desactualizadas y no sustituyen una ventana de mantenimiento segura. No hay garantía medida de alcanzar a Core durante IBD.
 
 Para Sparrow, selecciona la misma red y **Private Electrum server**, host `127.0.0.1` y el puerto elegido. TCP sin SSL solo en loopback/túnel privado; nunca transportes abierto por Internet. La interfaz con Sparrow real sigue pendiente de validación aquí: no se ha instalado ni probado su GUI. Ver [perfil de protocolo y pruebas](docs/protocol.md).
 

@@ -85,6 +85,17 @@ def test_server(binary, root, cookie, core_port, rpc, address, historical_txid):
         try:
             client = wait(lambda: Electrum(port))
             wait(lambda: client.request("server.health")["ready"])
+            snapshot = client.request("server.health")
+            assert snapshot["status"] == "ready" and snapshot["historical_blocks_missing"] is False
+            assert isinstance(snapshot["core_pruned"], bool) and snapshot["core_observation_age_seconds"] is not None
+            monitor = subprocess.Popen([binary,"--network","regtest","monitor","--address",f"127.0.0.1:{port}","--interval","1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            try:
+                first = json.loads(monitor.stdout.readline())
+                second = json.loads(monitor.stdout.readline())
+                assert first["status"] == "ready" and second["blocks_per_second_since_last_sample"] == 0
+            finally:
+                monitor.terminate()
+                monitor.communicate(timeout=10)
             health = subprocess.run([binary,"--network","regtest","health","--address",f"127.0.0.1:{port}"],capture_output=True,text=True,timeout=90)
             assert health.returncode == 0 and json.loads(health.stdout)["ready"],health.stderr
             wrong = subprocess.run([binary,"--network","mainnet","health","--address",f"127.0.0.1:{port}"],capture_output=True,text=True,timeout=90)

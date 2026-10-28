@@ -1,6 +1,6 @@
 # Linux: instalación del ejecutable, conexión y uso
 
-Paquete experimental `0.0.1-beta.1`, compilado desde el commit `5145bd3` indicado
+Paquete experimental `0.0.1-beta.1`, compilado desde el commit indicado
 en `BUILD-INFO.txt`, no desde el código del tag original. Descárgalo junto con su
 checksum en https://github.com/AlbercoinDev/electrum-lite/releases/tag/v0.0.1-beta.1.
 El tag original no se modifica. Windows se prepara por separado.
@@ -20,9 +20,10 @@ El tag original no se modifica. Windows se prepara por separado.
 Desde el directorio que contiene el `.tar.gz` y su `.sha256`:
 
 ```sh
-sha256sum --check electrum-lite-0.0.1-beta.1-linux-x86_64-5145bd3.tar.gz.sha256
-tar -xzf electrum-lite-0.0.1-beta.1-linux-x86_64-5145bd3.tar.gz
-cd electrum-lite-0.0.1-beta.1-linux-x86_64-5145bd3
+PAQUETE="electrum-lite-0.0.1-beta.1-linux-x86_64-COMMIT.tar.gz" # Sustituye COMMIT por el del archivo descargado.
+sha256sum --check "$PAQUETE.sha256"
+tar -xzf "$PAQUETE"
+cd "${PAQUETE%.tar.gz}"
 sh ./install.sh
 "$HOME/.local/bin/electrum-lite" --version
 ```
@@ -89,6 +90,18 @@ Desde otra terminal:
 Espera `ready: true`. Revisa también IBD, altura Core/índice, pares, red activa y
 espacio. Si mempool excede los límites o falta histórico, no se sirven respuestas
 parciales. `ready` no garantiza por sí solo que Core esté conectado a pares.
+
+Para seguimiento continuo, abre otra terminal y ejecuta:
+
+```sh
+"$HOME/.local/bin/electrum-lite" --network signet monitor --address 127.0.0.1:60601
+```
+
+Produce una línea JSON cada cinco segundos; Ctrl+C detiene solo el monitor. La
+velocidad es la diferencia entre muestras, no una garantía ni una estimación de
+finalización. Las alturas de Core son observaciones con edad indicada, no un
+estado atómico global. Alerta si detecta poda automática o histórico faltante.
+Core con `prune=1` usa poda manual; no activa poda automática para ahorrar disco.
 
 ## 4. Conectar y usar una cartera
 
