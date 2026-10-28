@@ -1,5 +1,6 @@
 # Rust build artifacts (when implementation starts).
 /target/
+/dist/
 __pycache__/
 *.pyc
 

@@ -20,6 +20,14 @@ No hay GUI, servidor público, TLS nativo, telemetría ni dependencia de servido
 
 ## Instalar
 
+Para el paquete Linux x86-64 experimental (ejecutable e instalador sin sudo),
+consulta [instalación, conexión y uso](docs/install-linux.md). El paquete se
+adjunta a la [release existente](https://github.com/AlbercoinDev/electrum-lite/releases/tag/v0.0.1-beta.1),
+pero procede del commit `5145bd3` de main, **no del código del tag original**.
+El tag no se modifica. Para regenerarlo desde una
+compilación release verificada: `cargo fetch --locked` y
+`python3 scripts/package_linux.py` (Python 3.11+, salida en `dist/`, sin subir archivos).
+
 Entorno probado: **Linux x86-64, Rust 1.99.1 y Bitcoin Core 31.0**. No se exige AVX2. Otras plataformas/versiones no se han validado.
 
 En Debian/Ubuntu:
@@ -39,7 +47,7 @@ cargo build --release --locked
 ./target/release/electrum-lite --help
 ```
 
-Toolchain y dependencias quedan fijados en `rust-toolchain.toml` y `Cargo.lock`. Opcionalmente: `cargo install --path . --locked`. Para reemplazar una instalación existente se necesita `--force`: **conserva antes el binario previo y una copia de datos**, especialmente si migras esquema. No hay binarios precompilados oficiales.
+Toolchain y dependencias quedan fijados en `rust-toolchain.toml` y `Cargo.lock`. Opcionalmente: `cargo install --path . --locked`. Para reemplazar una instalación existente se necesita `--force`: **conserva antes el binario previo y una copia de datos**, especialmente si migras esquema. El paquete Linux publicado es experimental y no está firmado.
 
 ## Preparar Core y los datos
 
