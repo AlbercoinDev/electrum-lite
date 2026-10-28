@@ -13,8 +13,10 @@ Versiones concretas resueltas y checksums en `Cargo.lock`. No se ha realizado un
 | base64 | Autenticación Basic de cookie | MIT OR Apache-2.0 |
 | hex | Codificación hexadecimal | MIT OR Apache-2.0 |
 | fs2 | Bloqueo de archivo entre procesos | MIT OR Apache-2.0 |
+| rusqlite 0.41.1 / SQLite empaquetado | Base transaccional de índices, undo y referencias | MIT / SQLite en dominio público |
 | url | Validación de endpoint | MIT OR Apache-2.0 |
 | tempfile (tests) | Directorios temporales aislados | MIT OR Apache-2.0 |
+| redb 4.4.0 (solo desarrollo) | Comparación sintética de backends | MIT OR Apache-2.0 |
 
 Las licencias completas, incluidas las transitivas y código nativo como secp256k1/Zstandard, están en los paquetes originales. Antes de distribuir binarios o elegir licencia propia, revisar y proporcionar avisos/licencias que correspondan. Esta tabla no reemplaza esos textos.
 

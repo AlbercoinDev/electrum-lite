@@ -6,12 +6,13 @@ version: "1.3.0-draft"
 date: "2026-10-28"
 status: "BETA_IMPLEMENTACION_PARCIAL"
 implementation_started: true
-benchmarks_executed: false
+benchmarks_executed: true
+benchmark_scope: "Solo microexperimento KV sintético SQLite/redb; no benchmark representativo de Bitcoin ni hardware objetivo"
 ---
 
 # Electrum Lite Engine — Especificación técnica
 
-> Diseño objetivo con implementación parcial en la beta `0.0.1-beta.1`: CLI, RPC, archivo Zstandard e índices en memoria. No hay servidor Electrum, base transaccional, undo, mempool ni controlador de poda todavía. No hay benchmarks propios ni garantías de compatibilidad completa o consumo. Se conserva el nombre del archivo para no romper referencias. La arquitectura simplificada sustituye el diseño original de LMDB + segmentos propios + archivo individual de transacciones.
+> Diseño objetivo con implementación parcial en la beta `0.0.1-beta.1`, cuya versión se mantiene: CLI, RPC, archivo Zstandard, índices SQLite persistentes y undo interno. No hay servidor Electrum, recuperación automática de reorgs, mempool ni controlador de poda. Solo hay un microexperimento KV propio, no benchmarks representativos ni garantías de compatibilidad completa o consumo. El tag original no se mueve; la continuación está en main. La arquitectura simplificada sustituye LMDB + segmentos propios + archivo individual de transacciones.
 
 ## 1. Objetivo y prioridades
 
@@ -21,7 +22,7 @@ Prioridades: corrección y durabilidad, simplicidad de implementación y operaci
 
 - Hardware objetivo: x86-64 antiguo sin AVX2 obligatorio, poca RAM y SSD SATA. Los perfiles de 2–4 GiB son hipótesis, no mínimos garantizados para Core + aplicación.
 - Conservar witness y bytes originales. No eliminar datos para aparentar ahorro.
-- **[DECIDIDO]** La aplicación debe soportar mainnet, Signet y Testnet4. Mainnet es requisito del producto, no una funcionalidad existente; las redes de prueba no sustituyen su implementación.
+- **[DECIDIDO]** La aplicación debe soportar mainnet, Signet y Testnet4. Selección de red e identidad/génesis están implementadas; la sincronización completa mainnet sigue pendiente de validación. Las redes de prueba no sustituyen ese requisito.
 - **[DECIDIDO]** Publicar el proyecto en GitHub como `AlbercoinDev/electrum-lite`, con README de instalación y operación actualizado a cada entrega. No publicar binarios ni comandos de la aplicación como utilizables antes de verificarlos.
 - No prometer ahorro frente a Core sin podar. Comparar también contra Core completo + servidor Electrum, que presta un servicio más equivalente.
 - No objetivos iniciales: consenso propio, otras monedas, explorador web, REST pública, GUI ni servicio público sin controles.
@@ -55,7 +56,7 @@ Servidor Electrum → Sparrow
 
 - Un ejecutable y un proceso Rust. Empezar con un paquete Cargo con biblioteca, módulos pequeños y CLI; separar crates solo si aporta una ventaja real.
 - Tokio para la futura red Electrum y coordinación; colas y cachés acotadas, un escritor lógico confirmado y lectores con snapshots consistentes. La CLI beta actual es síncrona y no necesita Tokio. No bloquear su futuro runtime con compresión o E/S síncrona pesada.
-- Una única base transaccional para todos los índices y metadatos. **[PENDIENTE]** Elegir backend mediante una comparación pequeña de bibliotecas maduras; no imponer LMDB ni mantener varios backends en producción.
+- **[DECIDIDO]** Una única base SQLite para índices y metadatos, mediante rusqlite empaquetado, esquema 1. Journal DELETE, synchronous EXTRA y claves foráneas; caché de páginas sugerida de 8 MiB, mmap desactivado. Elegida tras microexperimento SQLite/redb por simplicidad, no por ser la más rápida. Ver ADR-001; redb solo es dependencia de desarrollo.
 - No construir inicialmente segmentos históricos, compactación, motor KV ni codificación de transacciones propios. El backend gestiona sus estructuras internas.
 - RPC autenticado inicialmente. `getblock(hash, 0)` devuelve serialización hexadecimal dentro de JSON, no un cuerpo binario puro. Decodificar antes de archivar. REST y ZMQ quedan fuera del alcance inicial.
 - Core sigue siendo necesario para nuevos bloques, mempool, estimación de comisiones y difusión, pero no para recuperar histórico ya archivado.
@@ -70,7 +71,7 @@ Servidor Electrum → Sparrow
 - El archivo debe permitir reconstruir índices desde génesis. Esto no implica reconstrucción rápida ni sustituye backups consistentes.
 - Verificar hash, raíz Merkle y compromiso witness cuando aplique. TXID y raíz Merkle de transacciones no verifican por sí solos witness. Probar ida y vuelta byte a byte y TXID/wTXID.
 
-Datos lógicos de la base: UTXO por outpoint y script; historial por scripthash; ubicación TX por bloque y posición; cadena activa y cabeceras; undo; manifiesto del archivo y estado de sincronización. Claves y serialización finales están pendientes. Usar binario, satoshis enteros y referencias compactas cuando sean útiles, sin duplicar cargas completas ni truncar hashes inicialmente.
+Datos lógicos: UTXO por outpoint e índice por script; historial por scripthash; ocurrencias TX por bloque y posición; cadena activa, referencias al archivo, undo y estado. El esquema inicial ejecutable es `src/schema.sql`: hashes y outpoints binarios, satoshis enteros y ninguna copia adicional de transacciones completas. Cabeceras se recuperan del archivo; formatos estables y optimizaciones adicionales siguen pendientes.
 
 Invariantes:
 
@@ -97,7 +98,7 @@ Registrar alturas y hashes de `core_tip`, `indexed_tip`, `durable_tip` y `served
 
 Reorg: localizar ancestro común, revertir descendiendo con undo, aplicar nueva rama ascendiendo, publicar y notificar. Conservar datos necesarios mientras haya lectores o rollback pendiente; no retener transacciones de lectura de base durante consultas de red largas.
 
-**[PENDIENTE]** Ventana exacta de undo. Fuera de ella: modo seguro y reconstrucción controlada desde datos disponibles; no prometer reversión instantánea de profundidad arbitraria. Evitar inicialmente GC/reescritura del archivo histórico; medir crecimiento por bloques huérfanos.
+Ventana inicial de undo: 288 bloques, probada como primitiva interna de índices, no como garantía universal de profundidad segura. La CLI todavía rechaza reorgs: el archivo permanece lineal y falta gestionar ramas alternativas de forma coordinada. No exponer rollback de base sin resolver archivo/lectores. Fuera de la ventana: modo seguro y reconstrucción controlada; evitar GC/reescritura del histórico inicialmente.
 
 ## 6. Poda y disco
 
@@ -163,11 +164,13 @@ Estas fases sustituyen M0–M10. No saltar persistencia/recuperación para habil
 
 El paquete beta ya existe. Ejecutar `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` y `cargo build --release --locked`. Las instrucciones reales y el harness de Core están en README y `scripts/core_smoke.py`.
 
-La beta cubre la fundación y el archivo/indexación en memoria, no las fases C–F. Incluye selección mainnet/Signet/Testnet4/regtest; no equivale a sincronización completa ni servidor Electrum operativo. Los índices se reconstruyen desde el archivo en cada invocación y tienen límite de transacciones. El archivo sincronizado no representa todavía el commit coordinado de §5 y no autoriza poda. Formato inicial `ELBETA01`, segmentos hasta 64 MiB, Zstandard nivel 3, lecturas descomprimidas hasta 4 000 000 bytes y ventana máxima de 8 MiB: parámetros iniciales, no resultados de optimización.
+La beta cubre A/B y parte de C: SQLite persistente, commit coordinado, importación/reanudación, undo interno y pruebas de crash de proceso. Faltan reorgs operacionales, campaña completa de fallos y D–F. La CLI verifica todo el archivo al arrancar, sin reconstruir índices confirmados en RAM. Incluye mainnet/Signet/Testnet4/regtest, pero no valida sincronización completa ni servidor Electrum. Ningún durable_tip autoriza poda. ELBETA01 no cambia: segmentos hasta 64 MiB, Zstandard nivel 3, bloque descomprimido hasta 4 000 000 bytes y ventana máxima de 8 MiB. Son parámetros iniciales, no resultados de optimización.
+
+Migración inicial: copia cerrada completa previa, añadir SQLite schema 1 e importar ELBETA01 sin reescribirlo. Esquemas desconocidos se rechazan. `rebuild-index --output NUEVO.sqlite` genera otra base sin sobrescribir la activa; restauración/rollback usan un directorio separado con archivos y base de la misma generación, incluidos journals. Ver README para el procedimiento que evita mezclar journals antiguos con una base reconstruida.
 
 ## 10. Pendientes y riesgos
 
-- Versiones exactas, licencia, backend, serialización, límites de segmentos/cachés, ventana undo y recuperación fuera de ella.
+- Licencia, estabilización/migración de formatos, límites definitivos y recuperación operacional dentro/fuera de undo. Versiones usadas y dependencias están fijadas en toolchain/Cargo.lock, sin promesa de compatibilidad con otras versiones.
 - Perfil Electrum y versiones de Sparrow, control de disco durante IBD y procedimiento ante espacio crítico.
 - Compresión y consultas compiten por CPU; ahorro y funcionamiento en hardware antiguo siguen sin demostrar.
 - Core y la app conservan estados UTXO separados; no compartir ni abrir directamente la base interna de Core.
@@ -190,3 +193,4 @@ La beta cubre la fundación y el archivo/indexación en memoria, no las fases C�
 | 1.1.0-draft | 2026-10-28 | Revisión acordada: simplicidad, ejecutable único, bloques completos Zstandard, backend transaccional único por elegir, RPC inicial, Signet/Testnet4 y fases A–F. Retirados motor propio y benchmark A/B/C obligatorio. |
 | 1.2.0-draft | 2026-10-28 | Mainnet como soporte obligatorio del producto; GitHub público e instrucciones de instalación verificables por entrega. Pruebas iniciales en Signet/Testnet4 y poda mainnet condicionada a validación. |
 | 1.3.0-draft | 2026-10-28 | Beta 0.0.1-beta.1 parcial: CLI, RPC local por cookie, archivo de bloques Zstandard, índices en memoria, consultas offline, tests y CI. Persistencia de índices, undo, poda y servidor Electrum siguen pendientes. |
+| 1.3.0-draft (continuación, misma versión) | 2026-10-28 | SQLite schema 1, commit coordinado, recuperación idempotente, undo interno de 288 bloques y reconstrucción separada; archivo ELBETA01 y versión de app sin cambios. Reorg operacional, poda y Electrum siguen pendientes. |

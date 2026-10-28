@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import tempfile
 import time
@@ -77,6 +78,9 @@ def main():
                         assert rpc("generatetoaddress", "1", address).returncode == 0
                         stats = run("sync", *online, "--max-blocks", "200")
                         assert stats["indexed_tip"]["height"] == 106
+                        assert stats["durable_tip"] == stats["indexed_tip"]
+                        assert stats["index_backend"] == "sqlite-schema-1"
+                        assert (root / "archive" / chain / "index.sqlite").is_file()
                         fetched = run("transaction", txid)
                         expected = json.loads(rpc("gettransaction", txid).stdout)["hex"]
                         assert expected[8:12] == "0001", "smoke spend must include SegWit witness"
@@ -84,6 +88,16 @@ def main():
                         # Resume performs no duplicate appends.
                         assert run("sync", *online)["transactions"] == stats["transactions"]
                         assert run("inspect")["indexed_tip"] == stats["indexed_tip"]
+                        rebuilt = run("rebuild-index", "--output", str(root / "rebuilt.sqlite"))
+                        assert rebuilt["durable_tip"] == stats["durable_tip"]
+                        # All CLI processes have exited: copy one complete matching generation.
+                        shutil.copytree(root / "archive", root / "backup")
+                        restored = subprocess.run(
+                            [binary, "--network", chain, "--data-dir", str(root / "backup"), "inspect"],
+                            text=True, capture_output=True, timeout=60,
+                        )
+                        assert restored.returncode == 0, restored.stderr
+                        assert json.loads(restored.stdout)["durable_tip"] == stats["durable_tip"]
                         # An active chain mismatch fails closed; no implicit rollback.
                         assert rpc("invalidateblock", stats["indexed_tip"]["hash"]).returncode == 0
                         run("sync", *online, success=False)

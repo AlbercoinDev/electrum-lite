@@ -2,6 +2,7 @@
 pub mod archive;
 pub mod index;
 pub mod rpc;
+pub mod store;
 
 use anyhow::{ensure, Result};
 use bitcoin::{blockdata::constants::genesis_block, Block, BlockHash, Network};

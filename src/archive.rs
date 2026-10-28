@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -11,6 +11,7 @@ use bitcoin::{
     Block, BlockHash,
 };
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 
 use crate::{validate_block, Chain, MAX_BLOCK_BYTES};
 
@@ -18,6 +19,13 @@ const MAGIC: &[u8; 8] = b"ELBETA01";
 const HEADER: usize = 116;
 const MAX_COMPRESSED: usize = MAX_BLOCK_BYTES + 65536;
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    pub segment: u32,
+    pub offset: u64,
+    pub length: u32,
+}
 
 pub struct Archive {
     dir: PathBuf,
@@ -39,6 +47,17 @@ impl Archive {
         let dir = root.join(chain.name());
         if create {
             fs::create_dir_all(&dir)?;
+            // Persist directory entries too, including a newly created data root.
+            let mut directory = Some(dir.as_path());
+            while let Some(path) = directory {
+                File::open(if path.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    path
+                })?
+                .sync_all()?;
+                directory = path.parent();
+            }
         }
         ensure!(dir.is_dir(), "archive does not exist: {}", dir.display());
         let lock = OpenOptions::new()
@@ -75,54 +94,38 @@ impl Archive {
 
     /// Replay all records before appending. A torn tail is rejected, never silently discarded.
     pub fn scan(&mut self, mut visit: impl FnMut(u32, &Block) -> Result<()>) -> Result<()> {
+        self.scan_records(|height, block, _| visit(height, block))
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn scan_records(
+        &mut self,
+        mut visit: impl FnMut(u32, &Block, Location) -> Result<()>,
+    ) -> Result<()> {
         self.tip = None;
         self.scanned = false;
-        for path in &self.segments {
+        File::open(&self.dir)?.sync_all()?;
+        for (segment, path) in self.segments.iter().enumerate() {
             let mut file = File::open(path)?;
+            // Recovery can import a complete tail or a copied legacy archive: ensure
+            // its bytes are durable before publishing new database references.
+            file.sync_all()?;
             loop {
-                let mut header = [0u8; HEADER];
-                if file.read(&mut header[..1])? == 0 {
+                let offset = file.stream_position()?;
+                let Some((height, block)) = read_record(&mut file, self.chain)? else {
                     break;
-                }
-                file.read_exact(&mut header[1..])
-                    .context("incomplete archive header; preserve files and restore a backup")?;
-                ensure!(&header[..8] == MAGIC, "unsupported archive format");
-                ensure!(
-                    header[8..40] == self.chain.genesis().to_byte_array(),
-                    "archive network mismatch"
-                );
-                let height = u32::from_le_bytes(header[40..44].try_into()?);
-                let expected_hash = BlockHash::from_slice(&header[44..76])?;
-                let raw_len = u32::from_le_bytes(header[76..80].try_into()?) as usize;
-                let compressed_len = u32::from_le_bytes(header[80..84].try_into()?) as usize;
-                ensure!(
-                    (1..=MAX_BLOCK_BYTES).contains(&raw_len)
-                        && (1..=MAX_COMPRESSED).contains(&compressed_len),
-                    "invalid record size"
-                );
-                let mut compressed = vec![0; compressed_len];
-                file.read_exact(&mut compressed)
-                    .context("incomplete archive payload; preserve files and restore a backup")?;
-                ensure!(
-                    sha256d::Hash::hash(&compressed).as_byte_array() == &header[84..116],
-                    "archive checksum mismatch"
-                );
-                let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
-                decoder.window_log_max(23)?;
-                let mut raw = Vec::new();
-                decoder
-                    .take((MAX_BLOCK_BYTES + 1) as u64)
-                    .read_to_end(&mut raw)?;
-                ensure!(raw.len() == raw_len, "decompressed size mismatch");
-                let block: Block = deserialize(&raw)?;
-                ensure!(
-                    block.block_hash() == expected_hash,
-                    "archived block hash mismatch"
-                );
-                validate_block(&block)?;
+                };
+                let location = Location {
+                    segment: segment.try_into()?,
+                    offset,
+                    length: (file.stream_position()? - offset).try_into()?,
+                };
                 self.check_next(height, &block)?;
-                visit(height, &block)?;
-                self.tip = Some((height, expected_hash));
+                visit(height, &block, location)?;
+                self.tip = Some((height, block.block_hash()));
             }
         }
         self.scanned = true;
@@ -143,7 +146,34 @@ impl Archive {
         Ok(())
     }
 
-    pub fn append(&mut self, height: u32, block: &Block) -> Result<()> {
+    pub fn read(&self, location: Location) -> Result<(u32, Block)> {
+        let path = self
+            .segments
+            .get(location.segment as usize)
+            .context("referenced archive segment missing")?;
+        ensure!(
+            location.length as usize <= HEADER + MAX_COMPRESSED,
+            "invalid archive reference length"
+        );
+        let mut file = File::open(path)?;
+        ensure!(
+            location
+                .offset
+                .checked_add(u64::from(location.length))
+                .is_some_and(|end| end <= file.metadata().map(|m| m.len()).unwrap_or(0)),
+            "archive reference outside file"
+        );
+        file.seek(SeekFrom::Start(location.offset))?;
+        let result =
+            read_record(&mut file, self.chain)?.context("archive reference points at EOF")?;
+        ensure!(
+            file.stream_position()? - location.offset == u64::from(location.length),
+            "archive reference length mismatch"
+        );
+        Ok(result)
+    }
+
+    pub fn append(&mut self, height: u32, block: &Block) -> Result<Location> {
         ensure!(
             self.scanned,
             "scan the complete archive successfully before appending"
@@ -188,11 +218,59 @@ impl Archive {
         let mut file = OpenOptions::new()
             .append(true)
             .open(self.segments.last().unwrap())?;
+        let location = Location {
+            segment: (self.segments.len() - 1).try_into()?,
+            offset: file.metadata()?.len(),
+            length: (header.len() + compressed.len()).try_into()?,
+        };
         file.write_all(&header)?;
         file.write_all(&compressed)?;
         file.sync_all()?;
         self.tip = Some((height, block.block_hash()));
         self.scanned = true;
-        Ok(())
+        Ok(location)
     }
+}
+
+fn read_record(file: &mut File, chain: Chain) -> Result<Option<(u32, Block)>> {
+    let mut header = [0u8; HEADER];
+    if file.read(&mut header[..1])? == 0 {
+        return Ok(None);
+    }
+    file.read_exact(&mut header[1..])
+        .context("incomplete archive header; preserve files and restore a backup")?;
+    ensure!(&header[..8] == MAGIC, "unsupported archive format");
+    ensure!(
+        header[8..40] == chain.genesis().to_byte_array(),
+        "archive network mismatch"
+    );
+    let height = u32::from_le_bytes(header[40..44].try_into()?);
+    let expected_hash = BlockHash::from_slice(&header[44..76])?;
+    let raw_len = u32::from_le_bytes(header[76..80].try_into()?) as usize;
+    let compressed_len = u32::from_le_bytes(header[80..84].try_into()?) as usize;
+    ensure!(
+        (1..=MAX_BLOCK_BYTES).contains(&raw_len) && (1..=MAX_COMPRESSED).contains(&compressed_len),
+        "invalid record size"
+    );
+    let mut compressed = vec![0; compressed_len];
+    file.read_exact(&mut compressed)
+        .context("incomplete archive payload; preserve files and restore a backup")?;
+    ensure!(
+        sha256d::Hash::hash(&compressed).as_byte_array() == &header[84..116],
+        "archive checksum mismatch"
+    );
+    let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
+    decoder.window_log_max(23)?;
+    let mut raw = Vec::new();
+    decoder
+        .take((MAX_BLOCK_BYTES + 1) as u64)
+        .read_to_end(&mut raw)?;
+    ensure!(raw.len() == raw_len, "decompressed size mismatch");
+    let block: Block = deserialize(&raw)?;
+    ensure!(
+        block.block_hash() == expected_hash,
+        "archived block hash mismatch"
+    );
+    validate_block(&block)?;
+    Ok(Some((height, block)))
 }
