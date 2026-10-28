@@ -2,16 +2,16 @@
 document_id: ELE-SPEC-001
 title: "Electrum Lite Engine"
 language: es-ES
-version: "1.2.0-draft"
+version: "1.3.0-draft"
 date: "2026-10-28"
-status: "PROPUESTA_NO_IMPLEMENTADA"
-implementation_started: false
+status: "BETA_IMPLEMENTACION_PARCIAL"
+implementation_started: true
 benchmarks_executed: false
 ---
 
 # Electrum Lite Engine — Especificación técnica
 
-> Propuesta no implementada: no hay código, benchmarks propios ni garantías de compatibilidad o consumo. Esta revisión acordada sustituye LMDB + segmentos históricos propios + archivo individual de transacciones por un diseño inicial más sencillo. El nombre del archivo se conserva para no romper referencias.
+> Diseño objetivo con implementación parcial en la beta `0.0.1-beta.1`: CLI, RPC, archivo Zstandard e índices en memoria. No hay servidor Electrum, base transaccional, undo, mempool ni controlador de poda todavía. No hay benchmarks propios ni garantías de compatibilidad completa o consumo. Se conserva el nombre del archivo para no romper referencias. La arquitectura simplificada sustituye el diseño original de LMDB + segmentos propios + archivo individual de transacciones.
 
 ## 1. Objetivo y prioridades
 
@@ -54,7 +54,7 @@ Servidor Electrum → Sparrow
 ```
 
 - Un ejecutable y un proceso Rust. Empezar con un paquete Cargo con biblioteca, módulos pequeños y CLI; separar crates solo si aporta una ventaja real.
-- Tokio para red y coordinación; colas y cachés acotadas, un escritor lógico confirmado y lectores con snapshots consistentes. No bloquear el runtime con compresión o E/S síncrona pesada.
+- Tokio para la futura red Electrum y coordinación; colas y cachés acotadas, un escritor lógico confirmado y lectores con snapshots consistentes. La CLI beta actual es síncrona y no necesita Tokio. No bloquear su futuro runtime con compresión o E/S síncrona pesada.
 - Una única base transaccional para todos los índices y metadatos. **[PENDIENTE]** Elegir backend mediante una comparación pequeña de bibliotecas maduras; no imponer LMDB ni mantener varios backends en producción.
 - No construir inicialmente segmentos históricos, compactación, motor KV ni codificación de transacciones propios. El backend gestiona sus estructuras internas.
 - RPC autenticado inicialmente. `getblock(hash, 0)` devuelve serialización hexadecimal dentro de JSON, no un cuerpo binario puro. Decodificar antes de archivar. REST y ZMQ quedan fuera del alcance inicial.
@@ -64,7 +64,7 @@ Servidor Electrum → Sparrow
 
 - Conservar bloques completos, cabeceras y witness, en frames Zstandard independientes por bloque. Agrupar registros en archivos append-only de tamaño limitado; no crear un archivo por bloque.
 - Versionar el formato e identificar red, hash de bloque, tamaños comprimido/descomprimido y checksum. Guardar segmento y ubicación en la base.
-- Acotar tamaño y memoria al descomprimir. Permitir registros sin compresión si comprimir aumenta el tamaño, identificándolo explícitamente.
+- Acotar tamaño y memoria al descomprimir. Como optimización posterior, permitir registros sin compresión si comprimir aumenta el tamaño, identificándolo con una versión de formato compatible; la beta inicial usa siempre Zstandard.
 - TXID → ocurrencia/ubicación permite encontrar una transacción; inicialmente descomprimir su bloque para recuperarla. No guardar una segunda copia permanente de transacciones.
 - Generar pruebas Merkle desde el bloque recuperado. Añadir tablas TXID ordenadas o cachés persistentes solo con justificación medida.
 - El archivo debe permitir reconstruir índices desde génesis. Esto no implica reconstrucción rápida ni sustituye backups consistentes.
@@ -161,7 +161,9 @@ Estas fases sustituyen M0–M10. No saltar persistencia/recuperación para habil
 - Antes de declarar instalable una entrega, documentar sistema compatible, toolchain y versión Core probados, dependencias, compilación o binarios verificados, configuración por red, cookie RPC, rutas de datos, arranque, comprobación de salud y actualización/backup/recuperación.
 - Incluir ejemplos separados de mainnet, Signet y Testnet4 sin credenciales. Los valores y comandos exactos se añadirán cuando existan y se hayan probado; no inventarlos ahora.
 
-Cuando exista el paquete, ejecutar y registrar `cargo fmt --check`, `cargo clippy`, `cargo test` y pruebas de integración aplicables. Todavía no existen manifiestos, comandos específicos de app ni harness ejecutable.
+El paquete beta ya existe. Ejecutar `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` y `cargo build --release --locked`. Las instrucciones reales y el harness de Core están en README y `scripts/core_smoke.py`.
+
+La beta cubre la fundación y el archivo/indexación en memoria, no las fases C–F. Incluye selección mainnet/Signet/Testnet4/regtest; no equivale a sincronización completa ni servidor Electrum operativo. Los índices se reconstruyen desde el archivo en cada invocación y tienen límite de transacciones. El archivo sincronizado no representa todavía el commit coordinado de §5 y no autoriza poda. Formato inicial `ELBETA01`, segmentos hasta 64 MiB, Zstandard nivel 3, lecturas descomprimidas hasta 4 000 000 bytes y ventana máxima de 8 MiB: parámetros iniciales, no resultados de optimización.
 
 ## 10. Pendientes y riesgos
 
@@ -187,3 +189,4 @@ Cuando exista el paquete, ejecutar y registrar `cargo fmt --check`, `cargo clipp
 | 1.0.0-draft | 2026-10-28 | Propuesta inicial LMDB, segmentos propios y archivo TX; sin implementación. |
 | 1.1.0-draft | 2026-10-28 | Revisión acordada: simplicidad, ejecutable único, bloques completos Zstandard, backend transaccional único por elegir, RPC inicial, Signet/Testnet4 y fases A–F. Retirados motor propio y benchmark A/B/C obligatorio. |
 | 1.2.0-draft | 2026-10-28 | Mainnet como soporte obligatorio del producto; GitHub público e instrucciones de instalación verificables por entrega. Pruebas iniciales en Signet/Testnet4 y poda mainnet condicionada a validación. |
+| 1.3.0-draft | 2026-10-28 | Beta 0.0.1-beta.1 parcial: CLI, RPC local por cookie, archivo de bloques Zstandard, índices en memoria, consultas offline, tests y CI. Persistencia de índices, undo, poda y servidor Electrum siguen pendientes. |

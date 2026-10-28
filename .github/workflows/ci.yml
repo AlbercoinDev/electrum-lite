@@ -1,0 +1,26 @@
+name: Rust checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Download isolated smoke-test Core (checksum pinned)
+        shell: bash
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 https://bitcoincore.org/bin/bitcoin-core-31.0/bitcoin-31.0-x86_64-linux-gnu.tar.gz -o "$RUNNER_TEMP/core.tar.gz"
+          echo "d3e4c58a35b1d0a97a457462c94f55501ad167c660c245cb1ffa565641c65074  $RUNNER_TEMP/core.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/core.tar.gz" -C "$RUNNER_TEMP" bitcoin-31.0/bin/bitcoind bitcoin-31.0/bin/bitcoin-cli
+      - name: Core integration (offline networks and regtest)
+        run: python3 scripts/core_smoke.py
+        env:
+          BITCOIND: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoind
+          BITCOINCLI: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoin-cli
