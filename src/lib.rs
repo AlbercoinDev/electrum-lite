@@ -1,8 +1,12 @@
 //! Beta archive/index primitives. Not an Electrum server or a pruning controller.
 pub mod archive;
+pub mod electrum;
 pub mod index;
+pub mod mempool;
+pub mod operations;
 pub mod rpc;
 pub mod store;
+pub mod sync;
 
 use anyhow::{ensure, Result};
 use bitcoin::{blockdata::constants::genesis_block, Block, BlockHash, Network};

@@ -20,7 +20,7 @@ const HEADER: usize = 116;
 const MAX_COMPRESSED: usize = MAX_BLOCK_BYTES + 65536;
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Location {
     pub segment: u32,
     pub offset: u64,
@@ -34,6 +34,8 @@ pub struct Archive {
     segments: Vec<PathBuf>,
     tip: Option<(u32, BlockHash)>,
     scanned: bool,
+    branches: bool,
+    bytes: u64,
 }
 
 impl Drop for Archive {
@@ -82,6 +84,10 @@ impl Archive {
                 "invalid segment sequence"
             );
         }
+        let bytes = segments.iter().try_fold(0u64, |sum, path| -> Result<u64> {
+            sum.checked_add(fs::metadata(path)?.len())
+                .context("archive size overflow")
+        })?;
         Ok(Self {
             dir,
             chain,
@@ -89,6 +95,8 @@ impl Archive {
             segments,
             tip: None,
             scanned: false,
+            branches: false,
+            bytes,
         })
     }
 
@@ -101,12 +109,28 @@ impl Archive {
         &self.dir
     }
 
+    /// Schema-2 coordinator validates active-chain transitions and durable rewind markers.
+    pub fn enable_branches(&mut self) {
+        self.branches = true;
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub fn scan_records(
         &mut self,
         mut visit: impl FnMut(u32, &Block, Location) -> Result<()>,
     ) -> Result<()> {
         self.tip = None;
         self.scanned = false;
+        self.bytes = self
+            .segments
+            .iter()
+            .try_fold(0u64, |sum, path| -> Result<u64> {
+                sum.checked_add(fs::metadata(path)?.len())
+                    .context("archive size overflow")
+            })?;
         File::open(&self.dir)?.sync_all()?;
         for (segment, path) in self.segments.iter().enumerate() {
             let mut file = File::open(path)?;
@@ -133,6 +157,9 @@ impl Archive {
     }
 
     fn check_next(&self, height: u32, block: &Block) -> Result<()> {
+        if self.branches && self.tip.is_some() {
+            return Ok(());
+        }
         match self.tip {
             None => ensure!(
                 height == 0 && block.block_hash() == self.chain.genesis(),
@@ -226,6 +253,10 @@ impl Archive {
         file.write_all(&header)?;
         file.write_all(&compressed)?;
         file.sync_all()?;
+        self.bytes = self
+            .bytes
+            .checked_add(u64::from(location.length))
+            .context("archive size overflow")?;
         self.tip = Some((height, block.block_hash()));
         self.scanned = true;
         Ok(location)

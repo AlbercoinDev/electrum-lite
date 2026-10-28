@@ -15,11 +15,12 @@ Versiones concretas resueltas y checksums en `Cargo.lock`. No se ha realizado un
 | fs2 | Bloqueo de archivo entre procesos | MIT OR Apache-2.0 |
 | rusqlite 0.41.1 / SQLite empaquetado | Base transaccional de índices, undo y referencias | MIT / SQLite en dominio público |
 | url | Validación de endpoint | MIT OR Apache-2.0 |
-| tempfile (tests) | Directorios temporales aislados | MIT OR Apache-2.0 |
+| Tokio 1.54.1 | Transporte TCP, señales y coordinación async | MIT |
+| tempfile | Auditoría temporal y tests aislados | MIT OR Apache-2.0 |
 | redb 4.4.0 (solo desarrollo) | Comparación sintética de backends | MIT OR Apache-2.0 |
 
 Las licencias completas, incluidas las transitivas y código nativo como secp256k1/Zstandard, están en los paquetes originales. Antes de distribuir binarios o elegir licencia propia, revisar y proporcionar avisos/licencias que correspondan. Esta tabla no reemplaza esos textos.
 
-No se necesita Tokio en esta fase: no hay servidor ni procesamiento concurrente. Añadirlo al implementar red Electrum, sin bloquear su runtime con el archivador síncrono.
+Tokio gestiona transporte y señales; un worker dedicado ejecuta RPC, SQLite y compresión síncronos sin bloquear el executor async. Metadatos: https://docs.rs/tokio/1.54.1/tokio/.
 
 Referencias consultadas: documentación oficial de [rust-bitcoin](https://docs.rs/bitcoin/0.32.102/bitcoin/), [ureq](https://docs.rs/ureq/2.12.1/ureq/), [zstd](https://docs.rs/zstd/0.13.3/zstd/), metadatos de crates.io y RPC [getblock de Core 31.0](https://bitcoincore.org/en/doc/31.0.0/rpc/blockchain/getblock/). El transporte RPC entrega hex dentro de JSON. Se eligieron APIs concretas comprobadas al compilar, no versiones inferidas de pseudocódigo.

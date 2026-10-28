@@ -9,6 +9,18 @@ use url::Url;
 
 use crate::{Chain, MAX_BLOCK_BYTES};
 
+#[derive(Debug)]
+pub struct RpcFailure {
+    pub code: i64,
+}
+impl std::fmt::Display for RpcFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Core RPC failed (code {})", self.code)
+    }
+}
+impl std::error::Error for RpcFailure {}
+
+#[derive(Clone)]
 pub struct Core {
     agent: ureq::Agent,
     url: String,
@@ -48,6 +60,19 @@ impl Core {
     }
 
     pub fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        self.call_with_limit(method, params, MAX_BLOCK_BYTES * 2 + 65536)
+    }
+
+    pub fn call_with_limit<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        limit: usize,
+    ) -> Result<T> {
+        ensure!(
+            limit > 0 && limit <= 64 * 1024 * 1024,
+            "invalid RPC response budget"
+        );
         // Re-read to support Core cookie rotation. Never include credentials in errors.
         let cookie = fs::read_to_string(&self.cookie).context("cannot read RPC cookie")?;
         let cookie = cookie.trim();
@@ -71,7 +96,6 @@ impl Core {
             Err(_) => anyhow::bail!("RPC transport failed; check Core and the loopback endpoint"),
         };
         let status = response.status();
-        let limit = MAX_BLOCK_BYTES * 2 + 65536;
         let mut bytes = Vec::new();
         response
             .into_reader()
@@ -83,10 +107,12 @@ impl Core {
         ensure!(value["id"] == "electrum-lite", "RPC response ID mismatch");
         if !value["error"].is_null() {
             // Codes suffice for diagnostics without echoing server-provided secrets.
-            anyhow::bail!(
-                "Core RPC {method} failed (code {}); historical block may be unavailable or pruned",
-                value["error"]["code"]
-            );
+            return Err(RpcFailure {
+                code: value["error"]["code"]
+                    .as_i64()
+                    .context("invalid RPC error code")?,
+            }
+            .into());
         }
         ensure!(status == 200, "Core HTTP status {status}");
         serde_json::from_value(value.get("result").context("RPC missing result")?.clone())

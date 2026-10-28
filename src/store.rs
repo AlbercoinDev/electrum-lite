@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub const UNDO_WINDOW: u32 = 288;
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 const APPLICATION: i64 = 0x454C4954;
 
 #[derive(Clone, Copy)]
@@ -74,7 +74,7 @@ impl Store {
         } else {
             ensure!(
                 version == SCHEMA && app == APPLICATION,
-                "unsupported index schema; preserve database and use rebuild-index into a new file"
+                "unsupported index schema; schema 1 requires migrate-index with a backup; otherwise rebuild-index separately"
             );
         }
         // EXTRA also syncs the directory after rollback-journal removal on Unix.
@@ -148,20 +148,98 @@ impl Store {
     /// Verify every archived record; index only complete records beyond the committed prefix.
     /// A corrupt tail is never discarded, and database-ahead/mixed generations fail closed.
     pub fn recover(&mut self, archive: &mut Archive) -> Result<()> {
-        let committed = self.stats()?.tip;
-        let mut last = None;
+        archive.enable_branches();
+        let cursor = self.cursor()?;
+        let tip = self.stats()?.tip;
+        ensure!(
+            tip.is_some() == cursor.is_some(),
+            "index tip/cursor mismatch"
+        );
+        let mut matched = 0u64;
+        let mut cursor_seen = cursor.is_none();
+        let mut pending = false;
         archive.scan_records(|height, block, location| {
-            if committed.is_some_and(|(tip, _)| height <= tip) {
-                ensure!(self.record(height)? == Some((block.block_hash(), location)), "database/archive generation mismatch; restore a matching backup or rebuild separately");
-            } else {
-                self.apply_record(height, block, location)?;
+            if cursor.is_none_or(|c| location > c) {
+                pending = true;
             }
-            last = Some((height, block.block_hash()));
+            if cursor == Some(location) {
+                cursor_seen = true;
+            }
+            if let Some((hash, reference)) = self.record(height)? {
+                if reference == location {
+                    ensure!(hash == block.block_hash(), "database/archive hash mismatch");
+                    let header: Option<Vec<u8>> = self.conn.query_row(
+                        "SELECT header FROM blocks WHERE height=?1",
+                        [height],
+                        |r| r.get(0),
+                    )?;
+                    let bytes = serialize(&block.header);
+                    if let Some(header) = header {
+                        ensure!(header == bytes, "stored header mismatch");
+                    } else {
+                        self.conn.execute(
+                            "UPDATE blocks SET header=?1 WHERE height=?2",
+                            params![bytes, height],
+                        )?;
+                    }
+                    matched += 1;
+                }
+            }
             Ok(())
         })?;
         ensure!(
-            self.stats()?.tip == last,
-            "database references missing archive blocks; restore matching files"
+            cursor_seen && matched == tip.map_or(0, |(h, _)| u64::from(h) + 1),
+            "database/archive generation mismatch or missing references"
+        );
+        if pending {
+            archive.scan_records(|height, block, location| {
+                if cursor.is_none_or(|c| location > c) {
+                    self.apply_record(height, block, location)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn cursor(&self) -> Result<Option<Location>> {
+        let row: Option<(u32, i64, u32)> = self
+            .conn
+            .query_row(
+                "SELECT segment,offset,length FROM archive_cursor WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(segment, offset, length)| {
+            Ok(Location {
+                segment,
+                offset: offset.try_into()?,
+                length,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn rewind(&mut self, archive: &mut Archive, height: u32) -> Result<()> {
+        self.check_undo(height)?;
+        let (_, location) = self.record(height)?.context("ancestor absent")?;
+        let (_, block) = archive.read(location)?;
+        let marker = archive.append(height, &block)?; // Durable intent; no original bytes deleted.
+        self.apply_record(height, &block, marker)
+    }
+
+    fn check_undo(&self, height: u32) -> Result<()> {
+        let tip = self.stats()?.tip.context("empty index")?.0;
+        ensure!(height <= tip, "ancestor after tip");
+        let count: u32 = self.conn.query_row(
+            "SELECT count(*) FROM undo_blocks WHERE height>?1 AND height<=?2",
+            params![height, tip],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            count == tip - height,
+            "reorg exceeds retained undo; restore/rebuild safely"
         );
         Ok(())
     }
@@ -193,6 +271,28 @@ impl Store {
     }
 
     fn apply_record(&mut self, height: u32, block: &Block, location: Location) -> Result<()> {
+        if self
+            .record(height)?
+            .is_some_and(|(hash, _)| hash == block.block_hash())
+        {
+            self.check_undo(height)?;
+            while self.stats()?.tip.is_some_and(|(h, _)| h > height) {
+                self.rollback_tip()?;
+            }
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "UPDATE blocks SET segment=?1,offset=?2,length=?3 WHERE height=?4",
+                params![
+                    location.segment,
+                    i64::try_from(location.offset)?,
+                    location.length,
+                    height
+                ],
+            )?;
+            set_cursor(&tx, location)?;
+            tx.commit()?;
+            return Ok(());
+        }
         let tx = self.conn.transaction()?;
         prepare(&tx, self.chain, self.limits, height, block)?;
         publish(&tx, height, block, location)?;
@@ -299,6 +399,181 @@ impl Store {
             });
         }
         Ok(found)
+    }
+
+    pub fn header(&self, height: u32) -> Result<bitcoin::block::Header> {
+        let bytes: Vec<u8> =
+            self.conn
+                .query_row("SELECT header FROM blocks WHERE height=?1", [height], |r| {
+                    r.get(0)
+                })?;
+        Ok(deserialize(&bytes)?)
+    }
+
+    pub fn headers(&self, start: u32, count: u32) -> Result<Vec<u8>> {
+        ensure!(count <= 2016, "header chunk exceeds limit");
+        let end = start.checked_add(count).context("header range overflow")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT header FROM blocks WHERE height>=?1 AND height<?2 ORDER BY height")?;
+        let rows = stmt.query_map(params![start, end], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut bytes = Vec::with_capacity(count as usize * 80);
+        for row in rows {
+            let header = row?;
+            ensure!(header.len() == 80, "invalid stored header size");
+            bytes.extend(header);
+        }
+        ensure!(
+            bytes.len() == count as usize * 80,
+            "missing indexed headers"
+        );
+        Ok(bytes)
+    }
+
+    pub fn header_hashes(&self, height: u32) -> Result<Vec<[u8; 32]>> {
+        ensure!(
+            height <= 2_000_000,
+            "header checkpoint exceeds resource limit"
+        );
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash FROM blocks WHERE height<=?1 ORDER BY height")?;
+        let rows = stmt.query_map([height], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(
+                row?.try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid header hash"))?,
+            );
+        }
+        ensure!(
+            result.len() == height as usize + 1,
+            "checkpoint beyond indexed chain"
+        );
+        Ok(result)
+    }
+
+    pub fn coin(&self, outpoint: OutPoint) -> Result<Option<Coin>> {
+        let row: Option<(Vec<u8>, i64, u32, bool)> = self
+            .conn
+            .query_row(
+                "SELECT script,value,height,coinbase FROM utxos WHERE outpoint=?1",
+                [serialize(&outpoint)],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(mut script, value, height, coinbase)| {
+            script.reverse();
+            Ok(Coin {
+                value: value.try_into()?,
+                height,
+                coinbase,
+                scripthash: hex::encode(script),
+            })
+        })
+        .transpose()
+    }
+
+    pub fn fingerprint(&self) -> Result<String> {
+        use bitcoin::hashes::{sha256, HashEngine};
+        let mut engine = sha256::Hash::engine();
+        for table in [
+            "identity",
+            "state",
+            "blocks",
+            "occurrences",
+            "history",
+            "utxos",
+            "undo_blocks",
+            "undo",
+            "archive_cursor",
+        ] {
+            engine.input(&[255]);
+            engine.input(&(table.len() as u64).to_le_bytes());
+            engine.input(table.as_bytes());
+            let columns: i64 = self.conn.query_row(
+                &format!("SELECT count(*) FROM pragma_table_info('{table}')"),
+                [],
+                |r| r.get(0),
+            )?;
+            let order = (1..=columns)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = self
+                .conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                engine.input(&[254]);
+                for i in 0..columns as usize {
+                    use rusqlite::types::ValueRef;
+                    match row.get_ref(i)? {
+                        ValueRef::Null => engine.input(&[0]),
+                        ValueRef::Integer(n) => {
+                            engine.input(&[1]);
+                            engine.input(&n.to_le_bytes());
+                        }
+                        ValueRef::Real(n) => {
+                            engine.input(&[2]);
+                            engine.input(&n.to_le_bytes());
+                        }
+                        ValueRef::Text(b) => {
+                            engine.input(&[3]);
+                            engine.input(&(b.len() as u64).to_le_bytes());
+                            engine.input(b);
+                        }
+                        ValueRef::Blob(b) => {
+                            engine.input(&[4]);
+                            engine.input(&(b.len() as u64).to_le_bytes());
+                            engine.input(b);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(sha256::Hash::from_engine(engine).to_string())
+    }
+
+    pub fn audit(&self, archive: &mut Archive) -> Result<()> {
+        let temporary = tempfile::NamedTempFile::new_in(archive.directory())?;
+        let mut rebuilt = Store::open(
+            temporary.path(),
+            self.chain,
+            Limits {
+                transactions: i64::MAX as usize,
+                entries: i64::MAX as usize,
+            },
+        )?;
+        rebuilt.recover(archive)?;
+        ensure!(
+            self.fingerprint()? == rebuilt.fingerprint()?,
+            "semantic audit mismatch; pruning denied"
+        );
+        Ok(())
+    }
+
+    pub fn prune_start(&self, requested: u32) -> Result<i64> {
+        let pending: i64 = self.conn.query_row(
+            "SELECT count(*) FROM prune_audit WHERE state='requested'",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            pending == 0,
+            "previous prune request needs operator review before another prune"
+        );
+        let (height, hash) = self.stats()?.tip.context("empty index")?;
+        self.conn.execute("INSERT INTO prune_audit(requested,tip_height,tip_hash,state) VALUES(?1,?2,?3,'requested')",params![requested,height,hash.as_byte_array().as_slice()])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn prune_finish(&self, id: i64, actual: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE prune_audit SET actual=?1,state='completed' WHERE id=?2",
+            params![actual, id],
+        )?;
+        Ok(())
     }
 
     /// Internal reversible-index primitive only. Does not rewind the immutable archive or Core.
@@ -490,15 +765,21 @@ fn prepare(
 
 fn publish(tx: &Transaction<'_>, height: u32, block: &Block, location: Location) -> Result<()> {
     tx.execute(
-        "INSERT INTO blocks VALUES(?1,?2,?3,?4,?5)",
+        "INSERT INTO blocks VALUES(?1,?2,?3,?4,?5,?6)",
         params![
             height,
             block.block_hash().as_byte_array().as_slice(),
             location.segment,
             i64::try_from(location.offset)?,
-            location.length
+            location.length,
+            serialize(&block.header)
         ],
     )?;
+    set_cursor(tx, location)
+}
+
+fn set_cursor(tx: &Transaction<'_>, location: Location) -> Result<()> {
+    tx.execute("INSERT INTO archive_cursor VALUES(1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET segment=excluded.segment,offset=excluded.offset,length=excluded.length", params![location.segment,i64::try_from(location.offset)?,location.length])?;
     Ok(())
 }
 

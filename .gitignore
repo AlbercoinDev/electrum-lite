@@ -1,5 +1,7 @@
 # Rust build artifacts (when implementation starts).
 /target/
+__pycache__/
+*.pyc
 
 # Local configuration, secrets and node/index data.
 .env

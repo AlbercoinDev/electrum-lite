@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{ensure, Context, Result};
 use bitcoin::{consensus::serialize, Txid};
@@ -14,7 +14,7 @@ use serde_json::json;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Electrum Lite beta: block archive and durable SQLite index. No Electrum service or pruning."
+    about = "Electrum Lite beta: private Electrum server, durable Bitcoin archive and indexes."
 )]
 struct Cli {
     #[arg(long, value_enum)]
@@ -23,10 +23,10 @@ struct Cli {
     #[arg(long, default_value = "./data", global = true)]
     data_dir: PathBuf,
     /// Cumulative transaction safety cap during new indexing/import (not an RSS limit).
-    #[arg(long, default_value_t = 100_000, global = true)]
+    #[arg(long, default_value_t = 10_000_000_000usize, global = true)]
     max_index_transactions: usize,
     /// Combined persistent UTXO + history occurrence cap during new indexing/import.
-    #[arg(long, default_value_t = 500_000, global = true)]
+    #[arg(long, default_value_t = 100_000_000_000usize, global = true)]
     max_index_entries: usize,
     /// Maximum history or UTXO entries returned for one script. Never silently truncates.
     #[arg(long, default_value_t = 10_000, global = true)]
@@ -37,6 +37,82 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Recover a deep reorg into a NEW root using matching archived blocks and Core's new branch.
+    RecoverChain {
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long)]
+        cookie_file: PathBuf,
+        #[arg(long)]
+        output_root: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        min_free_mib: u64,
+    },
+    /// Validate a backup manifest and checksums without modifying data.
+    VerifyBackup {
+        #[arg(long)]
+        directory: PathBuf,
+    },
+    /// Restore a verified backup into a NEW data root; never overwrite current data.
+    Restore {
+        #[arg(long)]
+        backup_dir: PathBuf,
+        #[arg(long)]
+        output_root: PathBuf,
+    },
+    /// Run the private Electrum server with continuous synchronization and mempool reconciliation.
+    Serve {
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long)]
+        cookie_file: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:50001")]
+        listen: SocketAddr,
+        #[arg(long, default_value_t = 2)]
+        poll_seconds: u64,
+        #[arg(long, default_value_t = 512)]
+        min_free_mib: u64,
+        #[arg(long, default_value_t = 50_000)]
+        max_mempool_transactions: usize,
+        #[arg(long, default_value_t = 64)]
+        max_mempool_mib: usize,
+        #[arg(long, default_value_t = 500_000)]
+        max_mempool_entries: usize,
+        #[arg(long, default_value_t = 16)]
+        max_connections: usize,
+        #[arg(long, default_value_t = 1000)]
+        max_subscriptions: usize,
+    },
+    /// Ask a running local daemon for readiness and counters.
+    Health {
+        #[arg(long, default_value = "127.0.0.1:50001")]
+        address: SocketAddr,
+    },
+    /// Copy a closed matching archive/index generation into a NEW backup directory.
+    Backup {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Reconstruct and compare all semantic index data against the archived intent log.
+    Audit,
+    /// Explicit schema-1 -> schema-2 migration, with a mandatory NEW backup directory.
+    MigrateIndex {
+        #[arg(long)]
+        backup_dir: PathBuf,
+    },
+    /// Audited manual Core pruning on test networks only; never enabled by the daemon.
+    Prune {
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long)]
+        cookie_file: PathBuf,
+        #[arg(long)]
+        backup_dir: PathBuf,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long, default_value_t = 512)]
+        min_free_mib: u64,
+    },
     /// Check Core identity without downloading blocks.
     CheckCore {
         #[arg(long)]
@@ -86,6 +162,181 @@ fn main() -> Result<()> {
         entries: cli.max_index_entries,
     };
     match cli.command {
+        Command::RecoverChain {
+            rpc_url,
+            cookie_file,
+            output_root,
+            min_free_mib,
+        } => {
+            let core = core(cli.network, rpc_url, cookie_file)?;
+            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
+            let mut store = Store::open(
+                &archive.directory().join("index.sqlite"),
+                cli.network,
+                limits,
+            )?;
+            store.recover(&mut archive)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&electrum_lite::operations::recover_chain(
+                    &store,
+                    &archive,
+                    &core,
+                    cli.network,
+                    limits,
+                    &output_root,
+                    min_free_mib
+                        .checked_mul(1024 * 1024)
+                        .context("free-space limit overflow")?
+                )?)?
+            );
+        }
+        Command::VerifyBackup { directory } => {
+            let files = electrum_lite::operations::verify_backup(&directory, cli.network)?;
+            println!(
+                "{}",
+                json!({"verified_files":files.len(),"network":cli.network})
+            );
+        }
+        Command::Restore {
+            backup_dir,
+            output_root,
+        } => {
+            electrum_lite::operations::restore(&backup_dir, &output_root, cli.network)?;
+            println!(
+                "{}",
+                json!({"restored":output_root,"next":"run inspect; schema-1 backups require migration or the previous binary"})
+            );
+        }
+        Command::Serve {
+            rpc_url,
+            cookie_file,
+            listen,
+            poll_seconds,
+            min_free_mib,
+            max_mempool_transactions,
+            max_mempool_mib,
+            max_mempool_entries,
+            max_connections,
+            max_subscriptions,
+        } => {
+            let options = electrum_lite::electrum::Options {
+                transport: electrum_lite::electrum::TransportLimits {
+                    connections: max_connections,
+                    subscriptions: max_subscriptions,
+                },
+                chain: cli.network,
+                data_dir: cli.data_dir,
+                core: core(cli.network, rpc_url, cookie_file)?,
+                limits,
+                query_limit: cli.max_query_results,
+                listen,
+                poll_seconds,
+                min_free_bytes: min_free_mib
+                    .checked_mul(1024 * 1024)
+                    .context("free-space limit overflow")?,
+                mempool_budget: electrum_lite::mempool::Budget {
+                    transactions: max_mempool_transactions,
+                    entries: max_mempool_entries,
+                    bytes: max_mempool_mib
+                        .checked_mul(1024 * 1024)
+                        .context("mempool size overflow")?,
+                },
+            };
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?
+                .block_on(electrum_lite::electrum::serve(options))?;
+        }
+        Command::Health { address } => {
+            use std::io::{BufRead, Read, Write};
+            ensure!(
+                address.ip().is_loopback(),
+                "health endpoint must be loopback"
+            );
+            let mut stream =
+                std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(90)))?;
+            stream.write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.health\",\"params\":[]}\n",
+            )?;
+            let mut line = String::new();
+            std::io::BufReader::new(stream)
+                .take(65536)
+                .read_line(&mut line)?;
+            let result: serde_json::Value = serde_json::from_str(&line)?;
+            ensure!(result.get("error").is_none(), "health request failed");
+            ensure!(
+                result["result"]["network"] == cli.network.name(),
+                "health endpoint network mismatch"
+            );
+            println!("{}", serde_json::to_string_pretty(&result["result"])?);
+        }
+        Command::MigrateIndex { backup_dir } => {
+            let archive = Archive::open(&cli.data_dir, cli.network, false)?;
+            electrum_lite::operations::migrate(&archive, cli.network, &backup_dir)?;
+            println!(
+                "{}",
+                json!({"schema":2,"backup":backup_dir,"next":"run inspect before serving"})
+            );
+        }
+        Command::Backup { output } => {
+            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
+            let mut store = Store::open(
+                &archive.directory().join("index.sqlite"),
+                cli.network,
+                limits,
+            )?;
+            store.recover(&mut archive)?;
+            electrum_lite::operations::backup(&archive, &output)?;
+            println!("{}", json!({"backup":output}));
+        }
+        Command::Audit => {
+            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
+            let mut store = Store::open(
+                &archive.directory().join("index.sqlite"),
+                cli.network,
+                limits,
+            )?;
+            store.recover(&mut archive)?;
+            store.audit(&mut archive)?;
+            println!("{}", json!({"audit":"ok"}));
+        }
+        Command::Prune {
+            rpc_url,
+            cookie_file,
+            backup_dir,
+            confirm,
+            min_free_mib,
+        } => {
+            ensure!(confirm,"pruning is destructive: explicit --confirm and a new backup directory are required");
+            ensure!(
+                cli.network != Chain::Mainnet,
+                "mainnet pruning remains gated on sustained validation; no unsafe override"
+            );
+            let core = core(cli.network, rpc_url, cookie_file)?;
+            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
+            let mut store = Store::open(
+                &archive.directory().join("index.sqlite"),
+                cli.network,
+                limits,
+            )?;
+            store.recover(&mut archive)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&electrum_lite::operations::prune(
+                    &store,
+                    &mut archive,
+                    &core,
+                    cli.network,
+                    &backup_dir,
+                    min_free_mib
+                        .checked_mul(1024 * 1024)
+                        .context("free-space limit overflow")?
+                )?)?
+            );
+        }
         Command::CheckCore {
             rpc_url,
             cookie_file,
@@ -104,11 +355,6 @@ fn main() -> Result<()> {
         } => {
             ensure!(max_blocks > 0, "max-blocks must be positive");
             let core = core(cli.network, rpc_url, cookie_file)?;
-            let info = core.verify(cli.network)?;
-            let core_height: u32 = info["blocks"]
-                .as_u64()
-                .context("Core missing blocks height")?
-                .try_into()?;
             let mut archive = Archive::open(&cli.data_dir, cli.network, true)?;
             let mut index = Store::open(
                 &archive.directory().join("index.sqlite"),
@@ -116,42 +362,15 @@ fn main() -> Result<()> {
                 limits,
             )?;
             index.recover(&mut archive)?;
-            let tip = index.stats()?.tip;
-            if let Some((height, hash)) = tip {
-                ensure!(height <= core_height && core.hash(height)? == hash, "archive differs from Core active chain; beta has no rollback, preserve archive and rebuild in a separate directory");
-            }
-            let start = tip.map_or(0, |(h, _)| h + 1);
-            let end = to_height
-                .unwrap_or(core_height)
-                .min(core_height)
-                .min(start.saturating_add(max_blocks - 1));
-            if start <= end {
-                if info["pruned"].as_bool() == Some(true) {
-                    let floor = info["pruneheight"]
-                        .as_u64()
-                        .context("Core missing pruneheight")?;
-                    ensure!(u64::from(start.max(1)) >= floor || end == 0, "required historical blocks are already pruned; restore a trusted archive or use a node with complete history");
-                }
-                let anchor = core.hash(end)?;
-                for height in start..=end {
-                    // Refuse a moving branch. A concurrent reorg still requires explicit recovery.
-                    ensure!(
-                        core.hash(end)? == anchor,
-                        "Core reorg during sync; stopped without pruning"
-                    );
-                    let hash = core.hash(height)?;
-                    let block = core.block(hash)?;
-                    ensure!(
-                        core.hash(height)? == hash,
-                        "Core reorg while fetching block"
-                    );
-                    index.commit(&mut archive, height, &block)?;
-                }
-                ensure!(
-                    core.hash(end)? == anchor,
-                    "Core reorg at batch end; archive needs recovery before further syncing"
-                );
-            }
+            electrum_lite::sync::batch(
+                &mut index,
+                &mut archive,
+                &core,
+                cli.network,
+                max_blocks,
+                to_height,
+                None,
+            )?;
             print_stats(&index, cli.network)?;
         }
         Command::RebuildIndex { output } => {
@@ -237,7 +456,7 @@ fn print_stats(index: &Store, chain: Chain) -> Result<()> {
             "indexed_tip": stats.tip.map(|(height, hash)| json!({"height":height,"hash":hash})),
             "durable_tip":stats.tip.map(|(height,hash)| json!({"height":height,"hash":hash})),
             "transactions":stats.transactions, "utxos":stats.utxos,"history_entries":stats.history,
-            "index_backend":"sqlite-schema-1",
+            "index_backend":"sqlite-schema-2",
             "scope":"local archived prefix only; not necessarily synchronized with Core",
             "electrum_server":false, "pruning_enabled":false
         }))?

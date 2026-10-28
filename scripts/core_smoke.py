@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import socket
-import shutil
 import subprocess
 import tempfile
 import time
@@ -79,7 +78,7 @@ def main():
                         stats = run("sync", *online, "--max-blocks", "200")
                         assert stats["indexed_tip"]["height"] == 106
                         assert stats["durable_tip"] == stats["indexed_tip"]
-                        assert stats["index_backend"] == "sqlite-schema-1"
+                        assert stats["index_backend"] == "sqlite-schema-2"
                         assert (root / "archive" / chain / "index.sqlite").is_file()
                         fetched = run("transaction", txid)
                         expected = json.loads(rpc("gettransaction", txid).stdout)["hex"]
@@ -91,16 +90,40 @@ def main():
                         rebuilt = run("rebuild-index", "--output", str(root / "rebuilt.sqlite"))
                         assert rebuilt["durable_tip"] == stats["durable_tip"]
                         # All CLI processes have exited: copy one complete matching generation.
-                        shutil.copytree(root / "archive", root / "backup")
+                        run("backup", "--output", str(root / "backup"))
+                        run("verify-backup", "--directory", str(root / "backup"))
+                        run("restore", "--backup-dir", str(root / "backup"), "--output-root", str(root / "restored"))
                         restored = subprocess.run(
-                            [binary, "--network", chain, "--data-dir", str(root / "backup"), "inspect"],
+                            [binary, "--network", chain, "--data-dir", str(root / "restored"), "inspect"],
                             text=True, capture_output=True, timeout=60,
                         )
                         assert restored.returncode == 0, restored.stderr
                         assert json.loads(restored.stdout)["durable_tip"] == stats["durable_tip"]
-                        # An active chain mismatch fails closed; no implicit rollback.
+                        # A retained reorg durably rewinds without deleting archived bytes.
                         assert rpc("invalidateblock", stats["indexed_tip"]["hash"]).returncode == 0
-                        run("sync", *online, success=False)
+                        assert run("sync", *online)["indexed_tip"]["height"] == 105
+                        assert rpc("setmocktime", str(int(time.time()) + 30)).returncode == 0
+                        generated = rpc("generatetoaddress", "2", address)
+                        assert generated.returncode == 0, generated.stderr
+                        assert run("sync", *online)["indexed_tip"]["height"] == 107
+                        assert run("audit")["audit"] == "ok"
+                        from electrum_smoke import test_server
+                        test_server(binary, root, cookie, port, rpc, address, txid)
+                        assert rpc("generatetoaddress", "400", address).returncode == 0
+                        old = run("sync", *online, "--max-blocks", "1000")
+                        original_database = (root / "archive" / chain / "index.sqlite").read_bytes()
+                        fork = rpc("getblockhash", "100").stdout.strip()
+                        assert rpc("invalidateblock", fork).returncode == 0
+                        assert rpc("setmocktime", str(int(time.time()) + 120)).returncode == 0
+                        assert rpc("generatetoaddress", "410", address).returncode == 0
+                        run("sync", *online, success=False)  # Beyond retained undo; never silently reset.
+                        assert run("inspect")["indexed_tip"] == old["indexed_tip"]
+                        recovered = run("recover-chain", *online, "--output-root", str(root / "deep-recovered"), "--min-free-mib", "8")
+                        assert recovered["height"] == 509
+                        assert (root / "archive" / chain / "index.sqlite").read_bytes() == original_database
+                        verified = subprocess.run([binary, "--network", chain, "--data-dir", str(root / "deep-recovered"), "audit"], text=True, capture_output=True, timeout=60)
+                        assert verified.returncode == 0, verified.stderr
+                        print("PASS deep reorg: automatic rewind denied, canonical chain recovered into a separate root, original generation unchanged")
                     else:
                         # Offline genesis only: not a live public-network synchronization.
                         stats = run("sync", *online, "--max-blocks", "1")

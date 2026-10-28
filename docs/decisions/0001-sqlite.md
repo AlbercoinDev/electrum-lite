@@ -2,6 +2,8 @@
 
 Estado: decidido para la continuación de `0.0.1-beta.1`. No implica formato estable ni autorización de poda.
 
+Nota histórica: el esquema 1 y las limitaciones originales corresponden a la primera entrega de persistencia. La implementación actual usa schema 2 y el log de ramas de [ADR-002](0002-branch-log.md).
+
 ## Decisión
 
 Una base SQLite mediante rusqlite 0.41.1 y SQLite empaquetado (`bundled`). Esquema 1 en `src/schema.sql`; bloques originales fuera de la base en ELBETA01. Usar journal DELETE, synchronous EXTRA, claves foráneas activas, mmap desactivado y caché de páginas sugerida de 8 MiB. No usar WAL inicialmente para simplificar copias cerradas y recuperación.

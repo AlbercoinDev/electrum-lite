@@ -415,3 +415,73 @@ fn archive_io_failure_rolls_back_all_prepared_sql() {
     store.recover(&mut archive).unwrap();
     store.integrity_check().unwrap();
 }
+
+#[test]
+fn rewind_crash_worker() {
+    let Ok(root) = std::env::var("ELECTRUM_TEST_REWIND_ROOT") else {
+        return;
+    };
+    let mut archive = Archive::open(std::path::Path::new(&root), Chain::Regtest, false).unwrap();
+    let mut store = Store::open(
+        &archive.directory().join("index.sqlite"),
+        Chain::Regtest,
+        limits(),
+    )
+    .unwrap();
+    store.recover(&mut archive).unwrap();
+    let (_, location) = store.record(1).unwrap().unwrap();
+    let (_, ancestor) = archive.read(location).unwrap();
+    archive.append(1, &ancestor).unwrap(); // Simulate death after durable rewind intent, before SQL undo.
+    std::process::exit(87);
+}
+
+#[test]
+fn reorg_intent_survives_crash_and_rebuild_preserves_new_branch() {
+    let root = tempdir().unwrap();
+    let chain = Chain::Regtest;
+    let mut block = genesis_block(chain.network());
+    let original;
+    {
+        let mut archive = Archive::open(root.path(), chain, true).unwrap();
+        let mut store =
+            Store::open(&archive.directory().join("index.sqlite"), chain, limits()).unwrap();
+        store.recover(&mut archive).unwrap();
+        store.commit(&mut archive, 0, &block).unwrap();
+        for height in 1..=3 {
+            block = next(&block, vec![coinbase(height)]);
+            store.commit(&mut archive, height, &block).unwrap();
+        }
+        original = fs::read(archive.directory().join("blocks-00000000.elb")).unwrap();
+    }
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "rewind_crash_worker", "--nocapture"])
+        .env("ELECTRUM_TEST_REWIND_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert_eq!(child.status.code(), Some(87));
+    let mut archive = Archive::open(root.path(), chain, false).unwrap();
+    let mut store =
+        Store::open(&archive.directory().join("index.sqlite"), chain, limits()).unwrap();
+    assert_eq!(store.stats().unwrap().tip.unwrap().0, 3);
+    store.recover(&mut archive).unwrap();
+    assert_eq!(store.stats().unwrap().tip.unwrap().0, 1);
+    store.audit(&mut archive).unwrap();
+    let (_, location) = store.record(1).unwrap().unwrap();
+    let (_, mut parent) = archive.read(location).unwrap();
+    for height in 2..=3 {
+        parent = next(&parent, vec![coinbase(1000 + height)]);
+        store.commit(&mut archive, height, &parent).unwrap();
+    }
+    store.audit(&mut archive).unwrap();
+    let expected = store.fingerprint().unwrap();
+    assert!(fs::read(archive.directory().join("blocks-00000000.elb"))
+        .unwrap()
+        .starts_with(&original));
+    drop(store);
+    drop(archive);
+    let mut archive = Archive::open(root.path(), chain, false).unwrap();
+    let mut store =
+        Store::open(&archive.directory().join("index.sqlite"), chain, limits()).unwrap();
+    store.recover(&mut archive).unwrap();
+    assert_eq!(store.fingerprint().unwrap(), expected);
+}

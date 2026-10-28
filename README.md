@@ -1,26 +1,26 @@
 # Electrum Lite — beta 0.0.1
 
-**Versión técnica: `0.0.1-beta.1` (sin incremento de versión).** CLI experimental en Rust para archivar bloques Bitcoin completos con Zstandard y mantener historial/UTXO en SQLite. Esta continuación está en la rama `main`; la etiqueta publicada originalmente conserva su contenido y no se mueve.
+**Versión: `0.0.1-beta.1`, sin cambios.** Servidor Electrum privado en Rust para **mainnet, Signet y Testnet4**, con Bitcoin Core como validador, archivo histórico de bloques completos Zstandard e índices SQLite.
 
-**Todavía no es un servidor Electrum:** no acepta conexiones de Sparrow ni sigue mempool. Ya hay base transaccional y una primitiva interna de undo, pero no recuperación automática de reorgs ni controlador de poda. No usar como servicio de cartera ni para autorizar la eliminación de bloques de Core.
+La rama **`main` contiene la beta funcional actual**. La etiqueta `v0.0.1-beta.1` conserva la entrega inicial; no se ha movido ni sustituido. Al mantener la versión, registra también el commit instalado (`git rev-parse HEAD`).
 
-## Funciones disponibles
+**Experimental, no certificado para fondos reales.** Hay pruebas TCP extremo a extremo en regtest y validación de un prefijo real de Signet/Testnet4; todavía no hay sincronización completa sostenida, prueba GUI con Sparrow ni mediciones en hardware antiguo. **La poda en mainnet está bloqueada**, sin opción insegura para saltarse la protección.
 
-- Selección explícita de **mainnet, Signet, Testnet4** y regtest auxiliar, con directorios separados y comprobación de red/génesis contra Core.
-- RPC local autenticado por cookie; el secreto no se guarda en el archivo ni se incluye en mensajes RPC de error.
-- Descarga secuencial desde génesis, comprobación de continuidad, raíz Merkle y compromiso witness.
-- Archivo append-only de segmentos de hasta 64 MiB, frames Zstandard por bloque, checksum, `fsync` y bloqueo exclusivo.
-- Índices persistentes en **una base SQLite**, esquema 1, journal DELETE y sincronización EXTRA. Caché de páginas sugerida de 8 MiB; no es un límite total de RSS.
-- Commit coordinado: preparar cambios SQL, sincronizar el bloque archivado y confirmar referencias/UTXO/historial/undo en una transacción.
-- Reanudación con verificación completa del archivo, sin reconstruir los índices ya confirmados en RAM; recuperación idempotente de registros completos archivados aún no indexados. Colas incompletas, corrupción y generaciones mezcladas causan error.
-- Consultas SQL de historial/UTXO por scripthash Electrum y recuperación exacta de transacciones por ubicación en archivo, incluido witness.
-- Undo interno de hasta 288 bloques y reconstrucción no destructiva a una base separada. La CLI aún rechaza reorgs en vez de revertirlas automáticamente.
+## Qué funciona
 
-Bitcoin Core conserva la responsabilidad de validar consenso. Las comprobaciones del archivo no convierten esta app en un validador independiente. No hay ahorro de disco ni consumo mínimo de RAM demostrados.
+- Servicio Electrum TCP privado, negociación 1.4, cabeceras y checkpoints, historial, saldo, UTXO, transacciones con witness, pruebas Merkle, fees y difusión.
+- Mempool reconciliada por RPC: padres/hijos, alturas 0/-1, RBF, gastos pendientes, suscripciones y notificaciones.
+- Sincronización continua, un escritor lógico y respuestas de una generación consistente. No devuelve balances/historiales vacíos cuando el índice no está listo.
+- Reorgs dentro del undo retenido (hasta 288 bloques): marcas de intención durables, reversión y nueva rama, sin sobrescribir bloques anteriores.
+- SQLite schema 2, commit coordinado, recuperación tras reinicios, auditoría semántica y reconstrucción separada.
+- Backup con manifiesto SHA-256, verificación, restauración a directorio nuevo y migración explícita con copia previa.
+- Poda manual auditada en redes de prueba, con backup obligatorio y demostración de recuperación histórica después de poda efectiva.
 
-## Instalación desde código
+No hay GUI, servidor público, TLS nativo, telemetría ni dependencia de servidores Electrum externos. El TCP solo permite loopback; usa un túnel privado para acceso remoto. **Conservar todo el histórico exige disco: no hay un ahorro total ni un mínimo de RAM demostrado.**
 
-Entorno probado: Linux x86-64, Rust **1.99.1**, Bitcoin Core **31.0**. Otros sistemas y versiones no se han validado. No se exige AVX2. Se necesita un compilador C para Zstandard/secp256k1.
+## Instalar
+
+Entorno probado: **Linux x86-64, Rust 1.99.1 y Bitcoin Core 31.0**. No se exige AVX2. Otras plataformas/versiones no se han validado.
 
 En Debian/Ubuntu:
 
@@ -39,108 +39,132 @@ cargo build --release --locked
 ./target/release/electrum-lite --help
 ```
 
-`rust-toolchain.toml` fija el toolchain y `Cargo.lock` fija las dependencias. Opcionalmente instala la CLI en `~/.cargo/bin` con `cargo install --path . --locked`. No hay instalador ni binarios precompilados oficiales en esta beta.
+Toolchain y dependencias quedan fijados en `rust-toolchain.toml` y `Cargo.lock`. Opcionalmente: `cargo install --path . --locked`. Para reemplazar una instalación existente se necesita `--force`: **conserva antes el binario previo y una copia de datos**, especialmente si migras esquema. No hay binarios precompilados oficiales.
 
-## Preparar Bitcoin Core
+## Preparar Core y los datos
 
-Usa un Core local con `server=1`, autenticación por cookie y RPC solo en loopback. La app acepta únicamente URLs HTTP con IP de loopback y sin credenciales en URL; no sigue redirecciones. Para Core remoto, usa un túnel seguro con extremo local.
+Usa un nodo dedicado de laboratorio, RPC por cookie y puertos solo en localhost. Configuración conceptual del Core dedicado:
 
-La app **no cambia la configuración de Core ni ejecuta poda**. Para una instalación nueva destinada a poda manual, el diseño requiere `prune=1` y `txindex=0`, pero **esta beta no debe usarse para decidir cuándo podar**. La poda automática puede eliminar datos antes de archivarlos. Un Core ya podado no permite completar desde cero el histórico faltante.
+```ini
+server=1
+prune=1
+txindex=0
+```
 
-No modifiques la configuración ni los datos de tu nodo habitual para experimentar. Usa nodos de laboratorio independientes; nunca expongas RPC a Internet.
+`prune=1` significa **poda manual**, no automática. La app no cambia la configuración de Core. No apliques estos ajustes a un nodo valioso sin revisar sus backups y consumidores. No expongas RPC a Internet.
 
-| Red | `--network` | Puerto RPC habitual | Cookie habitual en Linux |
+Una instalación nueva debe disponer de bloques desde génesis. Si Core ya eliminó histórico y no hay archivo/backup confiable, **no se puede reconstruir ese histórico mágicamente**. Core puede descargar más rápido de lo que indexamos: durante IBD no hay un máximo de disco garantizado.
+
+| Red | `--network` | RPC habitual | Cookie Linux habitual |
 |---|---|---|---|
 | Mainnet | `mainnet` | 8332 | `~/.bitcoin/.cookie` |
-| Signet | `signet` | 38332 | `~/.bitcoin/signet/.cookie` |
+| Signet estándar | `signet` | 38332 | `~/.bitcoin/signet/.cookie` |
 | Testnet4 | `testnet4` | 48332 | `~/.bitcoin/testnet4/.cookie` |
 | Regtest auxiliar | `regtest` | 18443 | `~/.bitcoin/regtest/.cookie` |
 
-Si Core usa otro datadir/puerto, especifica su cookie y `--rpc-url http://127.0.0.1:PUERTO/`. Los ejemplos Signet se refieren a la red estándar; signets personalizadas no están validadas.
+Otro datadir/puerto: pasa `--cookie-file` y `--rpc-url http://127.0.0.1:PUERTO/`. Solo se aceptan IPs loopback, sin credenciales en URL ni redirecciones. Signets personalizadas no están validadas.
 
-## Uso
+Los datos se separan automáticamente en `DATA_ROOT/mainnet`, `DATA_ROOT/signet`, etc. **`--network` debe ir antes del subcomando.**
 
-`--network` es obligatorio y debe ir **antes del subcomando**. No hay una red predeterminada.
+### Actualizar desde SQLite schema 1
 
-### Verificar Core sin descargar bloques
+Detén todas las instancias, conserva el binario anterior y ejecuta con el nuevo binario:
+
+```sh
+./target/release/electrum-lite --network signet --data-dir ./data \
+  migrate-index --backup-dir ./before-schema2
+./target/release/electrum-lite --network signet --data-dir ./data inspect
+```
+
+El destino del backup debe ser nuevo. Se conserva la copia completa anterior y se migra SQLite en una transacción. No se reescriben bloques `ELBETA01`; schema 2 añade cabeceras, cursor del log de ramas y auditoría de poda. Los archivos sin SQLite se importan directamente al esquema nuevo. Esquemas desconocidos se rechazan. [Actualización, rollback y recuperación](docs/operations.md).
+
+## Arrancar
+
+Verifica primero el nodo:
 
 ```sh
 ./target/release/electrum-lite --network signet check-core \
   --cookie-file "$HOME/.bitcoin/signet/.cookie"
-
-./target/release/electrum-lite --network testnet4 check-core \
-  --cookie-file "$HOME/.bitcoin/testnet4/.cookie"
-
-./target/release/electrum-lite --network mainnet check-core \
-  --cookie-file "$HOME/.bitcoin/.cookie"
 ```
 
-### Archivar un lote limitado
+Servicio Signet:
 
 ```sh
+./target/release/electrum-lite --network signet --data-dir ./data serve \
+  --cookie-file "$HOME/.bitcoin/signet/.cookie" --listen 127.0.0.1:60601
+```
+
+Servicio Testnet4:
+
+```sh
+./target/release/electrum-lite --network testnet4 --data-dir ./data serve \
+  --cookie-file "$HOME/.bitcoin/testnet4/.cookie" --listen 127.0.0.1:61001
+```
+
+Servicio mainnet, **solo para validación experimental y sin poda habilitada**:
+
+```sh
+./target/release/electrum-lite --network mainnet --data-dir ./data serve \
+  --cookie-file "$HOME/.bitcoin/.cookie" --listen 127.0.0.1:50001
+```
+
+El arranque verifica íntegramente archivo, referencias e índices; puede tardar según el histórico. Después sincroniza lotes y reconcilia mempool. Las consultas de cartera solo se habilitan al alcanzar el tip observado de Core, finalizar IBD y obtener una mempool consistente dentro de los presupuestos.
+
+En otra terminal:
+
+```sh
+./target/release/electrum-lite --network signet health --address 127.0.0.1:60601
+```
+
+Comprueba `ready`, tip local/Core, IBD, conexiones/red activa, espacio, tamaños de archivo/base y presupuesto de mempool. `ready` significa coherencia con el **Core observado**, no conexión garantizada al resto de Bitcoin. Core sin pares o con red desactivada puede estar atrasado. Ctrl+C/SIGTERM detiene el servicio; no ejecuta poda automática.
+
+Para Sparrow, selecciona la misma red y **Private Electrum server**, host `127.0.0.1` y el puerto elegido. TCP sin SSL solo en loopback/túnel privado; nunca transportes abierto por Internet. La interfaz con Sparrow real sigue pendiente de validación aquí: no se ha instalado ni probado su GUI. Ver [perfil de protocolo y pruebas](docs/protocol.md).
+
+## Herramientas y límites
+
+```sh
+# Lote manual; continuar repitiendo el comando. No omite el prefijo desde génesis.
 ./target/release/electrum-lite --network signet --data-dir ./data sync \
   --cookie-file "$HOME/.bitcoin/signet/.cookie" --max-blocks 100
+./target/release/electrum-lite --network signet --data-dir ./data inspect
+./target/release/electrum-lite --network signet --data-dir ./data audit
 ```
 
-Repetir el comando verifica lo existente y continúa desde el siguiente bloque. `--to-height N` establece una altura máxima adicional; no omite el procesamiento desde génesis. `--max-blocks` limita el lote (100 por defecto), no el tamaño del archivo total. Para Testnet4 cambia red y cookie; mainnet usa la misma interfaz, pero no está validada una sincronización completa.
+También hay `history SCRIPTHASH`, `transaction TXID [--height ALTURA]`, `rebuild-index --output NUEVO.sqlite`, `backup`, `verify-backup`, `restore`, `recover-chain` y `prune`. Las herramientas de archivos requieren el servicio detenido por su bloqueo exclusivo. Las respuestas offline representan el histórico local, que puede estar incompleto o pertenecer a una rama que ya cambió en Core.
 
-Los datos quedan en `./data/signet/`, `./data/testnet4/`, etc., junto a `index.sqlite`. **El archivo es un prefijo histórico que puede estar incompleto o atrasado, no una prueba de sincronización con la punta actual.** Cada invocación comprueba integridad SQLite, claves foráneas, contadores y todos los bloques/referencias (E/S proporcional al histórico), pero no vuelve a aplicar los ya indexados ni carga todo el UTXO/historial en memoria. Esto no sustituye una auditoría semántica completa de saldos reconstruidos desde génesis.
+- SQLite sugiere caché de páginas de 8 MiB; no es un límite total de RAM.
+- Mempool: 50 000 transacciones, 64 MiB serializados y 500 000 entradas input/output por defecto; `--max-mempool-transactions`, `--max-mempool-mib`, `--max-mempool-entries`. Se calienta la caché en lotes de hasta 500 TX/ciclo. Si no cabe, no se sirve un historial parcial: queda no listo.
+- Transporte: 16 conexiones y 1 000 suscripciones por conexión por defecto, configurables con `--max-connections`/`--max-subscriptions`. Lotes JSON-RPC de hasta 64, 200 peticiones por 10 s/conexión, mensaje hasta 8,1 MB, respuesta hasta 16,2 MB, idle 120 s y escritura 15 s.
+- `--max-query-results` limita a 10 000 entradas por script y produce error, nunca truncado silencioso. Checkpoints de cabeceras hasta altura 2 000 000; chunks de 2 016.
+- `--min-free-mib` de `serve` y mantenimiento: 512 MiB por defecto. No garantiza espacio suficiente para un backup/auditoría grande ni supervisa otro filesystem de Core.
+- `--max-index-transactions` y `--max-index-entries` son topes acumulados de seguridad en disco durante importación/nueva indexación, no de RAM; sus defaults permiten indexación extensa.
 
-Los topes de seguridad durante nueva indexación/importación siguen siendo 100 000 transacciones (`--max-index-transactions`) y 500 000 entradas UTXO + historial (`--max-index-entries`). Se comprueban antes de archivar nuevos bloques; una cola completa ya archivada requiere límites suficientes para importarla. Son topes de crecimiento, no un presupuesto de RAM ni una validación de sincronización completa de mainnet.
-
-`--max-query-results` limita a 10 000 las entradas de historial o UTXO devueltas por script; superar el límite produce error sin devolver un historial parcial. Las consultas sobre índices ya existentes no vuelven a aplicar los topes de importación.
-
-### Verificar y consultar offline
+## Backup y poda
 
 ```sh
-./target/release/electrum-lite --network signet inspect
+# Con el servicio detenido. Los destinos deben ser nuevos y estar fuera del origen.
+./target/release/electrum-lite --network signet --data-dir ./data backup --output ./backup-signet
+./target/release/electrum-lite --network signet verify-backup --directory ./backup-signet
+./target/release/electrum-lite --network signet restore \
+  --backup-dir ./backup-signet --output-root ./restored-data
+./target/release/electrum-lite --network signet --data-dir ./restored-data inspect
 ```
+
+La poda es **mantenimiento explícito en redes de prueba**, no un modo automático. Requiere Core con poda manual, red de Core desactivada explícitamente por el operador, ningún otro escritor de cadena, prefijo indexado coincidente, auditoría semántica, margen de 288 bloques y backup nuevo. Puede podar un prefijo durable durante bootstrap aunque Core vaya por delante.
 
 ```sh
-# Sustituye los argumentos por hashes hexadecimales reales.
-./target/release/electrum-lite --network signet history SCRIPT_HASH
-./target/release/electrum-lite --network signet transaction TXID
-./target/release/electrum-lite --network mainnet transaction TXID --height ALTURA
+# Solo sobre el nodo de pruebas dedicado. Detén primero Electrum Lite.
+bitcoin-cli -signet setnetworkactive false
+./target/release/electrum-lite --network signet --data-dir ./data prune \
+  --cookie-file "$HOME/.bitcoin/signet/.cookie" \
+  --confirm --backup-dir ./before-prune-signet
+# Revisa el resultado y vuelve a activar la red de Core cuando sea seguro.
+bitcoin-cli -signet setnetworkactive true
 ```
 
-El scripthash es SHA-256 de scriptPubKey con bytes invertidos, como en Electrum; la base conserva el hash binario canónico. Las respuestas incluyen solo los bloques archivados: no mempool, ni saldo gastable ajustado por madurez de coinbase. `--height` desambigua TXID históricos duplicados. No hay todavía comando público de pruebas Merkle ni servidor JSON-RPC Electrum.
+Registra altura solicitada/real, verifica indisponibilidad del bloque en Core y conserva auditoría. Ante fallo tras solicitar poda, se bloquean nuevas peticiones hasta revisión del operador. No borres auditorías para forzarlas. Nunca ejecutes pruebas destructivas contra nodos compartidos/valiosos. [Procedimientos completos](docs/operations.md).
 
-`indexed_tip` y `durable_tip` describen la generación local confirmada. **No significan que el índice esté actualizado contra Core ni que la poda esté autorizada.**
-
-### Actualizar desde la beta inicial
-
-Con todos los procesos detenidos, haz una copia completa del directorio de red. Conserva el binario anterior y esa copia para rollback. El formato de bloques `ELBETA01` no cambia: al ejecutar esta continuación sobre un archivo sin `index.sqlite`, se crea el esquema 1 y se importa el histórico desde génesis, sin eliminar ni reescribir bloques. Es necesario espacio adicional para base, journal y backup.
-
-La creación/importación es reanudable por bloque. Una base con esquema desconocido o dañada se rechaza; no se migra ni sobrescribe silenciosamente. El binario anterior ignora SQLite y conserva sus límites de RAM; para volver a él usa la copia previa en otro directorio, no mezcles archivos de distintos momentos.
-
-## Seguridad, backups y recuperación
-
-- No hay rollback automático: una reorg detectada al sincronizar bloquea la continuación. Conserva el archivo y reconstruye en **otro directorio**, usando un Core que aún disponga de todo el histórico necesario.
-- Una cola incompleta o checksum incorrecto causa error. No se trunca ni repara automáticamente; no borres archivos para intentar continuar. Restaura una copia verificada o reconstruye aparte.
-- Para backup, termina todas las CLI y copia **todo** el subdirectorio de red: archivo, SQLite y cualquier journal presente después de un fallo. No copies solo la base mientras hay un escritor ni mezcles generaciones. Verifica la copia con `inspect` desde otro directorio raíz. Se prueba restauración de una copia cerrada en regtest; no equivale a una certificación de recuperación ni autoriza poda.
-- Se prueban salidas abruptas de subprocesos antes del append, después de sincronizar archivo, con referencias SQL preparadas y después del commit; también SQLITE_FULL simulado con límite de páginas y un error de append. No equivalen a pérdida real de energía, disco físico lleno ni una campaña exhaustiva de fallos.
-- No ejecutes varias instancias sobre el mismo archivo. No mezcles redes ni compartas directorios con Core. No uses root.
-- No hay garantía de límite de disco durante IBD; Core puede descargar más rápido de lo que esta CLI archiva.
-- El formato `ELBETA01` y el esquema SQLite 1 son experimentales. Cambios futuros exigirán migración explícita o reconstrucción, nunca actualización silenciosa.
-
-### Reconstruir sin sobrescribir datos
-
-`rebuild-index --output NUEVO.sqlite` verifica el archivo y genera una base nueva; exige extensión `.sqlite` y rechaza destinos existentes de forma atómica. Un fallo puede dejar una base parcial en ese destino, que debe conservarse para diagnóstico; elige otro nombre para otro intento. El comando no sustituye automáticamente la base activa ni repara una rama reorganizada.
-
-Para trabajar con una reconstrucción, usa un directorio de recuperación nuevo. Ejemplo Signet, **con todas las CLI detenidas y espacio para otra copia del archivo**:
-
-```sh
-recovery="$(mktemp -d ./recovery-XXXXXX)"
-mkdir "$recovery/signet"
-cp -p ./data/signet/blocks-*.elb "$recovery/signet/"
-./target/release/electrum-lite --network signet --data-dir ./data \
-  rebuild-index --output "$recovery/signet/index.sqlite"
-./target/release/electrum-lite --network signet --data-dir "$recovery" inspect
-```
-
-Si verificas la copia, puedes usar ese nuevo `--data-dir`. El original queda intacto para rollback. No sustituyas un SQLite dejando journals antiguos a su lado ni elimines una cola corrupta para forzar el arranque.
-
-## Pruebas
+## Pruebas y estado del plan
 
 ```sh
 cargo fmt --check
@@ -149,21 +173,18 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Para la integración aislada, instala Bitcoin Core 31.0 desde su [distribución oficial](https://bitcoincore.org/bin/bitcoin-core-31.0/) y verifica la descarga siguiendo sus instrucciones. Después:
+Con Bitcoin Core 31.0 instalado y verificado:
 
 ```sh
-BITCOIND=/ruta/a/bitcoind \
-BITCOINCLI=/ruta/a/bitcoin-cli \
-ELECTRUM_LITE=./target/release/electrum-lite \
-python3 scripts/core_smoke.py
+BITCOIND=/ruta/a/bitcoind BITCOINCLI=/ruta/a/bitcoin-cli \
+  python3 scripts/core_smoke.py
+BITCOIND=/ruta/a/bitcoind python3 scripts/prune_smoke.py
 ```
 
-El script crea nodos temporales sin pares públicos y los cierra al terminar. Verifica génesis/red en mainnet, Signet y Testnet4; en regtest genera 106 bloques, realiza un gasto SegWit, verifica transacción, índice persistente, reanudación, reconstrucción separada, restauración de copia cerrada y rechazo de reorg. **No equivale a sincronización real de Signet/Testnet4 ni a validación completa de mainnet.** Estas pruebas sostenidas siguen pendientes.
+Crean únicamente nodos temporales aislados. La segunda prueba genera unos 300 MiB de datos muy compresibles, poda realmente Core y verifica TX/Merkle por Electrum sin ese bloque en Core: **no es un benchmark de compresión**. Las pruebas públicas acotadas son opcionales: `scripts/live_smoke.py --network signet` o `--network testnet4`; implican conexiones P2P y descarga limitada.
 
-La elección de SQLite y el microexperimento reproducible frente a redb están en [ADR-001](docs/decisions/0001-sqlite.md). redb es dependencia de desarrollo del experimento, no un segundo backend de producción.
-
-Ver [resultados y límites de la beta](docs/beta-0.0.1.md) y [especificación](ELECTRUM_LITE_ENGINE_v1.0.md). GitHub Actions ejecuta comprobaciones Rust y la integración aislada.
+Ver [evidencias y pendientes](docs/beta-0.0.1.md), [operación/systemd](docs/operations.md), [protocolo](docs/protocol.md), [decisión SQLite](docs/decisions/0001-sqlite.md) y [especificación](ELECTRUM_LITE_ENGINE_v1.0.md). GitHub Actions ejecuta tests, integración TCP y poda real regtest. No sustituye sincronización sostenida, ensayo con Sparrow ni pruebas de pérdida real de energía.
 
 ## Licencia
 
-La licencia del proyecto sigue pendiente de elección. Publicar el repositorio no concede por sí solo una licencia general de reutilización. Las dependencias mantienen sus propias licencias; ver [notas de dependencias](docs/dependencies.md).
+La licencia propia sigue pendiente de decisión. Un repositorio público no concede por sí solo una licencia general de reutilización. Las dependencias conservan sus licencias: [notas](docs/dependencies.md).

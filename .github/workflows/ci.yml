@@ -24,3 +24,8 @@ jobs:
         env:
           BITCOIND: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoind
           BITCOINCLI: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoin-cli
+      - name: Actual pruning and local historical Electrum proof (isolated regtest)
+        timeout-minutes: 15
+        run: python3 scripts/prune_smoke.py
+        env:
+          BITCOIND: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoind

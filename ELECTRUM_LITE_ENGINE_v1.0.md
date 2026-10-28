@@ -12,7 +12,7 @@ benchmark_scope: "Solo microexperimento KV sintético SQLite/redb; no benchmark 
 
 # Electrum Lite Engine — Especificación técnica
 
-> Diseño objetivo con implementación parcial en la beta `0.0.1-beta.1`, cuya versión se mantiene: CLI, RPC, archivo Zstandard, índices SQLite persistentes y undo interno. No hay servidor Electrum, recuperación automática de reorgs, mempool ni controlador de poda. Solo hay un microexperimento KV propio, no benchmarks representativos ni garantías de compatibilidad completa o consumo. El tag original no se mueve; la continuación está en main. La arquitectura simplificada sustituye LMDB + segmentos propios + archivo individual de transacciones.
+> Beta funcional de laboratorio `0.0.1-beta.1`, sin incremento de versión: servidor Electrum privado, RPC, archivo Zstandard, SQLite schema 2, mempool, reorgs y operaciones de backup/recuperación/poda explícita en redes de prueba. No certificada para producción: faltan sincronización sostenida completa, ensayo GUI con Sparrow, pruebas físicas de energía y benchmarks representativos. Mainnet está soportada para indexación/servicio experimental, pero su poda permanece bloqueada. El tag inicial no se mueve; el desarrollo actual está en main.
 
 ## 1. Objetivo y prioridades
 
@@ -55,8 +55,8 @@ Servidor Electrum → Sparrow
 ```
 
 - Un ejecutable y un proceso Rust. Empezar con un paquete Cargo con biblioteca, módulos pequeños y CLI; separar crates solo si aporta una ventaja real.
-- Tokio para la futura red Electrum y coordinación; colas y cachés acotadas, un escritor lógico confirmado y lectores con snapshots consistentes. La CLI beta actual es síncrona y no necesita Tokio. No bloquear su futuro runtime con compresión o E/S síncrona pesada.
-- **[DECIDIDO]** Una única base SQLite para índices y metadatos, mediante rusqlite empaquetado, esquema 1. Journal DELETE, synchronous EXTRA y claves foráneas; caché de páginas sugerida de 8 MiB, mmap desactivado. Elegida tras microexperimento SQLite/redb por simplicidad, no por ser la más rápida. Ver ADR-001; redb solo es dependencia de desarrollo.
+- Tokio gestiona transporte y señales. Un worker dedicado posee RPC/SQLite/archivo/mempool, con canal acotado y consultas serializadas con cambios de generación. No bloquear el executor async con esas operaciones síncronas. Durante sincronización/reorg no se sirven como listas consultas de cartera parciales.
+- **[DECIDIDO]** Una única base SQLite para índices y metadatos, mediante rusqlite empaquetado, esquema 2. Journal DELETE, synchronous EXTRA y claves foráneas; caché sugerida de 8 MiB, mmap desactivado. Elegida por simplicidad tras microexperimento, no por ser la más rápida. ADR-001/002; redb solo es dependencia de desarrollo.
 - No construir inicialmente segmentos históricos, compactación, motor KV ni codificación de transacciones propios. El backend gestiona sus estructuras internas.
 - RPC autenticado inicialmente. `getblock(hash, 0)` devuelve serialización hexadecimal dentro de JSON, no un cuerpo binario puro. Decodificar antes de archivar. REST y ZMQ quedan fuera del alcance inicial.
 - Core sigue siendo necesario para nuevos bloques, mempool, estimación de comisiones y difusión, pero no para recuperar histórico ya archivado.
@@ -71,7 +71,7 @@ Servidor Electrum → Sparrow
 - El archivo debe permitir reconstruir índices desde génesis. Esto no implica reconstrucción rápida ni sustituye backups consistentes.
 - Verificar hash, raíz Merkle y compromiso witness cuando aplique. TXID y raíz Merkle de transacciones no verifican por sí solos witness. Probar ida y vuelta byte a byte y TXID/wTXID.
 
-Datos lógicos: UTXO por outpoint e índice por script; historial por scripthash; ocurrencias TX por bloque y posición; cadena activa, referencias al archivo, undo y estado. El esquema inicial ejecutable es `src/schema.sql`: hashes y outpoints binarios, satoshis enteros y ninguna copia adicional de transacciones completas. Cabeceras se recuperan del archivo; formatos estables y optimizaciones adicionales siguen pendientes.
+Datos lógicos: UTXO por outpoint e índice por script; historial por scripthash; ocurrencias TX por bloque y posición; cadena activa, referencias al archivo, cabeceras, cursor durable, undo y auditoría de poda. Fuente ejecutable: `src/schema.sql`. Hashes/outpoints binarios, satoshis enteros y ninguna copia adicional de transacciones completas. Las cabeceras cacheadas se verifican contra el archivo; formatos estables y optimizaciones futuras siguen pendientes.
 
 Invariantes:
 
@@ -98,7 +98,7 @@ Registrar alturas y hashes de `core_tip`, `indexed_tip`, `durable_tip` y `served
 
 Reorg: localizar ancestro común, revertir descendiendo con undo, aplicar nueva rama ascendiendo, publicar y notificar. Conservar datos necesarios mientras haya lectores o rollback pendiente; no retener transacciones de lectura de base durante consultas de red largas.
 
-Ventana inicial de undo: 288 bloques, probada como primitiva interna de índices, no como garantía universal de profundidad segura. La CLI todavía rechaza reorgs: el archivo permanece lineal y falta gestionar ramas alternativas de forma coordinada. No exponer rollback de base sin resolver archivo/lectores. Fuera de la ventana: modo seguro y reconstrucción controlada; evitar GC/reescritura del histórico inicialmente.
+Ventana inicial de undo: hasta 288 bloques, no garantía universal de profundidad segura. Reorgs operacionales escriben primero una repetición durable del bloque ancestral como intención de rewind, revierten índices y aplican la nueva rama; un cursor evita reaplicar huérfanos al reiniciar. El actor no intercala consultas con estos cambios. Reconstrucción reproduce las intenciones (ADR-002). Fuera del undo: fallo seguro y `recover-chain` a raíz nueva, usando bloques locales coincidentes y la rama canónica disponible en Core. Si faltan bytes se requiere otra fuente confiable. No hay GC del histórico inicialmente.
 
 ## 6. Poda y disco
 
@@ -107,12 +107,15 @@ Ventana inicial de undo: 288 bloques, probada como primitiva interna de índices
 - Core elimina archivos completos y conserva mínimos propios. Verificar retorno de `pruneblockchain`, `pruneheight` y disponibilidad real, no asumir eliminación exacta de la altura solicitada.
 - Índice vacío frente a Core ya podado debe fallar claramente salvo restauración histórica confiable.
 - No podar nodos con datos valiosos sin autorización y backups. Persistencia y recuperación deben pasar pruebas antes de habilitar poda.
+- Implementado: mantenimiento CLI de redes de prueba con --confirm, auditoría semántica, backup nuevo y registro durable previo en prune_audit. Requiere P2P de Core explícitamente desactivado por el operador y ningún otro escritor de cadena; comprobación y poda no son ACID global con Core. Se verifica altura efectiva e indisponibilidad real. Un request no finalizado bloquea nuevos intentos hasta revisión. Mainnet permanece bloqueada, sin override inseguro.
 - La poda manual no limita disco durante IBD: si Core adelanta al indexador, crece su almacenamiento. Alertar por espacio y lag; parar Electrum Lite no detiene Core.
 - **[PENDIENTE]** Procedimiento autorizado para espacio crítico. No controlar automáticamente Core sin diseñarlo y probarlo explícitamente.
 
 ## 7. Electrum, mempool y seguridad
 
 Baseline Electrum 1.4; fijar perfil exacto contra especificación y Sparrow. No anunciar versiones o métodos no probados.
+
+Perfil implementado y pruebas TCP: `docs/protocol.md`. Incluye métodos de servidor/cabeceras/scripts/transacciones/fees, mempool, suscripciones, pruebas Merkle/checkpoints, batches, named params y requests legacy. Solo anuncia 1.4. TLS nativo no implementado: TCP loopback y túnel/proxy seguro para remoto. La GUI de Sparrow sigue pendiente de ensayo real.
 
 Métodos previstos: `server.version`, `server.features`, `server.ping`, `server.peers.subscribe`; cabeceras y suscripción; saldo, historial, mempool, UTXO y suscripciones por scripthash; recuperación, difusión, posición y prueba Merkle de transacciones; estimatefee y relayfee. Verificar unsubscribe, verbose, errores, orden, alturas 0/-1, status y pruebas de cabeceras con checkpoint.
 
@@ -125,6 +128,8 @@ Métodos previstos: `server.version`, `server.features`, `server.ping`, `server.
 ## 8. Pruebas y mediciones
 
 **[DECIDIDO]** Signet y Testnet4 son las redes de integración y funcionamiento sostenido. Separar configuración, datos, cookies, puertos e identidad de red; rechazar mezclas. No ejecutar pruebas destructivas sobre nodos compartidos o valiosos. Mainnet queda fuera de las pruebas iniciales.
+
+Evidencia actual: TCP/mempool/RBF/reorg/backup en regtest, poda efectiva tras generar 1 600 bloques y recuperación TX/Merkle local; prefijos reales de 100 bloques/101 TX descargados y auditados en Signet y Testnet4. No equivalen a sincronización completa sostenida ni a validación de hardware objetivo. Resultados: `docs/beta-0.0.1.md`.
 
 Regtest es apoyo local para fixtures deterministas, reorgs, fallos y poda controlada: esos escenarios no pueden provocarse reproduciblemente en redes compartidas.
 
@@ -164,14 +169,14 @@ Estas fases sustituyen M0–M10. No saltar persistencia/recuperación para habil
 
 El paquete beta ya existe. Ejecutar `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` y `cargo build --release --locked`. Las instrucciones reales y el harness de Core están en README y `scripts/core_smoke.py`.
 
-La beta cubre A/B y parte de C: SQLite persistente, commit coordinado, importación/reanudación, undo interno y pruebas de crash de proceso. Faltan reorgs operacionales, campaña completa de fallos y D–F. La CLI verifica todo el archivo al arrancar, sin reconstruir índices confirmados en RAM. Incluye mainnet/Signet/Testnet4/regtest, pero no valida sincronización completa ni servidor Electrum. Ningún durable_tip autoriza poda. ELBETA01 no cambia: segmentos hasta 64 MiB, Zstandard nivel 3, bloque descomprimido hasta 4 000 000 bytes y ventana máxima de 8 MiB. Son parámetros iniciales, no resultados de optimización.
+La beta implementa A–F como funcionalidad de laboratorio: persistencia/reorg, daemon Electrum/mempool y operaciones con pruebas automatizadas, incluida poda real regtest. La aceptación completa de E/F todavía requiere Sparrow real, sincronización sostenida y mediciones; mainnet no está autorizada para poda. Ningún durable_tip por sí solo autoriza destruir datos. Verificación inicial completa sin reconstruir índices confirmados en RAM. Registros físicos ELBETA01 se conservan: segmentos hasta 64 MiB, Zstandard nivel 3, bloque descomprimido hasta 4 000 000 bytes y ventana máxima de 8 MiB; parámetros iniciales, no resultados de optimización.
 
-Migración inicial: copia cerrada completa previa, añadir SQLite schema 1 e importar ELBETA01 sin reescribirlo. Esquemas desconocidos se rechazan. `rebuild-index --output NUEVO.sqlite` genera otra base sin sobrescribir la activa; restauración/rollback usan un directorio separado con archivos y base de la misma generación, incluidos journals. Ver README para el procedimiento que evita mezclar journals antiguos con una base reconstruida.
+Migración: archivos sin base se importan a schema 2. Schema 1 exige `migrate-index --backup-dir NUEVO`, con copia completa previa y cambio transaccional. Se añaden cabeceras/cursor/auditoría sin reescribir bloques. Esquemas desconocidos se rechazan. Rebuild/restore/recover-chain usan destinos nuevos, nunca sobrescriben el origen. Rollback con backup previo + binario previo, sin mezclar journals. Procedimientos: README y `docs/operations.md`.
 
 ## 10. Pendientes y riesgos
 
-- Licencia, estabilización/migración de formatos, límites definitivos y recuperación operacional dentro/fuera de undo. Versiones usadas y dependencias están fijadas en toolchain/Cargo.lock, sin promesa de compatibilidad con otras versiones.
-- Perfil Electrum y versiones de Sparrow, control de disco durante IBD y procedimiento ante espacio crítico.
+- Licencia, estabilización de formatos, límites definitivos y validación física de recuperación/energía. Versiones fijadas en toolchain/Cargo.lock; no promesa de compatibilidad con otras versiones.
+- Ensayo real con Sparrow, sincronización sostenida completa, pruebas a escala y capacidad de mainnet. Control de disco de Core sigue siendo responsabilidad operacional: la app no modifica su conectividad ni garantiza límite durante IBD.
 - Compresión y consultas compiten por CPU; ahorro y funcionamiento en hardware antiguo siguen sin demostrar.
 - Core y la app conservan estados UTXO separados; no compartir ni abrir directamente la base interna de Core.
 - El histórico mainnet puede requerir cientos de GB; índices y duplicación reciente pueden anular el ahorro. No hay tamaño final ni hardware mínimo validados.
@@ -194,3 +199,4 @@ Migración inicial: copia cerrada completa previa, añadir SQLite schema 1 e imp
 | 1.2.0-draft | 2026-10-28 | Mainnet como soporte obligatorio del producto; GitHub público e instrucciones de instalación verificables por entrega. Pruebas iniciales en Signet/Testnet4 y poda mainnet condicionada a validación. |
 | 1.3.0-draft | 2026-10-28 | Beta 0.0.1-beta.1 parcial: CLI, RPC local por cookie, archivo de bloques Zstandard, índices en memoria, consultas offline, tests y CI. Persistencia de índices, undo, poda y servidor Electrum siguen pendientes. |
 | 1.3.0-draft (continuación, misma versión) | 2026-10-28 | SQLite schema 1, commit coordinado, recuperación idempotente, undo interno de 288 bloques y reconstrucción separada; archivo ELBETA01 y versión de app sin cambios. Reorg operacional, poda y Electrum siguen pendientes. |
+| 1.3.0-draft (beta funcional, misma versión) | 2026-10-28 | Schema 2 y migración con backup, log de ramas, reorg/recovery separada, daemon Electrum 1.4, mempool/RBF/suscripciones, poda manual offline de prueba, restore/auditoría/health y ejemplos systemd. Poda real regtest y prefijos públicos verificados; mainnet pruning y aceptación externa pendientes. |

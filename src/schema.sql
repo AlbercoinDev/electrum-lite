@@ -4,7 +4,7 @@ CREATE TABLE state(id INTEGER PRIMARY KEY CHECK(id=1), transactions INTEGER NOT 
 INSERT INTO state VALUES(1,0,0,0);
 CREATE TABLE blocks(
     height INTEGER PRIMARY KEY CHECK(height>=0), hash BLOB NOT NULL UNIQUE CHECK(length(hash)=32),
-    segment INTEGER NOT NULL CHECK(segment>=0), offset INTEGER NOT NULL CHECK(offset>=0), length INTEGER NOT NULL CHECK(length>0)
+    segment INTEGER NOT NULL CHECK(segment>=0), offset INTEGER NOT NULL CHECK(offset>=0), length INTEGER NOT NULL CHECK(length>0), header BLOB CHECK(length(header)=80)
 );
 CREATE TABLE occurrences(
     height INTEGER NOT NULL REFERENCES blocks(height) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
@@ -31,4 +31,6 @@ CREATE TABLE undo(
           (old_value IS NOT NULL AND old_script IS NOT NULL AND old_height IS NOT NULL AND old_coinbase IS NOT NULL AND old_value>=0 AND length(old_script)=32 AND old_height>=0 AND old_coinbase IN(0,1)))
 ) WITHOUT ROWID;
 PRAGMA application_id=0x454C4954;
-PRAGMA user_version=1;
+CREATE TABLE archive_cursor(id INTEGER PRIMARY KEY CHECK(id=1), segment INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL);
+CREATE TABLE prune_audit(id INTEGER PRIMARY KEY, requested INTEGER NOT NULL, actual INTEGER, tip_height INTEGER NOT NULL, tip_hash BLOB NOT NULL, state TEXT NOT NULL);
+PRAGMA user_version=2;

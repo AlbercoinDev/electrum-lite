@@ -1,6 +1,6 @@
 # Beta 0.0.1 — estado y validación
 
-Versión Cargo: `0.0.1-beta.1`, mantenida por petición del usuario. Fecha: 2026-10-28. El tag inicial conserva A/B; la continuación en main añade parte de C. No es una entrega de servidor Electrum.
+Versión Cargo: `0.0.1-beta.1`, mantenida por petición del usuario. Fecha: 2026-10-28. El tag inicial conserva A/B; main contiene el servidor privado funcional de laboratorio. Los apartados iniciales documentan entregas históricas, no las limitaciones actuales.
 
 ## Entrega inicial (tag v0.0.1-beta.1)
 
@@ -27,7 +27,7 @@ Resultado local: formato y clippy sin errores, **14 tests aprobados**, build rel
 
 El tar oficial Core usado coincidió con SHA256 `d3e4c58a35b1d0a97a457462c94f55501ad167c660c245cb1ffa565641c65074`, obtenido del manifiesto HTTPS oficial. No se verificaron firmas de mantenedores en esta ejecución; el checksum no sustituye ese procedimiento de autenticidad.
 
-## Continuación en main, misma versión
+## Primera continuación SQLite (histórica), misma versión
 
 - SQLite schema 1 para UTXO, historial, ocurrencias, referencias de bloques, contadores y undo. Caché sugerida de 8 MiB, journal DELETE, synchronous EXTRA, claves foráneas y hashes binarios.
 - Commit por bloque: preparar SQL, sincronizar archivo, registrar ubicación y confirmar base. Recuperar registros completos no confirmados una sola vez y rechazar generaciones mezcladas, colas truncadas y referencias ausentes.
@@ -40,14 +40,22 @@ Pruebas nuevas: paridad contra índice de referencia, reapertura/importación en
 
 Resultado local de la continuación: **25 tests aprobados**, fmt y clippy correctos, build release e integración Core 31.0 aprobados en las cuatro redes aisladas. No se ha realizado sincronización sostenida pública ni ensayo real de pérdida de energía.
 
-## Pendiente antes de una beta operativa de Electrum
+## Beta funcional actual en main
+
+- Electrum 1.4 TCP loopback, consultas históricas/Merkle, mempool padre/hijo y RBF, difusión, fees y suscripciones; worker único con límites y readiness.
+- SQLite schema 2: cursor y rewind durable, reorgs hasta undo retenido y recuperación profunda a otra raíz conservando el origen. Migración explícita con backup, manifiestos, restore y auditoría semántica.
+- Poda manual de prueba con auditoría, backup nuevo y Core offline; mainnet bloqueada sin override. Ejemplos systemd no iniciados aquí.
+- Verificación Rust: **37 tests**, formato, clippy y release. Integración Core 31.0: TCP, RBF, reorg superficial/profunda, generación reconstruida y bytes SQLite originales preservados.
+- Poda efectiva regtest: 1 600 bloques, 600 con OP_RETURN grandes; Core deja de servir el bloque histórico y el socket Electrum devuelve TX original con witness y Merkle válido. Datos deliberadamente compresibles, no benchmark.
+- P2P público acotado: Signet y Testnet4, 100 bloques/101 TX cada una, auditados. Signet: 4 pares, 49 038 902 bytes recibidos; Testnet4: 1 par, 21 299 775 bytes. No sincronización completa.
+
+## Aceptación externa pendiente
 
 - Sincronización sostenida real en Signet/Testnet4 y pruebas de parámetros/casos históricos representativos de mainnet. Génesis offline no valida toda una red.
-- Recuperación operacional de reorg con archivo consciente de ramas, publicación de snapshots y prueba exhaustiva de undo histórico BIP30 real; la primitiva interna no basta.
+- Prueba exhaustiva de undo histórico BIP30 real y recuperación a escala.
 - Fault injection exhaustiva, fallos de disco lleno y recuperación validada de pérdida de energía. Las pruebas de truncado/corrupción no cubren todos esos escenarios.
-- Controlador de poda y consulta después de poda efectiva. Esta beta nunca ejecuta `pruneblockchain`.
-- Servidor Electrum, pruebas Merkle expuestas, mempool, suscripciones, TLS y Sparrow.
+- Ensayo real con Sparrow GUI; Java/Sparrow/entorno gráfico no disponibles aquí. TLS nativo no implementado: remoto requiere túnel/proxy seguro.
 - Formato estable, migraciones entre futuros esquemas, pruebas de backup/restore a mayor escala y elección de licencia.
 - Mediciones de CPU/RAM/latencia, disco total y pico temporal. No extrapolar ahorro de otros corpus o redes.
 
-Si hay corrupción o reorg, conservar archivos y reconstruir aparte o restaurar una copia verificada. La CLI no elimina, trunca ni migra datos silenciosamente. No conectar una cartera esperando un servicio Electrum ni usar esta beta para decidir la poda de un nodo valioso.
+Si hay corrupción, conservar archivos y reconstruir aparte o restaurar una copia verificada. No se truncan ni migran datos silenciosamente. Usar carteras de laboratorio sin fondos reales; no podar nodos valiosos. Procedimientos actuales: README, docs/operations.md y docs/protocol.md.
