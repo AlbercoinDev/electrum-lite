@@ -28,7 +28,13 @@ Instalación o actualización del **ejecutable**, sin sudo (Linux x86-64, Python
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/install.sh | sh
 ```
 
-La misma línea selecciona el paquete más reciente con checksum de la prerelease actual, instala en `~/.local/share/electrum-lite/versions/` y activa `~/.local/bin/electrum-lite`. Conserva la entrega anterior mediante `previous`; no sobrescribe instalaciones antiguas ajenas a este instalador. Confía en el script remoto y en GitHub HTTPS: SHA-256 detecta corrupción, **no sustituye una firma**. No modifica Core, datos, configuración ni servicios. No migra esquemas ni reinicia procesos: antes de reiniciar tras actualizar, detén Lite y crea/verifica un backup con el binario anterior. La configuración inicial de Core se describe debajo. [Detalles y rollback](docs/install-linux.md#instalación-y-actualización-en-una-línea).
+La misma línea instala o actualiza **Lite y la última versión estable oficial de Bitcoin Core** dentro de `~/electrum-lite/`. Requiere Python 3.11+, curl, GnuPG y Linux x86-64. Core se autentica con firma de un firmante fijado; Lite confía en GitHub HTTPS y en el hash exacto de la pareja validada. Si la última versión no está validada, se rechaza sin elegir una anterior. Cierra Lite antes de actualizar: el instalador no mata procesos, no hace downgrade y conserva datos y versiones. No toca `~/.bitcoin`. [Detalles](docs/install-linux.md).
+
+```sh
+"$HOME/electrum-lite/electrum-lite" --network signet
+```
+
+Este único comando inicia el supervisor, su Core dedicado y Lite, con poda coordinada automática. Ctrl+C cierra ambos. Datos bajo `~/electrum-lite/data/signet/{core,lite}/`; Electrum en `127.0.0.1:60601`. El motor sigue siendo SQLite; el rediseño LSM y el rendimiento superior a Core siguen pendientes. Los ejemplos manuales posteriores son para desarrollo, no pasos requeridos por este lanzador.
 
 Para el paquete Linux x86-64 experimental (ejecutable e instalador sin sudo),
 consulta [instalación, conexión y uso](docs/install-linux.md). El paquete se
@@ -38,7 +44,7 @@ El tag no se modifica. Para regenerarlo desde una
 compilación release verificada: `cargo fetch --locked` y
 `python3 scripts/package_linux.py` (Python 3.11+, salida en `dist/`, sin subir archivos).
 
-Entorno probado: **Linux x86-64, Rust 1.99.1 y Bitcoin Core 31.0**. No se exige AVX2. Otras plataformas/versiones no se han validado.
+Entorno probado: **Linux x86-64, Rust 1.99.1 y Bitcoin Core 31.0/32.1**. La pareja publicada Lite `d258034`/Core 32.1 pasó suites aisladas de protocolo, reorg, supervisor y poda real ([evidencia](docs/core-32.1-validation.md)). No se exige AVX2. Otras plataformas/versiones no se han validado.
 
 En Debian/Ubuntu:
 

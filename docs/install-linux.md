@@ -1,5 +1,41 @@
 # Linux: instalación del ejecutable, conexión y uso
 
+## Instalación y actualización conjunta
+
+El bootstrap nuevo instala y actualiza Lite y la última versión estable oficial
+de Core en `~/electrum-lite/`, sin sudo y sin tocar `~/.bitcoin`.
+Requiere Linux x86-64, glibc 2.34+, Python 3.11+, curl y GnuPG.
+No requiere una instalación previa de Core ni Rust.
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/install.sh | sh
+"$HOME/electrum-lite/electrum-lite" --network signet
+```
+
+La implementación local pasó instalación desde descargas públicas,
+arranque Signet **offline**, rechazo de actualización con Lite activo, cierre
+SIGTERM de Lite/Core y repetición idempotente preservando datos (2026-10-29).
+No equivale a una sincronización pública completa.
+
+Ctrl+C cierra el supervisor y su Core dedicado. Para actualizar, cierra primero
+Lite y repite la línea de instalación. El instalador no mata procesos, no hace
+downgrade automático y rechaza una última versión no validada: no elige otra
+anterior. Conserva versiones y datos; no elimina backups automáticamente.
+
+Distribución: `versions/{lite,bitcoin-core,runtime}/`, `config/`, `data/`,
+`backups/`, `logs/`, `tmp/`, `active.json` y lanzador `electrum-lite`.
+Por red, Core reside en `data/signet/core/` y el motor en `data/signet/lite/`.
+El motor actual añade todavía su subdirectorio `signet` bajo esa raíz.
+Electrum Signet escucha solo en `127.0.0.1:60601`, RPC dedicado en 39332.
+
+La poda es automática y coordinada por Lite, mientras Core usa `prune=1`.
+Requiere auditoría, backup verificado y margen de reorg; mainnet permanece
+bloqueada en el supervisor. Ni el crecimiento total de disco ni la superioridad
+de rendimiento sobre Core están demostrados. El motor sigue siendo SQLite:
+la estructura LSM propuesta todavía no está implementada.
+
+## Flujo manual anterior (paquetes publicados previamente)
+
 Paquete experimental `0.0.1-beta.1`, compilado desde el commit indicado
 en `BUILD-INFO.txt`, no desde el código del tag original. Descárgalo junto con su
 checksum en https://github.com/AlbercoinDev/electrum-lite/releases/tag/v0.0.1-beta.1.
@@ -169,10 +205,10 @@ Adapta red, cookie y puerto en **todos** los comandos y en la cartera. `--networ
 siempre va antes del subcomando. **La poda mainnet está bloqueada.** No se ofrece
 certificación de producción, recuperación ante pérdida física de energía ni
 rendimiento garantizado. Licencia propia pendiente; avisos de terceros incluidos.
-# Instalación y actualización en una línea
+# Instalador antiguo: referencia histórica, no usar para el flujo conjunto
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/install.sh | sh
+# El bootstrap de main ahora usa el flujo conjunto descrito al principio.
 ```
 
 Requisitos: Linux x86-64, Python 3.11+, curl y las bibliotecas dinámicas requeridas por el paquete. Ejecutar como usuario normal, sin sudo. El bootstrap y el paquete se descargan por HTTPS. El código remoto se ejecuta con los permisos de tu usuario: revísalo antes si no confías en el repositorio. Los paquetes actuales **no están firmados**; comprobar SHA-256 contra un archivo servido por el mismo GitHub no aporta autenticación independiente.
