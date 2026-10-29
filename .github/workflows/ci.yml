@@ -7,6 +7,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: One-line installer offline regression tests
+        run: |
+          sh -n install.sh
+          python3 scripts/test_install.py
       - name: Install pinned toolchain
         run: rustup show
       - run: cargo fmt --check

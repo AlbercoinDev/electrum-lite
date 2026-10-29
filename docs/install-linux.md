@@ -169,3 +169,23 @@ Adapta red, cookie y puerto en **todos** los comandos y en la cartera. `--networ
 siempre va antes del subcomando. **La poda mainnet está bloqueada.** No se ofrece
 certificación de producción, recuperación ante pérdida física de energía ni
 rendimiento garantizado. Licencia propia pendiente; avisos de terceros incluidos.
+# Instalación y actualización en una línea
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/install.sh | sh
+```
+
+Requisitos: Linux x86-64, Python 3.11+, curl y las bibliotecas dinámicas requeridas por el paquete. Ejecutar como usuario normal, sin sudo. El bootstrap y el paquete se descargan por HTTPS. El código remoto se ejecuta con los permisos de tu usuario: revísalo antes si no confías en el repositorio. Los paquetes actuales **no están firmados**; comprobar SHA-256 contra un archivo servido por el mismo GitHub no aporta autenticación independiente.
+
+La misma orden instala o actualiza el ejecutable. Selecciona por fecha de publicación el paquete Linux con checksum más reciente de `v0.0.1-beta.1`; distingue entregas por commit aunque compartan versión. No sigue automáticamente futuras releases ni acepta otros formatos/versiones sin actualizar el instalador.
+
+Se instalan el binario y su identificación de compilación bajo `~/.local/share/electrum-lite/versions/`. `current` identifica la entrega activa y `previous` la anterior; `~/.local/bin/electrum-lite` apunta a `current`. Si falta `~/.local/bin` en PATH, usa la ruta completa o añade ese directorio al PATH. Las entregas anteriores nunca se borran automáticamente. Un ejecutable antiguo instalado directamente en esa ruta se rechaza: consérvalo y muévelo explícitamente antes de adoptar el instalador nuevo.
+
+**No configura ni arranca Core/Lite, no modifica servicios ni datos, no hace backup de datos ni migraciones.** Un daemon ya iniciado continúa usando el binario anterior. Antes de reiniciarlo para usar la nueva entrega:
+
+1. Detén Lite limpiamente.
+2. Usa el binario en `previous/electrum-lite` con tu red/data-root para crear y verificar un backup completo en un destino nuevo.
+3. Revisa la compatibilidad de esquema. Migra únicamente con el procedimiento explícito y su backup obligatorio, si hace falta.
+4. Arranca con `current/electrum-lite` y comprueba `health`; sincronizando no equivale necesariamente a fallo.
+
+Rollback: detén Lite y usa directamente `~/.local/share/electrum-lite/previous/electrum-lite`. Si el esquema cambió, restaura el backup en **otra raíz** y usa allí el binario anterior; nunca abras un esquema incompatible ni sobrescribas la generación fallida. Consulta también `docs/operations.md`. El cambio de enlace es atómico, pero no se promete durabilidad del instalador ante pérdida física de energía: los datos de cadena no se tocan y las versiones se conservan.

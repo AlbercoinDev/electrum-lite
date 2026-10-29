@@ -20,6 +20,14 @@ No hay GUI, servidor público, TLS nativo, telemetría ni dependencia de servido
 
 ## Instalar
 
+Instalación o actualización del **ejecutable**, sin sudo (Linux x86-64, Python 3.11+ y curl):
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/install.sh | sh
+```
+
+La misma línea selecciona el paquete más reciente con checksum de la prerelease actual, instala en `~/.local/share/electrum-lite/versions/` y activa `~/.local/bin/electrum-lite`. Conserva la entrega anterior mediante `previous`; no sobrescribe instalaciones antiguas ajenas a este instalador. Confía en el script remoto y en GitHub HTTPS: SHA-256 detecta corrupción, **no sustituye una firma**. No modifica Core, datos, configuración ni servicios. No migra esquemas ni reinicia procesos: antes de reiniciar tras actualizar, detén Lite y crea/verifica un backup con el binario anterior. La configuración inicial de Core se describe debajo. [Detalles y rollback](docs/install-linux.md#instalación-y-actualización-en-una-línea).
+
 Para el paquete Linux x86-64 experimental (ejecutable e instalador sin sudo),
 consulta [instalación, conexión y uso](docs/install-linux.md). El paquete se
 adjunta a la [release existente](https://github.com/AlbercoinDev/electrum-lite/releases/tag/v0.0.1-beta.1),
