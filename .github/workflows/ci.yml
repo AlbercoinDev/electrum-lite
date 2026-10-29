@@ -11,6 +11,7 @@ jobs:
         run: |
           sh -n install.sh
           python3 scripts/test_install.py
+          python3 scripts/test_cosync.py
       - name: Install pinned toolchain
         run: rustup show
       - run: cargo fmt --check

@@ -6,6 +6,8 @@ La rama **`main` contiene la beta funcional actual**. La etiqueta `v0.0.1-beta.1
 
 **Experimental, no certificado para fondos reales.** Hay pruebas TCP extremo a extremo en regtest y validación de un prefijo real de Signet/Testnet4; todavía no hay sincronización completa sostenida, prueba GUI con Sparrow ni mediciones en hardware antiguo. **La poda en mainnet está bloqueada**, sin opción insegura para saltarse la protección.
 
+**Rendimiento real:** la co-sincronización Signet del binario `f8fcfb6` mostró retraso creciente (aprox. 5593 → 70 668 bloques), sin pausas de mantenimiento. La meta de seguir/superar a Core **no está conseguida**. [Evidencia y reproducción](docs/benchmarks/signet-cosync-f8fcfb6.md).
+
 ## Qué funciona
 
 - Servicio Electrum TCP privado, negociación 1.4, cabeceras y checkpoints, historial, saldo, UTXO, transacciones con witness, pruebas Merkle, fees y difusión.

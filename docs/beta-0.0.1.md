@@ -1,5 +1,9 @@
 # Beta 0.0.1 — estado y validación
 
+## Co-sincronización pública medida — meta no alcanzada
+
+El binario publicado `f8fcfb6` se probó con un Core Signet nuevo, sin poda ni pausas de mantenimiento durante el muestreo. En 67 muestras durante aproximadamente 199 segundos, Lite pasó de altura 255 a 29 439 mientras Core pasó de 5848 a 100 107. El retraso creció de unos 5593 a 70 668 bloques: **M2 no cumplida en esta ejecución**, no solo pendiente de medir. Véanse [metodología, hash del binario y resultado](benchmarks/signet-cosync-f8fcfb6.md). La nueva herramienta `scripts/cosync_smoke.py` conserva logs/JSONL y no acepta como éxito alcanzar un Core detenido. No se habilita poda mainnet ni se promete `prune=550`.
+
 ## Poda automática coordinada — entrega experimental
 
 `managed-serve --auto-prune --prune-backup-root EXISTENTE` automatiza exclusivamente el mantenimiento del Core dedicado de prueba: parada del daemon, P2P offline, auditoría, nuevo backup verificado, margen 288, intención durable y prueba de poda efectiva. El cursor `prune_audit` sobrevive reinicios; una petición incompleta bloquea nuevos intentos y el arranque automático. No hay cambios de esquema, borrado automático de backups, adopción de nodos existentes, poda mainnet ni override `prune=550`. Véase operación para procedimiento, rollback y límites de capacidad.
