@@ -192,3 +192,7 @@ def test_server(binary, root, cookie, core_port, rpc, address, historical_txid):
                 process.wait()
                 raise
             assert code == 0, (root / "electrum.log").read_text()
+            output = (root / "electrum.log").read_text()
+            assert "verificando archivo e índice" in output and "Estado:" in output
+            assert "Core:" in output and "Electrum Lite:" in output
+            assert cookie.read_text().strip() not in output

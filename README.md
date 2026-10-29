@@ -118,6 +118,10 @@ Servicio mainnet, **solo para validación experimental y sin poda habilitada**:
 
 El arranque verifica íntegramente archivo, referencias e índices; puede tardar según el histórico. Después sincroniza lotes y reconcilia mempool. Las consultas de cartera solo se habilitan al alcanzar el tip observado de Core, finalizar IBD y obtener una mempool consistente dentro de los presupuestos.
 
+La misma terminal de `serve` muestra cada aproximadamente cinco segundos las alturas observadas de Core e índice, retraso, velocidad entre muestras, altura de poda, antigüedad de la observación y espacio libre. También informa de errores y alerta de poda automática o histórico ausente. Si el worker está ocupado o Core no responde, la actualización puede tardar más; `?` significa que no hay dato disponible. No registra cookies ni consultas de cartera.
+
+**La parada automática de Core aún no está implementada.** `serve` no supervisa ni detiene Core si falla. La poda automática de Core no está validada para preservar el histórico de esta beta: utiliza la configuración manual y los procedimientos seguros descritos abajo.
+
 En otra terminal:
 
 ```sh

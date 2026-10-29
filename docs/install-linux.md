@@ -81,6 +81,12 @@ raíz de datos, comprueba archivos, indexa y reconcilia mempool. No modifica la
 configuración de Core. La sincronización completa puede tardar y aún no ha sido
 validada públicamente de forma sostenida en este proyecto.
 
+La terminal del servidor muestra progreso aproximadamente cada cinco segundos:
+alturas de Core e índice, retraso, velocidad entre muestras, espacio libre y
+alertas de poda o errores. La observación puede estar desactualizada o demorarse
+si el worker está ocupado. No hay parada automática de Core si falla el servidor;
+la poda automática de Core no está validada para preservar el histórico.
+
 Desde otra terminal:
 
 ```sh

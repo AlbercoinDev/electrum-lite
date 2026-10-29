@@ -173,6 +173,53 @@ fn diagnostic(error: &anyhow::Error) -> &'static str {
 }
 
 impl State {
+    fn progress(
+        &self,
+        previous: Option<(u32, Instant)>,
+        now: Instant,
+    ) -> Result<(String, Option<(u32, Instant)>)> {
+        let tip = self.store.stats()?.tip.map(|(height, _)| height);
+        let current = self.core_info["blocks"].as_u64();
+        let age = self.observed_at.map(|t| t.elapsed().as_secs());
+        let rate = tip.zip(previous).and_then(|(height, (old, when))| {
+            let elapsed = now.saturating_duration_since(when).as_secs_f64();
+            height
+                .checked_sub(old)
+                .filter(|_| elapsed > 0.0)
+                .map(|delta| f64::from(delta) / elapsed)
+        });
+        let number = |value: Option<u64>| value.map_or_else(|| "?".to_owned(), |n| n.to_string());
+        let status = if self.last_error.is_some() {
+            "esperando o error"
+        } else if self.ready {
+            "listo"
+        } else if self.catching_up {
+            "indexando"
+        } else {
+            "esperando Core o mempool"
+        };
+        let lag = current
+            .zip(tip)
+            .map(|(core, index)| core.saturating_sub(u64::from(index)));
+        let floor = self.core_info["pruneheight"].as_u64();
+        let next = tip.map_or(0, |height| u64::from(height) + 1);
+        let mut line = format!("Estado: {status} | Core: {} | Electrum Lite: {} | retraso observado: {} | bloques/s: {} | poda Core: {} | siguiente: {} | observación Core: {} s | libre: {} MiB",
+            number(current), number(tip.map(u64::from)), number(lag), rate.map_or_else(|| "?".to_owned(), |v| format!("{v:.1}")), number(floor), next, number(age), fs2::available_space(self.archive.directory())? / (1024 * 1024));
+        if self.core_info["automatic_pruning"] == true {
+            line.push_str(" | AVISO: poda automática puede eliminar bloques necesarios");
+        }
+        if floor.is_some_and(|floor| next.max(1) < floor) {
+            line.push_str(
+                " | ERROR: faltan bloques históricos; conservar datos y usar fuente confiable",
+            );
+        }
+        if let Some(error) = self.last_error {
+            line.push_str(" | causa: ");
+            line.push_str(error);
+        }
+        Ok((line, tip.map(|height| (height, now))))
+    }
+
     fn refresh(&mut self) -> Result<()> {
         self.ready = false;
         if self.recovery_required {
@@ -857,6 +904,9 @@ pub async fn serve(options: Options) -> Result<()> {
     let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_stop = stopping.clone();
     let (boot, boot_rx) = oneshot::channel();
+    eprintln!(
+        "Electrum Lite: verificando archivo e índice; todavía no se ha comprobado Bitcoin Core."
+    );
     let worker = std::thread::spawn(move || -> Result<()> {
         let mut archive = Archive::open(&options.data_dir, options.chain, true)?;
         let mut store = Store::open(
@@ -884,6 +934,9 @@ pub async fn serve(options: Options) -> Result<()> {
         let _ = boot.send(());
         let period = Duration::from_secs(state.options.poll_seconds);
         let mut updated = Instant::now() - period;
+        let mut last_progress = Instant::now() - Duration::from_secs(5);
+        let mut previous_progress = None;
+        let mut displayed_error = None;
         loop {
             if state.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -895,6 +948,22 @@ pub async fn serve(options: Options) -> Result<()> {
                     state.last_error = Some(diagnostic(&error));
                 }
                 updated = Instant::now();
+                if last_progress.elapsed() >= Duration::from_secs(5)
+                    || displayed_error != state.last_error
+                {
+                    let now = Instant::now();
+                    match state.progress(previous_progress, now) {
+                        Ok((line, next)) => {
+                            eprintln!("{line}");
+                            previous_progress = next;
+                        }
+                        Err(_) => eprintln!(
+                            "Estado: no se puede leer el progreso; conservar datos y revisar disco"
+                        ),
+                    }
+                    displayed_error = state.last_error;
+                    last_progress = now;
+                }
             }
             let wait = if state.catching_up {
                 Duration::ZERO
@@ -969,6 +1038,22 @@ mod tests {
         assert!(!diagnostic(&secret).contains("sensitive"));
         let error = anyhow::anyhow!("mempool byte budget exceeded");
         assert!(diagnostic(&error).contains("mempool budget"));
+    }
+
+    #[test]
+    fn progress_shows_prune_hazard_and_does_not_echo_rpc_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.core_info =
+            json!({"blocks":100,"pruneheight":2,"automatic_pruning":true,"untrusted":"secret"});
+        state.observed_at = Some(Instant::now());
+        state.last_error =
+            Some("required historical blocks are already pruned; restore trusted history");
+        let (text, previous) = state.progress(None, Instant::now()).unwrap();
+        assert!(text.contains("Core: 100") && text.contains("Electrum Lite: 0"));
+        assert!(text.contains("poda automática") && text.contains("faltan bloques históricos"));
+        assert!(!text.contains("secret"));
+        assert_eq!(previous.unwrap().0, 0);
     }
 
     fn state(root: &std::path::Path) -> State {
