@@ -167,6 +167,112 @@ impl Core {
         Ok(hash.parse()?)
     }
 
+    /// Small bounded batches amortize HTTP latency; IDs are checked and results
+    /// reordered explicitly (JSON-RPC does not promise response ordering).
+    fn batch(&self, method: &str, parameters: Vec<Value>, limit: usize) -> Result<Vec<Value>> {
+        ensure!(
+            !parameters.is_empty() && parameters.len() <= 4,
+            "invalid RPC batch size"
+        );
+        ensure!(limit <= 64 * 1024 * 1024, "invalid RPC batch budget");
+        let count = parameters.len();
+        let requests: Vec<Value> = parameters
+            .into_iter()
+            .enumerate()
+            .map(|(id, params)| json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .collect();
+        let response = self
+            .agent
+            .post(&self.url)
+            .set("Authorization", &self.authorization()?)
+            .send_json(json!(requests));
+        let response = match response {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(_) => anyhow::bail!("RPC transport failed; check Core and the loopback endpoint"),
+        };
+        let status = response.status();
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take((limit + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= limit, "RPC response exceeds size limit");
+        let responses: Vec<Value> =
+            serde_json::from_slice(&bytes).context("invalid RPC batch JSON")?;
+        ensure!(
+            responses.len() == count,
+            "RPC batch response count mismatch"
+        );
+        let mut results = vec![None; count];
+        for mut response in responses {
+            let id: usize = response["id"]
+                .as_u64()
+                .context("RPC batch ID missing")?
+                .try_into()?;
+            ensure!(
+                id < count && results[id].is_none(),
+                "invalid or duplicate RPC batch ID"
+            );
+            if !response["error"].is_null() {
+                return Err(RpcFailure {
+                    code: response["error"]["code"]
+                        .as_i64()
+                        .context("invalid RPC error code")?,
+                }
+                .into());
+            }
+            results[id] = Some(std::mem::take(
+                response.get_mut("result").context("RPC missing result")?,
+            ));
+        }
+        ensure!(status == 200, "Core HTTP status {status}");
+        results
+            .into_iter()
+            .map(|value| value.context("RPC batch missing result"))
+            .collect()
+    }
+
+    pub fn block_group(&self, start: u32, end: u32) -> Result<Vec<(Block, usize)>> {
+        ensure!(end >= start && end - start < 4, "invalid block group");
+        let hashes = self.batch(
+            "getblockhash",
+            (start..=end).map(|h| json!([h])).collect(),
+            65536,
+        )?;
+        let hashes: Vec<BlockHash> = hashes
+            .into_iter()
+            .map(|h| {
+                h.as_str()
+                    .context("invalid block hash")?
+                    .parse()
+                    .context("invalid block hash")
+            })
+            .collect::<Result<_>>()?;
+        let blocks = self.batch(
+            "getblock",
+            hashes.iter().map(|h| json!([h.to_string(), 0])).collect(),
+            hashes.len() * (MAX_BLOCK_BYTES * 2 + 65536),
+        )?;
+        blocks
+            .into_iter()
+            .zip(hashes)
+            .map(|(encoded, hash)| {
+                let encoded = encoded.as_str().context("invalid block hex")?;
+                ensure!(
+                    encoded.len() <= MAX_BLOCK_BYTES * 2,
+                    "Core block exceeds size limit"
+                );
+                let raw = hex::decode(encoded)?;
+                let block: Block = deserialize(&raw)?;
+                ensure!(
+                    block.block_hash() == hash,
+                    "Core returned a different block"
+                );
+                Ok((block, raw.len()))
+            })
+            .collect()
+    }
+
     pub fn block(&self, hash: BlockHash) -> Result<Block> {
         Ok(self.block_with_size(hash)?.0)
     }

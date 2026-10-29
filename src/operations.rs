@@ -335,6 +335,7 @@ pub fn prune(
         chain != Chain::Mainnet,
         "mainnet pruning remains gated on sustained validation; no unsafe override"
     );
+    store.prune_checkpoint()?;
     ensure!(
         fs2::available_space(archive.directory())? >= min_free,
         "insufficient free space for safe prune preparation"
@@ -361,6 +362,7 @@ pub fn prune(
     store.integrity_check()?;
     store.audit(archive)?;
     backup(archive, backup_path)?;
+    verify_backup(backup_path, chain)?;
     let network: Value = core.call("getnetworkinfo", json!([]))?;
     ensure!(
         network["networkactive"] == false,

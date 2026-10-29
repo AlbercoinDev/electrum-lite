@@ -159,3 +159,28 @@ Puede podarse un prefijo durable mientras Core vaya por delante durante IBD, per
 Si el proceso falla después de registrar/solicitar poda, una petición `requested` sin finalizar impide otra. Conserva `prune_audit`, backup, logs de Core y alturas; revisa el estado antes de cualquier recuperación. No hay botón de “ignorar auditoría”. La poda de Core es irreversible localmente y no se deshace restaurando su configuración.
 
 **Mainnet: comando bloqueado.** La evidencia regtest no sustituye validación sostenida de mainnet, interoperabilidad de cartera y capacidad de disco. No hay flags `unsafe`, `no-fsync` ni poda automática del daemon.
+# Poda automática coordinada
+
+Linux, experimental, opt-in y solo Core dedicado de Signet/Testnet4/regtest. Ejemplo con rutas editadas:
+
+```sh
+mkdir -p "$HOME/electrum-prune-backups"
+electrum-lite --network signet --data-dir "$HOME/electrum-data" managed-serve \
+  --bitcoind /ruta/real/a/bitcoind --core-dir "$HOME/electrum-core-dedicado" \
+  --rpc-port 38342 --listen 127.0.0.1:60601 --confirm-dedicated \
+  --auto-prune --prune-backup-root "$HOME/electrum-prune-backups"
+```
+
+El Core root debe ser nuevo o tener la identidad creada por este supervisor; no se adopta un nodo existente. No debe haber otros escritores de cadena/RPC contra el nodo dedicado. Internamente Core usa `prune=1`, pero **el supervisor decide y ejecuta automáticamente la poda**; no es poda independiente `prune=550`. Mainnet sigue bloqueada sin override.
+
+Cada 2016 nuevas alturas elegibles (opción `--auto-prune-interval-blocks`, mínimo 288), se detiene limpiamente el daemon, se adquiere su bloqueo exclusivo y se verifica/reproduce el archivo. Se desactiva P2P, se vacía la cola de validación de Core y se reutiliza el mantenimiento probado: identidad, prefijo coincidente, margen 288, integridad SQLite, auditoría semántica, backup completo nuevo con manifiesto y verificación de hashes, intención durable, prune RPC, verificación de indisponibilidad histórica y cierre de auditoría. Solo después se restaura el estado anterior de P2P y se reinicia el daemon. El servidor TCP no está disponible durante la ventana: las carteras deben reconectar.
+
+En caso de fallo no se reanuda automáticamente el servicio: se detiene el Core propio. No se borran datos, backups ni auditorías para reintentar. Una auditoría `requested` pendiente bloquea el arranque del modo automático, incluso tras reinicio. Revisa causa, conserva log/backup/binario y usa los procedimientos de recuperación/restauración a otra raíz; no cambies a `prune=550` para eludir el bloqueo. El supervisor no garantiza reacción inmediata a Ctrl+C mientras espera una operación bloqueante de mantenimiento; su muerte termina el proceso Core propio mediante protección Linux de padre.
+
+Las copias quedan en `PRUNE_BACKUP_ROOT/auto-prune-*/backup/`, siempre nuevas y nunca eliminadas automáticamente. Dimensiona **Core + archivo + SQLite + todas las copias y picos temporales**: no existe un presupuesto total garantizado, y el histórico de Lite sigue creciendo. Espacio insuficiente implica aborto sin autorizar el borrado. Los logs `Poda automática completada` incluyen altura pedida, resultado real, altura de poda observada y ruta de backup. El campo `automatic_pruning` de health sigue describiendo al daemon (false), no al supervisor.
+
+Para deshabilitar: detener el supervisor y arrancar el mismo Core dedicado sin `--auto-prune` ni `--prune-backup-root`; conserva backups y auditorías. Para rollback del software: binario anterior más backup verificado, restaurado en raíz nueva si fuera necesario; esquema 2 y archivo ELBETA01 no cambian con esta función. Un binario previo no automatizará la poda.
+
+Evidencia reproducible: `AUTO_PRUNE=1 BITCOIND=/ruta/a/bitcoind ELECTRUM_LITE=./target/release/electrum-lite python3 scripts/prune_smoke.py`. Crea un nodo propio, genera cientos de MiB, detiene por completo el generador antes del mantenimiento, verifica poda efectiva, TX witness/Merkle locales y cursor persistente tras reiniciar. No toca nodos existentes y no demuestra sincronización pública sostenida ni resistencia a pérdida física de energía.
+
+**Rendimiento independiente:** las pausas de mantenimiento no cuentan como alcanzar/superar a Core. La sincronización ahora agrupa cuatro hashes y cuatro bloques en dos peticiones HTTP por grupo y procesa hasta 256 bloques por ciclo, manteniendo commits de 16 bloques/16 MB, colas acotadas, validaciones y fsync. Solo una prueba pública sostenida, midiendo por separado estas pausas, podrá demostrar co-sincronización sin retraso creciente.

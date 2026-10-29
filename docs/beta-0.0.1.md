@@ -1,5 +1,15 @@
 # Beta 0.0.1 — estado y validación
 
+## Poda automática coordinada — entrega experimental
+
+`managed-serve --auto-prune --prune-backup-root EXISTENTE` automatiza exclusivamente el mantenimiento del Core dedicado de prueba: parada del daemon, P2P offline, auditoría, nuevo backup verificado, margen 288, intención durable y prueba de poda efectiva. El cursor `prune_audit` sobrevive reinicios; una petición incompleta bloquea nuevos intentos y el arranque automático. No hay cambios de esquema, borrado automático de backups, adopción de nodos existentes, poda mainnet ni override `prune=550`. Véase operación para procedimiento, rollback y límites de capacidad.
+
+Prueba `AUTO_PRUNE=1 scripts/prune_smoke.py`: **PASS AUTOMATIC PRUNING: owned supervisor, verified backup, real Core deletion, local witness TX/Merkle, restart cursor**. También se comprueban scheduler/margen, bloqueo persistente de auditoría pendiente y rechazo de respuestas RPC batch inválidas. No son pruebas físicas de energía ni validación GUI.
+
+Validación de esta entrega: fmt, Clippy `--locked --all-targets -- -D warnings`, **51 tests Rust**, build release y cinco pruebas del instalador; Core smoke TCP/mempool/RBF/reorg/recuperación, supervisor crash/parent-death/stall y poda automática real regtest satisfactorios. La versión sigue `0.0.1-beta.1`; los paquetes identifican el commit de main, no el tag original.
+
+Optimización adicional: grupos RPC de cuatro hashes/bloques (dos peticiones HTTP por grupo), ciclo de hasta 256 bloques y sincronización continua mientras exista retraso, sin omitir consultas ni fsync. Banco 120×200, 24 432 TX: Lite **1,077 / 1,072 / 1,103 s**, Core reindex **1,266 s** (1,15–1,18×). Caché caliente, tmpfs y pruebas concurrentes: exploratorio, no aislado. **No alcanza M1 1,5× ni demuestra M2 sostenida.** Las ventanas de poda pausan Core por seguridad y no cuentan como mejora de velocidad. M3 y capacidad en hardware objetivo siguen pendientes.
+
 ## Optimización de ingesta — 2026-10-29
 
 - Pool fijo de descarga, colas acotadas por worker y publicación en orden; commits de hasta 16 bloques/16 MB. SQL multi-fila y sentencias reutilizadas, contadores por lote y undo conservando el orden de gastos intra-bloque.

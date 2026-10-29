@@ -67,6 +67,27 @@ fn cookie_auth_and_request_are_correct() {
 }
 
 #[test]
+fn batched_block_fetch_rejects_duplicate_missing_and_out_of_range_ids() {
+    let dir = tempdir().unwrap();
+    let cookie = dir.path().join("cookie");
+    fs::write(&cookie, "user:secret").unwrap();
+    for body in [
+        json!([{"id":0,"result":"00"},{"id":0,"result":"00"}]),
+        json!([{"id":0,"result":"00"}]),
+        json!([{"id":0,"result":"00"},{"id":2,"result":"00"}]),
+    ] {
+        let (url, server) = serve(body.to_string(), "200 OK");
+        let error = Core::new(&url, &cookie)
+            .unwrap()
+            .block_group(1, 2)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("RPC batch"));
+        let request = server.join().unwrap();
+        assert!(request.contains("getblockhash"));
+    }
+}
+
+#[test]
 fn rpc_errors_do_not_echo_server_secrets() {
     let dir = tempdir().unwrap();
     let path = dir.path().join(".cookie");

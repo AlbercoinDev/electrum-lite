@@ -39,3 +39,9 @@ jobs:
         env:
           BITCOIND: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoind
           BITCOINCLI: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoin-cli
+      - name: Coordinated automatic pruning and persistent restart cursor (isolated regtest)
+        timeout-minutes: 20
+        run: python3 scripts/prune_smoke.py
+        env:
+          AUTO_PRUNE: "1"
+          BITCOIND: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoind

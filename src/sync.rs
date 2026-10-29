@@ -38,9 +38,8 @@ struct Fetched {
 fn fetch_group(core: &Core, start: u32, end: u32) -> Result<Vec<Fetched>> {
     let mut fetched = Vec::with_capacity((end - start + 1) as usize);
     let mut previous: Option<BlockHash> = None;
-    for height in start..=end {
-        let hash = core.hash(height)?;
-        let (block, size) = core.block_with_size(hash)?;
+    for (height, (block, size)) in (start..=end).zip(core.block_group(start, end)?) {
+        let hash = block.block_hash();
         if let Some(expected) = previous {
             ensure!(
                 block.header.prev_blockhash == expected,
@@ -275,7 +274,7 @@ mod tests {
                     .unwrap();
                 let mut request = [0; 4096];
                 let _ = stream.read(&mut request).unwrap();
-                let body = r#"{"id":"electrum-lite","error":{"code":-28,"message":"secret"},"result":null}"#;
+                let body = r#"[{"id":0,"error":{"code":-28,"message":"secret"},"result":null},{"id":1,"error":null,"result":null},{"id":2,"error":null,"result":null},{"id":3,"error":null,"result":null}]"#;
                 write!(stream, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
             }
         });

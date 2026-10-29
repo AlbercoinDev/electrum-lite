@@ -17,6 +17,65 @@ fn limits() -> Limits {
 }
 
 #[test]
+fn unfinished_prune_blocks_scheduling_across_restart() {
+    let root = tempdir().unwrap();
+    let chain = Chain::Signet;
+    let mut archive = Archive::open(root.path(), chain, true).unwrap();
+    let path = archive.directory().join("index.sqlite");
+    let mut store = Store::open(&path, chain, limits()).unwrap();
+    store.recover(&mut archive).unwrap();
+    store
+        .commit(&mut archive, 0, &genesis_block(chain.network()))
+        .unwrap();
+    assert_eq!(store.prune_checkpoint().unwrap(), 0);
+    store.prune_start(0).unwrap();
+    drop(store);
+    let store = Store::open(&path, chain, limits()).unwrap();
+    assert!(store.prune_checkpoint().is_err());
+    assert!(store.prune_start(0).is_err());
+    let core = Core::new("http://127.0.0.1:1/", &root.path().join("absent-cookie")).unwrap();
+    let backup = root.path().join("must-not-create");
+    let error = operations::prune(&store, &mut archive, &core, chain, &backup, 0).unwrap_err();
+    assert!(error.to_string().contains("previous prune request"));
+    assert!(!backup.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn automatic_mainnet_pruning_is_denied_without_creating_roots() {
+    let root = tempdir().unwrap();
+    let data = root.path().join("data");
+    let core = root.path().join("core");
+    let backups = root.path().join("backups");
+    fs::create_dir(&backups).unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_electrum-lite"))
+        .args(["--network", "mainnet", "--data-dir"])
+        .arg(&data)
+        .args([
+            "managed-serve",
+            "--bitcoind",
+            "/does-not-exist",
+            "--core-dir",
+        ])
+        .arg(&core)
+        .args([
+            "--rpc-port",
+            "18499",
+            "--confirm-dedicated",
+            "--auto-prune",
+            "--prune-backup-root",
+        ])
+        .arg(&backups)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("limited to test networks"));
+    assert!(!data.exists());
+    assert!(!core.exists());
+    assert_eq!(fs::read_dir(backups).unwrap().count(), 0);
+}
+
+#[test]
 fn explicit_schema_migration_has_verified_backup_and_backfills_headers() {
     let root = tempdir().unwrap();
     let chain = Chain::Signet;

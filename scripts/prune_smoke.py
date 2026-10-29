@@ -27,12 +27,30 @@ def port():
 def main():
     binary = str(Path(os.environ.get("ELECTRUM_LITE", "target/release/electrum-lite")).resolve())
     bitcoind = os.environ.get("BITCOIND", "bitcoind")
+    automatic = os.environ.get("AUTO_PRUNE") == "1"
     with tempfile.TemporaryDirectory(prefix="electrum-lite-prune-") as temporary:
         root = Path(temporary)
         data = root / "core"
-        data.mkdir()
         rpc_port = port()
         cookie = data / "regtest" / ".cookie"
+        if automatic:
+            # Let the supervisor create its own ownership marker. Never forge
+            # ownership or adopt an existing/user datadir in this test.
+            bootstrap_port = port()
+            with (root / "bootstrap.log").open("w") as bootstrap_log:
+                bootstrap = subprocess.Popen([
+                    binary, "--network", "regtest", "--data-dir", str(root / "archive"),
+                    "managed-serve", "--bitcoind", bitcoind, "--core-dir", str(data),
+                    "--rpc-port", str(rpc_port), "--listen", f"127.0.0.1:{bootstrap_port}",
+                    "--confirm-dedicated", "--offline",
+                ], stdout=bootstrap_log, stderr=bootstrap_log)
+                try:
+                    wait(lambda: cookie.exists(), timeout=60)
+                finally:
+                    bootstrap.terminate()
+                    assert bootstrap.wait(timeout=150) == 0, (root / "bootstrap.log").read_text()
+        else:
+            data.mkdir()
         with (root / "core.log").open("w") as log:
             node = subprocess.Popen([
                 bitcoind, "-regtest", f"-datadir={data}", f"-rpcport={rpc_port}", "-server=1",
@@ -93,6 +111,60 @@ def main():
                     return json.loads(result.stdout)
 
                 assert run("sync", *online, "--max-blocks", "5000")["indexed_tip"]["height"] == 1600
+                if automatic:
+                    # Stop the generator completely before managed maintenance.
+                    rpc("stop")
+                    assert node.wait(timeout=60) == 0
+                    backups = root / "automatic-backups"
+                    backups.mkdir()
+                    managed_port = port()
+                    with (root / "automatic.log").open("w") as managed_log:
+                        managed = subprocess.Popen([
+                            *app, "managed-serve", "--bitcoind", bitcoind,
+                            "--core-dir", str(data), "--rpc-port", str(rpc_port),
+                            "--listen", f"127.0.0.1:{managed_port}", "--confirm-dedicated", "--offline",
+                            "--auto-prune", "--prune-backup-root", str(backups),
+                            "--auto-prune-interval-blocks", "288",
+                        ], stdout=managed_log, stderr=managed_log)
+                        client = None
+                        try:
+                            wait(lambda: "Poda automática completada:" in (root / "automatic.log").read_text(), timeout=240)
+                            client = wait(lambda: Electrum(managed_port), timeout=120)
+                            wait(lambda: client.request("server.health")["ready"], timeout=120)
+                            assert client.request("blockchain.transaction.get", [target_txid]) == target_raw
+                            branch = client.request("blockchain.transaction.get_merkle", [target_txid, 10])
+                            assert proof(target_txid, branch["merkle"], branch["pos"]) == expected_root
+                            assert rpc("getblockchaininfo")["pruneheight"] >= 10
+                            try:
+                                rpc("getblock", [target_hash, 0])
+                            except RuntimeError as error:
+                                assert "pruned" in str(error)
+                            else:
+                                raise AssertionError("automatic prune did not delete historical Core bytes")
+                            manifests = list(backups.glob("auto-prune-*/backup/BACKUP_COMPLETE.json"))
+                            assert len(manifests) == 1, manifests
+                        finally:
+                            if client:
+                                client.close()
+                            managed.terminate()
+                            assert managed.wait(timeout=150) == 0, (root / "automatic.log").read_text()
+                    # Restart verifies the persisted scheduling cursor: no new
+                    # backup or prune request for the same durable height.
+                    with (root / "automatic-restart.log").open("w") as restart_log:
+                        restarted = subprocess.Popen(managed.args, stdout=restart_log, stderr=restart_log)
+                        client = None
+                        try:
+                            client = wait(lambda: Electrum(managed_port), timeout=120)
+                            wait(lambda: client.request("server.health")["ready"], timeout=120)
+                            time.sleep(3)
+                            assert len(list(backups.glob("auto-prune-*/backup/BACKUP_COMPLETE.json"))) == 1
+                        finally:
+                            if client:
+                                client.close()
+                            restarted.terminate()
+                            assert restarted.wait(timeout=150) == 0, (root / "automatic-restart.log").read_text()
+                    print("PASS AUTOMATIC PRUNING: owned supervisor, verified backup, real Core deletion, local witness TX/Merkle, restart cursor", flush=True)
+                    return
                 result = run("prune", *online, "--confirm", "--backup-dir", str(root / "before-prune"), "--min-free-mib", "8")
                 assert result["actual"] >= 10, result
                 try:
@@ -129,12 +201,13 @@ def main():
                         assert status == 0, (root / "electrum.log").read_text()
                 print("PASS REAL PRUNING: Core historical block unavailable; original witness-inclusive TX and valid Merkle proof served from local archive", flush=True)
             finally:
-                try:
-                    rpc("stop")
-                    node.wait(timeout=30)
-                except (OSError, RuntimeError, subprocess.TimeoutExpired):
-                    node.kill()
-                    node.wait()
+                if node.poll() is None:
+                    try:
+                        rpc("stop")
+                        node.wait(timeout=30)
+                    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                        node.kill()
+                        node.wait()
 
 
 if __name__ == "__main__":

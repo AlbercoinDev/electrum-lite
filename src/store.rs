@@ -616,6 +616,24 @@ impl Store {
         Ok(())
     }
 
+    /// Persistent scheduling cursor; unfinished requests always fail closed.
+    pub fn prune_checkpoint(&self) -> Result<u32> {
+        let pending: i64 = self.conn.query_row(
+            "SELECT count(*) FROM prune_audit WHERE state='requested'",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            pending == 0,
+            "previous prune request needs operator review before another prune"
+        );
+        Ok(self.conn.query_row(
+            "SELECT coalesce(max(requested),0) FROM prune_audit WHERE state='completed'",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn prune_start(&self, requested: u32) -> Result<i64> {
         let pending: i64 = self.conn.query_row(
             "SELECT count(*) FROM prune_audit WHERE state='requested'",

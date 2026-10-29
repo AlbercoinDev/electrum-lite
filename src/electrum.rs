@@ -251,7 +251,7 @@ impl State {
             &mut self.archive,
             &self.options.core,
             self.options.chain,
-            64,
+            256,
             None,
             Some(&self.stop),
         ) {
@@ -962,7 +962,7 @@ pub async fn serve(options: Options) -> Result<()> {
             if state.stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
-            if updated.elapsed() >= period {
+            if state.catching_up || updated.elapsed() >= period {
                 if let Err(error) = state.refresh() {
                     state.ready = false;
                     state.catching_up = false;

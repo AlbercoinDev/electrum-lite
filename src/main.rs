@@ -37,7 +37,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Supervise a NEW dedicated test Core (manual prune only); Linux experimental.
+    /// Supervise a dedicated test Core; optional coordinated automatic pruning.
     #[cfg(target_os = "linux")]
     ManagedServe {
         #[arg(long)]
@@ -54,6 +54,15 @@ enum Command {
         /// Disable P2P for isolated tests.
         #[arg(long)]
         offline: bool,
+        /// Automatically prune verified durable prefixes of the owned test Core.
+        #[arg(long, requires = "prune_backup_root")]
+        auto_prune: bool,
+        /// Existing parent for NEW backups per prune; never automatically deleted.
+        #[arg(long, requires = "auto_prune")]
+        prune_backup_root: Option<PathBuf>,
+        /// Minimum new eligible heights between automatic maintenance windows (>=288).
+        #[arg(long, default_value_t = 2016)]
+        auto_prune_interval_blocks: u32,
     },
     /// Recover a deep reorg into a NEW root using matching archived blocks and Core's new branch.
     RecoverChain {
@@ -200,6 +209,9 @@ fn main() -> Result<()> {
             listen,
             confirm_dedicated,
             offline,
+            auto_prune,
+            prune_backup_root,
+            auto_prune_interval_blocks,
         } => {
             ensure!(
                 confirm_dedicated,
@@ -213,6 +225,14 @@ fn main() -> Result<()> {
                 rpc_port,
                 listen,
                 offline,
+                auto_prune: if auto_prune {
+                    Some(electrum_lite::supervisor::AutoPrune {
+                        backup_root: prune_backup_root.context("backup root required")?,
+                        interval_blocks: auto_prune_interval_blocks,
+                    })
+                } else {
+                    None
+                },
             };
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()

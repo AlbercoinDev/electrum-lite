@@ -128,7 +128,7 @@ El arranque verifica íntegramente archivo, referencias e índices; puede tardar
 
 La misma terminal de `serve` muestra cada aproximadamente cinco segundos las alturas observadas de Core e índice, retraso, velocidad entre muestras, altura de poda, antigüedad de la observación y espacio libre. También informa de errores y alerta de poda automática o histórico ausente. Si el worker está ocupado o Core no responde, la actualización puede tardar más; `?` significa que no hay dato disponible. No registra cookies ni consultas de cartera.
 
-`serve` normal **no supervisa ni detiene Core**. En Linux existe `managed-serve`, experimental y solo para un Core dedicado nuevo de Signet/Testnet4/regtest: verifica el índice antes de arrancarlo y solicita la parada de su propio proceso si Electrum Lite falla. Exige `--confirm-dedicated` y **usa poda manual `prune=1`**, no `prune=550`. La poda automática de Core no está validada para preservar el histórico. Ver [supervisión y límites](docs/operations.md#supervisor-linux-experimental).
+`serve` normal **no supervisa ni detiene Core**. En Linux existe `managed-serve`, experimental y solo para un Core dedicado nuevo de Signet/Testnet4/regtest: verifica el índice antes de arrancarlo y solicita la parada de su propio proceso si Electrum Lite falla. Exige `--confirm-dedicated` y **usa internamente `prune=1`**, no `prune=550`. Con `--auto-prune --prune-backup-root DIRECTORIO_EXISTENTE` el supervisor automatiza ventanas de auditoría, backup verificable y poda del prefijo durable; sin esas opciones no poda. La poda independiente de Core no está validada para preservar el histórico. Ver [supervisión y límites](docs/operations.md#supervisor-linux-experimental).
 
 En otra terminal:
 
@@ -140,9 +140,9 @@ Comprueba `ready`, tip local/Core, IBD, conexiones/red activa, espacio, tamaños
 
 Para observar progreso continuamente: `./target/release/electrum-lite --network signet monitor --address 127.0.0.1:60601`. Emite JSON cada cinco segundos con velocidad entre muestras, retraso frente al Core observado, espacio y alertas de poda; `--interval` cambia el periodo. Las observaciones pueden quedar desactualizadas y no sustituyen una ventana de mantenimiento segura. No hay garantía medida de alcanzar a Core durante IBD.
 
-La sincronización agrupa hasta 16 bloques y 16 MB serializados por commit durable (el daemon procesa hasta 64 por ciclo). El archivo se sincroniza antes de confirmar SQLite. Una cola incompleta sigue fallando de forma segura; no se trunca automáticamente. Este cambio no demuestra que la indexación pueda seguir a Core: se necesitan pruebas sostenidas y mediciones representativas.
+La sincronización agrupa hasta 16 bloques y 16 MB serializados por commit durable (el daemon procesa hasta 256 por ciclo). El archivo se sincroniza antes de confirmar SQLite. Una cola incompleta sigue fallando de forma segura; no se trunca automáticamente. Este cambio no demuestra que la indexación pueda seguir a Core: se necesitan pruebas sostenidas y mediciones representativas.
 
-Un pool fijo de 2–8 workers descarga grupos de cuatro bloques, con una cola de un grupo por worker, y se solapan descargas con commits mediante el único escritor; las sentencias SQL se reutilizan durante el lote. Además del lote serializado acotado, hay memoria transitoria de los bloques y sus respuestas JSON/hex; no es un límite total de RSS. Un error RPC interrumpe el grupo, no se interpreta como una reorganización. `health` incluye `sync_metrics` del último ciclo: tiempo total, espera de grupos y commit. Son tiempos agregados, no una descomposición completa de RPC, compresión y SQLite.
+Un pool fijo de 2–8 workers descarga grupos de cuatro bloques mediante dos peticiones RPC por lote (hashes y bloques), con una cola de un grupo por worker, y se solapan descargas con commits mediante el único escritor; las sentencias SQL se reutilizan durante el lote. Además del lote serializado acotado, hay memoria transitoria de los bloques y sus respuestas JSON/hex; no es un límite total de RSS. Un error RPC interrumpe el grupo, no se interpreta como una reorganización. `health` incluye `sync_metrics` del último ciclo: tiempo total, espera de grupos y commit. Son tiempos agregados, no una descomposición completa de RPC, compresión y SQLite.
 
 Para Sparrow, selecciona la misma red y **Private Electrum server**, host `127.0.0.1` y el puerto elegido. TCP sin SSL solo en loopback/túnel privado; nunca transportes abierto por Internet. La interfaz con Sparrow real sigue pendiente de validación aquí: no se ha instalado ni probado su GUI. Ver [perfil de protocolo y pruebas](docs/protocol.md).
 
@@ -167,6 +167,23 @@ También hay `history SCRIPTHASH`, `transaction TXID [--height ALTURA]`, `rebuil
 
 ## Backup y poda
 
+### Poda automática coordinada (experimental, Linux)
+
+```sh
+mkdir -p "$HOME/electrum-prune-backups"
+~/.local/bin/electrum-lite --network signet --data-dir "$HOME/electrum-data" managed-serve \
+  --bitcoind /ruta/real/a/bitcoind --core-dir "$HOME/electrum-core-dedicado" \
+  --rpc-port 38342 --listen 127.0.0.1:60601 --confirm-dedicated \
+  --auto-prune --prune-backup-root "$HOME/electrum-prune-backups"
+```
+
+Edita la ruta de `bitcoind`. La raíz de Core debe ser **nueva** o creada antes por este supervisor; no adopta tu nodo existente. No ejecutes otros escritores de cadena contra el Core dedicado. Mainnet está bloqueada.
+
+Cada 2016 nuevas alturas elegibles (configurable con `--auto-prune-interval-blocks`, mínimo 288), el supervisor detiene su daemon, desactiva temporalmente P2P, verifica el prefijo durable, audita, crea/verifica un backup completo nuevo y solicita poda dejando 288 bloques de margen. Reinicia el daemon y restaura P2P solo tras éxito; ante error detiene el Core propio. Los backups nunca se borran automáticamente: reserva espacio para las copias completas y revisa capacidad. No es un objetivo de tamaño de disco ni `prune=550`.
+
+El cursor de poda persiste en SQLite y evita repetir el mismo prefijo tras reinicios. Una petición incompleta exige revisión del operador; nunca se borra para continuar. La ventana interrumpe consultas/conexiones y pausa la descarga de Core; **no cuenta como evidencia de que Lite indexe más rápido**. `health` del daemon conserva `automatic_pruning:false` porque la automatización pertenece al supervisor; sus logs muestran petición, resultado real y backup. Véase [operación](docs/operations.md#poda-automática-coordinada).
+
+
 ```sh
 # Con el servicio detenido. Los destinos deben ser nuevos y estar fuera del origen.
 ./target/release/electrum-lite --network signet --data-dir ./data backup --output ./backup-signet
@@ -176,7 +193,7 @@ También hay `history SCRIPTHASH`, `transaction TXID [--height ALTURA]`, `rebuil
 ./target/release/electrum-lite --network signet --data-dir ./restored-data inspect
 ```
 
-La poda es **mantenimiento explícito en redes de prueba**, no un modo automático. Requiere Core con poda manual, red de Core desactivada explícitamente por el operador, ningún otro escritor de cadena, prefijo indexado coincidente, auditoría semántica, margen de 288 bloques y backup nuevo. Puede podar un prefijo durable durante bootstrap aunque Core vaya por delante.
+La poda manual es **mantenimiento explícito en redes de prueba**. Existe además automatización opt-in en el supervisor dedicado, descrita debajo. Requiere Core con poda manual, red de Core desactivada explícitamente por el operador, ningún otro escritor de cadena, prefijo indexado coincidente, auditoría semántica, margen de 288 bloques y backup nuevo. Puede podar un prefijo durable durante bootstrap aunque Core vaya por delante.
 
 ```sh
 # Solo sobre el nodo de pruebas dedicado. Detén primero Electrum Lite.

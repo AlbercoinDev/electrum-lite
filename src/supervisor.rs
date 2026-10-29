@@ -21,6 +21,63 @@ pub struct Options {
     pub rpc_port: u16,
     pub listen: SocketAddr,
     pub offline: bool,
+    pub auto_prune: Option<AutoPrune>,
+}
+
+pub struct AutoPrune {
+    pub backup_root: PathBuf,
+    pub interval_blocks: u32,
+}
+
+fn prune_due(height: u64, checkpoint: u32, interval: u32) -> bool {
+    height
+        .checked_sub(288)
+        .is_some_and(|eligible| eligible >= u64::from(checkpoint) + u64::from(interval))
+}
+
+/// Runs only after the owned daemon stopped, with its exclusive archive lock.
+/// Any failure leaves networking disabled; the caller stops the owned Core.
+fn automatic_maintenance(
+    data: &Path,
+    cookie: PathBuf,
+    endpoint: String,
+    chain: Chain,
+    backup_root: &Path,
+) -> Result<Value> {
+    let core = crate::rpc::Core::new(&endpoint, &cookie)?;
+    let mut archive = crate::archive::Archive::open(data, chain, true)?;
+    let mut store = crate::store::Store::open(
+        &archive.directory().join("index.sqlite"),
+        chain,
+        crate::store::Limits {
+            transactions: 10_000_000_000,
+            entries: 100_000_000_000,
+        },
+    )?;
+    store.recover(&mut archive)?;
+    store.prune_checkpoint()?;
+    let network: Value = core.call("getnetworkinfo", json!([]))?;
+    let active = network["networkactive"]
+        .as_bool()
+        .context("missing Core network state")?;
+    let _: Value = core.call("setnetworkactive", json!([false]))?;
+    // Random NEW destination; retained on every failure, never reused/deleted.
+    let backup = tempfile::Builder::new()
+        .prefix("auto-prune-")
+        .tempdir_in(backup_root)?;
+    let parent = backup.keep();
+    let result = crate::operations::prune(
+        &store,
+        &mut archive,
+        &core,
+        chain,
+        &parent.join("backup"),
+        512 * 1024 * 1024,
+    )?;
+    if active {
+        let _: Value = core.call("setnetworkactive", json!([true]))?;
+    }
+    Ok(result)
 }
 
 struct OwnedChild(Child);
@@ -223,6 +280,32 @@ pub async fn run(options: Options) -> Result<()> {
         !root.starts_with(&app_root) && !app_root.starts_with(&root),
         "Core and Electrum data roots must be separate"
     );
+    let mut prune_checkpoint = 0;
+    if let Some(policy) = &options.auto_prune {
+        ensure!(
+            policy.interval_blocks >= 288,
+            "automatic prune interval must be >=288 blocks"
+        );
+        let backup = policy
+            .backup_root
+            .canonicalize()
+            .context("backup root must already exist")?;
+        ensure!(
+            backup.is_dir() && !backup.starts_with(&app_root) && !backup.starts_with(&root),
+            "backup root must be a directory outside Core and application data"
+        );
+        let mut archive = crate::archive::Archive::open(&app_root, options.chain, true)?;
+        let mut store = crate::store::Store::open(
+            &archive.directory().join("index.sqlite"),
+            options.chain,
+            crate::store::Limits {
+                transactions: 10_000_000_000,
+                entries: 100_000_000_000,
+            },
+        )?;
+        store.recover(&mut archive)?;
+        prune_checkpoint = store.prune_checkpoint()?;
+    }
     // Refuse occupied ports before launching either child; the applications also
     // independently bind them, and failures stop the owned Core.
     drop(TcpListener::bind(options.listen).context("Electrum listen port already in use")?);
@@ -232,7 +315,8 @@ pub async fn run(options: Options) -> Result<()> {
     );
     let cookie = root.join(options.chain.name()).join(".cookie");
     let endpoint = format!("http://127.0.0.1:{}/", options.rpc_port);
-    let mut app = Command::new(app_executable);
+    let mut app_command = Command::new(app_executable);
+    let app = &mut app_command;
     app.arg("--network")
         .arg(options.chain.name())
         .arg("--data-dir")
@@ -244,8 +328,12 @@ pub async fn run(options: Options) -> Result<()> {
         .arg(&endpoint)
         .arg("--listen")
         .arg(options.listen.to_string());
-    signal_on_parent_death(&mut app);
-    let mut app = OwnedChild(app.spawn().context("failed to start Electrum Lite")?);
+    signal_on_parent_death(app);
+    let mut app = OwnedChild(
+        app_command
+            .spawn()
+            .context("failed to start Electrum Lite")?,
+    );
     eprintln!("Supervisor: esperando verificación de Electrum Lite; Core aún no se ha iniciado.");
     let startup = Instant::now();
     let ctrl = tokio::signal::ctrl_c();
@@ -303,6 +391,9 @@ pub async fn run(options: Options) -> Result<()> {
     eprintln!(
         "Supervisor: Core dedicado iniciado en poda manual (prune=1); prune=550 no está validado."
     );
+    if let Some(policy) = &options.auto_prune {
+        eprintln!("Supervisor: poda automática coordinada habilitada; intervalo={} alturas elegibles, margen=288; auditoría y backup completo antes de borrar. No es una garantía de espacio ni velocidad.", policy.interval_blocks);
+    }
     let mut last_health = Instant::now();
     let core_started = Instant::now();
     let mut core_seen = false;
@@ -321,6 +412,57 @@ pub async fn run(options: Options) -> Result<()> {
                 last_health = Instant::now();
                 if health["core_height"].is_number() {
                     core_seen = true;
+                }
+                if let Some(policy) = &options.auto_prune {
+                    if health["last_error"].is_null()
+                        && health["indexed_tip"]["height"]
+                            .as_u64()
+                            .is_some_and(|height| {
+                                prune_due(height, prune_checkpoint, policy.interval_blocks)
+                            })
+                    {
+                        eprintln!("Poda automática: ventana de mantenimiento; deteniendo el escritor antes de auditar y respaldar.");
+                        if let Err(error) = stop_owned(&mut app, "Electrum Lite") {
+                            break (
+                                format!("automatic prune could not stop writer: {error}"),
+                                true,
+                            );
+                        }
+                        let data = app_root.clone();
+                        let cookie = cookie.clone();
+                        let endpoint = endpoint.clone();
+                        let backup_root = policy.backup_root.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            automatic_maintenance(&data, cookie, endpoint, chain, &backup_root)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(report)) => {
+                                prune_checkpoint = report["requested"]
+                                    .as_u64()
+                                    .context("automatic prune report missing cursor")?
+                                    .try_into()?;
+                                eprintln!("Poda automática completada: {report}");
+                                match app_command.spawn() {
+                                    Ok(child) => app = OwnedChild(child),
+                                    Err(error) => {
+                                        break (
+                                            format!(
+                                                "failed to restart after automatic prune: {error}"
+                                            ),
+                                            true,
+                                        )
+                                    }
+                                }
+                                last_health = Instant::now();
+                                errors = 0;
+                                continue;
+                            }
+                            error => {
+                                break (format!("automatic prune failed closed: {error:?}"), true)
+                            }
+                        }
+                    }
                 }
                 if core_seen || core_started.elapsed() > Duration::from_secs(120) {
                     if let Some(error) = health["last_error"].as_str() {
@@ -381,5 +523,15 @@ mod tests {
             fs::read(own.join("electrum-lite-core.conf")).unwrap(),
             b"prune=550"
         );
+    }
+
+    #[test]
+    fn automatic_prune_schedule_keeps_margin_and_uses_persistent_cursor() {
+        assert!(!prune_due(287, 0, 288));
+        assert!(!prune_due(575, 0, 288));
+        assert!(prune_due(576, 0, 288));
+        assert!(!prune_due(863, 288, 288));
+        assert!(prune_due(864, 288, 288));
+        assert!(!prune_due(100, 1000, 288)); // Reorg must not reset the cursor.
     }
 }
