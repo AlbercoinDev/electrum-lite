@@ -34,6 +34,13 @@ def health(port_number):
     return result["result"]
 
 
+def rss_kib(pid):
+    for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+    return None
+
+
 def summarize(samples, minimum_seconds):
     valid = [s for s in samples if "lite_height" in s and s.get("last_error") is None]
     # Conservative bounds: Core is sampled before AND after the health call.
@@ -74,6 +81,8 @@ def main():
     parser.add_argument("--max-download-mib", type=int, default=512)
     parser.add_argument("--prefill-blocks", type=int, default=4096)
     parser.add_argument("--minimum-window-seconds", type=int, default=120)
+    parser.add_argument("--rpc-probes", action="store_true",
+                        help="Time one lightweight RPC and one chain lookup per sample")
     args = parser.parse_args()
     if not (120 <= args.seconds <= 1800 and 1 <= args.max_download_mib <= 2048
             and args.prefill_blocks >= 1 and args.minimum_window_seconds >= 120):
@@ -105,6 +114,7 @@ def main():
         return result["result"]
 
     metadata = {"network": args.network, "binary": str(binary),
+                "sqlite_cache_mib": 64,
                 "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "core_version": subprocess.check_output([bitcoind, "--version"], text=True).splitlines()[0],
                 "budgets": vars(args) | {"root": str(args.root)}, "started_unix": time.time()}
@@ -141,11 +151,19 @@ def main():
                         sample = {"elapsed": time.monotonic() - started, "core_before": before["blocks"],
                                   "headers": before["headers"], "received_bytes": received, "peers": peers,
                                   "free_bytes": shutil.disk_usage(args.root).free}
+                        if args.rpc_probes:
+                            probe = time.monotonic()
+                            rpc("uptime")
+                            sample["rpc_uptime_ms"] = (time.monotonic() - probe) * 1000
+                            probe = time.monotonic()
+                            rpc("getblockhash", [before["blocks"]])
+                            sample["rpc_chain_lookup_ms"] = (time.monotonic() - probe) * 1000
                         if app is not None:
                             status = health(electrum_port)
                             after = rpc("getblockchaininfo")
                             height = status["indexed_tip"]["height"]
                             sample.update({"core_after": after["blocks"], "lite_height": height,
+                                "lite_rss_kib": rss_kib(app.pid), "core_rss_kib": rss_kib(core.pid),
                                 "lag_lower": max(0, before["blocks"] - height),
                                 "lag_upper": max(0, after["blocks"] - height),
                                 "sync_metrics": status["sync_metrics"], "last_error": status["last_error"]})

@@ -3,8 +3,11 @@ use std::{
     io::Read,
     net::IpAddr,
     path::Path,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{ensure, Context, Result};
@@ -27,12 +30,22 @@ impl std::fmt::Display for RpcFailure {
 }
 impl std::error::Error for RpcFailure {}
 
+#[derive(Default)]
+struct RpcTiming {
+    hash_calls: AtomicU64,
+    hash_us: AtomicU64,
+    block_calls: AtomicU64,
+    block_us: AtomicU64,
+    decode_us: AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct Core {
     agent: ureq::Agent,
     url: String,
     cookie: std::path::PathBuf,
     authorization: Arc<Mutex<Option<(u64, u64, String)>>>,
+    timing: Arc<RpcTiming>,
 }
 
 impl Core {
@@ -65,6 +78,7 @@ impl Core {
             url: url.to_string(),
             cookie: cookie.to_owned(),
             authorization: Arc::new(Mutex::new(None)),
+            timing: Arc::new(RpcTiming::default()),
         })
     }
 
@@ -171,7 +185,7 @@ impl Core {
     /// reordered explicitly (JSON-RPC does not promise response ordering).
     fn batch(&self, method: &str, parameters: Vec<Value>, limit: usize) -> Result<Vec<Value>> {
         ensure!(
-            !parameters.is_empty() && parameters.len() <= 4,
+            !parameters.is_empty() && parameters.len() <= 8,
             "invalid RPC batch size"
         );
         ensure!(limit <= 64 * 1024 * 1024, "invalid RPC batch budget");
@@ -233,12 +247,17 @@ impl Core {
     }
 
     pub fn block_group(&self, start: u32, end: u32) -> Result<Vec<(Block, usize)>> {
-        ensure!(end >= start && end - start < 4, "invalid block group");
+        ensure!(end >= start && end - start < 8, "invalid block group");
+        let started = Instant::now();
         let hashes = self.batch(
             "getblockhash",
             (start..=end).map(|h| json!([h])).collect(),
             65536,
         )?;
+        self.timing.hash_calls.fetch_add(1, Ordering::Relaxed);
+        self.timing
+            .hash_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         let hashes: Vec<BlockHash> = hashes
             .into_iter()
             .map(|h| {
@@ -248,12 +267,18 @@ impl Core {
                     .context("invalid block hash")
             })
             .collect::<Result<_>>()?;
+        let started = Instant::now();
         let blocks = self.batch(
             "getblock",
             hashes.iter().map(|h| json!([h.to_string(), 0])).collect(),
             hashes.len() * (MAX_BLOCK_BYTES * 2 + 65536),
         )?;
-        blocks
+        self.timing.block_calls.fetch_add(1, Ordering::Relaxed);
+        self.timing
+            .block_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let started = Instant::now();
+        let decoded = blocks
             .into_iter()
             .zip(hashes)
             .map(|(encoded, hash)| {
@@ -270,7 +295,22 @@ impl Core {
                 );
                 Ok((block, raw.len()))
             })
-            .collect()
+            .collect();
+        self.timing
+            .decode_us
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        decoded
+    }
+
+    /// Successful group-call totals, summed across workers (not wall time).
+    pub fn group_timing(&self) -> [u64; 5] {
+        [
+            self.timing.hash_calls.load(Ordering::Relaxed),
+            self.timing.hash_us.load(Ordering::Relaxed),
+            self.timing.block_calls.load(Ordering::Relaxed),
+            self.timing.block_us.load(Ordering::Relaxed),
+            self.timing.decode_us.load(Ordering::Relaxed),
+        ]
     }
 
     pub fn block(&self, hash: BlockHash) -> Result<Block> {

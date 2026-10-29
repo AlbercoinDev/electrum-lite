@@ -105,6 +105,72 @@ fn durable_batch_replays_after_failure_and_preserves_order() {
 }
 
 #[test]
+fn block_overlay_matches_reference_for_branched_intra_block_spends_and_rewind() {
+    let root = tempdir().unwrap();
+    let chain = Chain::Regtest;
+    let mut archive = Archive::open(root.path(), chain, true).unwrap();
+    let mut store =
+        Store::open(&archive.directory().join("index.sqlite"), chain, limits()).unwrap();
+    store.recover(&mut archive).unwrap();
+    let mut reference = Index::new(chain, 100_000);
+    let mut block = genesis_block(chain.network());
+    store.commit(&mut archive, 0, &block).unwrap();
+    reference.apply(0, &block).unwrap();
+    let scripts: Vec<_> = (1..=8)
+        .map(|n| ScriptBuf::from_bytes(vec![n, 0x75, 0x51]))
+        .collect();
+    let mut coins = Vec::new();
+    let mut snapshots = Vec::new();
+    let mut seed = 123456789u64;
+    for height in 1..=20 {
+        let coinbase = coinbase(height);
+        coins.push(OutPoint {
+            txid: coinbase.compute_txid(),
+            vout: 0,
+        });
+        let mut transactions = vec![coinbase];
+        for n in 0..32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let input = coins.swap_remove(seed as usize % coins.len());
+            let mut transaction = spend(input);
+            for (vout, output) in transaction.output.iter_mut().enumerate() {
+                output.value = Amount::ZERO;
+                output.script_pubkey = scripts[(n + vout) % scripts.len()].clone();
+            }
+            let txid = transaction.compute_txid();
+            coins.extend((0..2).map(|vout| OutPoint { txid, vout }));
+            transactions.push(transaction);
+        }
+        block = next(&block, transactions);
+        reference.apply(height, &block).unwrap();
+        store.commit(&mut archive, height, &block).unwrap();
+        let expected: Vec<_> = scripts
+            .iter()
+            .map(|script| {
+                serde_json::to_value(reference.view(&script_hash(script)).unwrap()).unwrap()
+            })
+            .collect();
+        for (script, expected) in scripts.iter().zip(&expected) {
+            assert_eq!(
+                serde_json::to_value(store.view(&script_hash(script), 10000).unwrap()).unwrap(),
+                *expected
+            );
+        }
+        snapshots.push(expected);
+    }
+    store.rewind(&mut archive, 19).unwrap();
+    for (script, expected) in scripts.iter().zip(&snapshots[18]) {
+        assert_eq!(
+            serde_json::to_value(store.view(&script_hash(script), 10000).unwrap()).unwrap(),
+            *expected
+        );
+    }
+    store.audit(&mut archive).unwrap();
+}
+
+#[test]
 fn batch_rejects_invalid_merkle_without_publishing() {
     let root = tempdir().unwrap();
     let chain = Chain::Regtest;

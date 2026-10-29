@@ -18,7 +18,7 @@ use std::{
 // One fixed worker pool per synchronization call. Groups preserve order; no
 // thread is spawned per block and no result is published before the whole
 // group succeeds.
-const FETCH_GROUP: u32 = 4;
+const FETCH_GROUP: u32 = 8;
 const PIPELINE_DEPTH: usize = 1;
 
 fn fetch_workers() -> usize {
@@ -61,6 +61,7 @@ struct CommitMetrics {
     time: Duration,
     blocks: usize,
     bytes: usize,
+    anchor_time: Duration,
 }
 
 /// Ordered publisher: fetched groups arrive out of order, but every batch is
@@ -81,10 +82,12 @@ impl Publisher<'_> {
         if self.pending.is_empty() {
             return Ok(());
         }
+        let anchor_started = Instant::now();
         ensure!(
             self.core.hash(self.end)? == self.anchor,
             "Core changed branch during sync; retry safely"
         );
+        self.metrics.anchor_time += anchor_started.elapsed();
         let started = Instant::now();
         self.store.commit_batch(self.archive, &self.pending)?;
         self.metrics.time += started.elapsed();
@@ -97,7 +100,7 @@ impl Publisher<'_> {
 
     fn push(&mut self, item: Fetched) -> Result<()> {
         if !self.pending.is_empty()
-            && (self.pending.len() >= 16
+            && (self.pending.len() >= 64
                 || self.pending_bytes.saturating_add(item.size) > 16_000_000)
         {
             self.commit()?;
@@ -121,6 +124,7 @@ pub fn batch(
     stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Value> {
     let started = Instant::now();
+    let rpc_before = core.group_timing();
     let mut fetch_wait = Duration::ZERO;
     let mut metrics = CommitMetrics::default();
     ensure!(maximum > 0, "batch size must be positive");
@@ -235,12 +239,18 @@ pub fn batch(
         })?;
     }
     let mut info = info;
+    let rpc_after = core.group_timing();
+    let rpc = std::array::from_fn::<_, 5, _>(|i| rpc_after[i].saturating_sub(rpc_before[i]));
     info["electrum_sync_metrics"] = serde_json::json!({
         "batch_blocks": metrics.blocks,
         "batch_bytes": metrics.bytes,
         "total_ms": started.elapsed().as_millis(),
         "fetch_wait_ms": fetch_wait.as_millis(),
-        "commit_ms": metrics.time.as_millis()
+        "commit_ms": metrics.time.as_millis(),
+        "anchor_ms": metrics.anchor_time.as_millis(),
+        "rpc_hash_groups": rpc[0], "rpc_hash_worker_us": rpc[1],
+        "rpc_block_groups": rpc[2], "rpc_block_worker_us": rpc[3],
+        "rpc_decode_worker_us": rpc[4]
     });
     Ok(info)
 }

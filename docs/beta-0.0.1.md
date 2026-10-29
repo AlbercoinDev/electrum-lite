@@ -1,5 +1,11 @@
 # Beta 0.0.1 — estado y validación
 
+## Perfil RPC/escritor y delta UTXO por bloque
+
+Se añadieron métricas agregadas RPC/anchor y perfil opt-in `ELECTRUM_LITE_PROFILE_STORE=1`. Los ensayos en disco identificaron coste importante de comprobaciones de rama y, a alturas mayores, del escritor durable. Se agrupan hasta ocho hashes/bloques por RPC y hasta 64 bloques/16 MB por generación, con comprobación de rama en cada generación. Un overlay temporal por bloque reduce las operaciones UTXO por transacción, conservando orden, undo, historial, witness y ruta BIP30. Caché default 64 MiB y esquema sin cambios.
+
+**Los ensayos siguen siendo negativos respecto a M2.** Medidas y variantes descartadas se detallan en [perfil en disco](benchmarks/signet-rpc-writer-profile.md); no se promete alcanzar/superar a Core. Los límites de 256 bloques/caché 256 MiB fueron exploratorios y no se adoptan como default. Validación de seguridad: 52 tests Rust, fmt, Clippy y release; comparación del overlay con Index de referencia, Core TCP/mempool/RBF/reorg, recuperación, supervisor y poda automática real satisfactorios.
+
 ## Co-sincronización pública medida — meta no alcanzada
 
 El binario publicado `f8fcfb6` se probó con un Core Signet nuevo, sin poda ni pausas de mantenimiento durante el muestreo. En 67 muestras durante aproximadamente 199 segundos, Lite pasó de altura 255 a 29 439 mientras Core pasó de 5848 a 100 107. El retraso creció de unos 5593 a 70 668 bloques: **M2 no cumplida en esta ejecución**, no solo pendiente de medir. Véanse [metodología, hash del binario y resultado](benchmarks/signet-cosync-f8fcfb6.md). La nueva herramienta `scripts/cosync_smoke.py` conserva logs/JSONL y no acepta como éxito alcanzar un Core detenido. No se habilita poda mainnet ni se promete `prune=550`.

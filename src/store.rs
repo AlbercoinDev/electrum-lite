@@ -276,6 +276,8 @@ impl Store {
             !blocks.is_empty() && blocks.len() <= 64,
             "invalid commit batch size"
         );
+        let profile = std::env::var_os("ELECTRUM_LITE_PROFILE_STORE").is_some();
+        let mut timing = [std::time::Duration::ZERO; 4];
         let result = (|| -> Result<()> {
             let tx = self.conn.transaction()?;
             let mut first = None;
@@ -283,6 +285,7 @@ impl Store {
                 let mut sql = BatchSql::new(&tx);
                 let mut running = Running::load(&tx)?;
                 for (height, block) in blocks {
+                    let started = std::time::Instant::now();
                     prepare_block(
                         &tx,
                         self.chain,
@@ -292,20 +295,57 @@ impl Store {
                         block,
                         &mut sql,
                     )?;
+                    timing[0] += started.elapsed();
+                    let started = std::time::Instant::now();
                     let location = archive.append_staged(*height, block)?;
+                    timing[1] += started.elapsed();
                     first.get_or_insert(location.segment);
                     publish(&tx, *height, block, location)?;
                 }
                 running.save(&tx)?;
+                if profile {
+                    let scans = |statements: &[Option<rusqlite::Statement<'_>>]| -> i64 {
+                        statements
+                            .iter()
+                            .flatten()
+                            .map(|s| {
+                                i64::from(s.get_status(rusqlite::StatementStatus::FullscanStep))
+                            })
+                            .sum()
+                    };
+                    eprintln!(
+                        "SQL_SCAN lookup={} delete={} utxos={} undo={} occurrences={} history={}",
+                        scans(&sql.lookup),
+                        scans(&sql.delete),
+                        scans(&sql.utxos),
+                        scans(&sql.undo_existing) + scans(&sql.undo_missing),
+                        scans(&sql.occurrences),
+                        scans(&sql.history)
+                    );
+                }
             }
             hook(CommitStage::Prepared)?;
+            let started = std::time::Instant::now();
             archive.sync_staged(first.context("empty batch")?)?;
+            timing[2] += started.elapsed();
             hook(CommitStage::ArchiveSynced)?;
             hook(CommitStage::ReferencesStaged)?;
+            let started = std::time::Instant::now();
             tx.commit()?;
+            timing[3] += started.elapsed();
             hook(CommitStage::Committed)?;
             Ok(())
         })();
+        if profile {
+            eprintln!(
+                "STORE_PROFILE blocks={} prepare_us={} append_us={} sync_us={} sqlcommit_us={}",
+                blocks.len(),
+                timing[0].as_micros(),
+                timing[1].as_micros(),
+                timing[2].as_micros(),
+                timing[3].as_micros()
+            );
+        }
         if result.is_err() {
             archive.require_scan();
         }
@@ -840,92 +880,98 @@ fn prepare_block(
     // BIP30 exceptions are the only place where an unspent outpoint may be
     // overwritten; every other conflict is a hard integrity error.
     let bip30 = chain == Chain::Mainnet && matches!(height, 91842 | 91880);
-    let mut utxo_rows: Vec<UtxoRow> = Vec::new();
-    let mut history_rows: Vec<([u8; 32], u32, i64)> = Vec::new();
-    let mut occurrence_rows: Vec<(u32, i64, Vec<u8>)> = Vec::new();
-    let mut undo_rows: Vec<([u8; 36], Prevout)> = Vec::new();
-    let mut missing_rows: Vec<[u8; 36]> = Vec::new();
-    for (position, transaction) in block.txdata.iter().enumerate() {
-        let position = i64::try_from(position)?;
-        let txid = txids[usize::try_from(position)?];
-        occurrence_rows.push((height, position, txid.as_byte_array().to_vec()));
-        let mut scripts: HashSet<[u8; 32]> = HashSet::new();
-        if !transaction.is_coinbase() {
-            let keys: Vec<[u8; 36]> = transaction
-                .input
-                .iter()
-                .map(|input| outpoint_key(input.previous_output.txid, input.previous_output.vout))
-                .collect();
-            let prevouts = lookup_prevouts(tx, sql, &keys)?;
-            for key in &keys {
-                let prevout = prevouts
-                    .get(key)
-                    .context("missing or already spent prevout")?;
-                scripts.insert(prevout.script);
-                undo_rows.push((
-                    *key,
-                    Prevout {
-                        script: prevout.script,
-                        value: prevout.value,
-                        height: prevout.height,
-                        coinbase: prevout.coinbase,
-                    },
-                ));
+    if !bip30 {
+        prepare_regular_block(tx, sql, running, height, block, &txids)?;
+    } else {
+        let mut utxo_rows: Vec<UtxoRow> = Vec::new();
+        let mut history_rows: Vec<([u8; 32], u32, i64)> = Vec::new();
+        let mut occurrence_rows: Vec<(u32, i64, Vec<u8>)> = Vec::new();
+        let mut undo_rows: Vec<([u8; 36], Prevout)> = Vec::new();
+        let mut missing_rows: Vec<[u8; 36]> = Vec::new();
+        for (position, transaction) in block.txdata.iter().enumerate() {
+            let position = i64::try_from(position)?;
+            let txid = txids[usize::try_from(position)?];
+            occurrence_rows.push((height, position, txid.as_byte_array().to_vec()));
+            let mut scripts: HashSet<[u8; 32]> = HashSet::new();
+            if !transaction.is_coinbase() {
+                let keys: Vec<[u8; 36]> = transaction
+                    .input
+                    .iter()
+                    .map(|input| {
+                        outpoint_key(input.previous_output.txid, input.previous_output.vout)
+                    })
+                    .collect();
+                let prevouts = lookup_prevouts(tx, sql, &keys)?;
+                for key in &keys {
+                    let prevout = prevouts
+                        .get(key)
+                        .context("missing or already spent prevout")?;
+                    scripts.insert(prevout.script);
+                    undo_rows.push((
+                        *key,
+                        Prevout {
+                            script: prevout.script,
+                            value: prevout.value,
+                            height: prevout.height,
+                            coinbase: prevout.coinbase,
+                        },
+                    ));
+                }
+                // Undo intent must be durable before the prevouts disappear.
+                insert_undo_existing(tx, sql, height, &undo_rows)?;
+                undo_rows.clear();
+                let removed = delete_utxos(tx, sql, &keys)?;
+                let unique = keys.iter().copied().collect::<BTreeSet<[u8; 36]>>().len();
+                ensure!(removed == unique, "missing or already spent prevout");
+                running.utxos -= i64::try_from(removed)?;
             }
-            // Undo intent must be durable before the prevouts disappear.
-            insert_undo_existing(tx, sql, height, &undo_rows)?;
-            undo_rows.clear();
-            let removed = delete_utxos(tx, sql, &keys)?;
-            let unique = keys.iter().copied().collect::<BTreeSet<[u8; 36]>>().len();
-            ensure!(removed == unique, "missing or already spent prevout");
-            running.utxos -= i64::try_from(removed)?;
-        }
-        let coinbase = transaction.is_coinbase();
-        for (vout, output) in transaction.output.iter().enumerate() {
-            let script = bitcoin::hashes::sha256::Hash::hash(output.script_pubkey.as_bytes())
-                .to_byte_array();
-            scripts.insert(script);
-            if height == 0
-                || output.script_pubkey.is_op_return()
-                || output.script_pubkey.len() > 10_000
-            {
-                continue;
+            let coinbase = transaction.is_coinbase();
+            for (vout, output) in transaction.output.iter().enumerate() {
+                let script = bitcoin::hashes::sha256::Hash::hash(output.script_pubkey.as_bytes())
+                    .to_byte_array();
+                scripts.insert(script);
+                if height == 0
+                    || output.script_pubkey.is_op_return()
+                    || output.script_pubkey.len() > 10_000
+                {
+                    continue;
+                }
+                let key = outpoint_key(txid, vout.try_into()?);
+                missing_rows.push(key);
+                utxo_rows.push(UtxoRow {
+                    key,
+                    script,
+                    value: i64::try_from(output.value.to_sat())?,
+                    height,
+                    coinbase,
+                });
             }
-            let key = outpoint_key(txid, vout.try_into()?);
-            missing_rows.push(key);
-            utxo_rows.push(UtxoRow {
-                key,
-                script,
-                value: i64::try_from(output.value.to_sat())?,
-                height,
-                coinbase,
-            });
+            // The two BIP30 blocks re-create unspent coinbase outpoints; capture
+            // their old value before `ON CONFLICT` overwrites it. Everywhere else a
+            // marker is enough: the outpoint cannot exist before this block.
+            let overwrite = bip30 && coinbase;
+            if overwrite {
+                insert_undo_from_utxos(tx, sql, height, &missing_rows)?;
+            }
+            insert_undo_missing(tx, sql, height, &missing_rows)?;
+            missing_rows.clear();
+            for script in scripts {
+                history_rows.push((script, height, position));
+            }
+            // Outputs of this transaction must be visible before the next one can
+            // spend them, so UTXOs are flushed per transaction (still multi-row).
+            let inserted = insert_utxos(tx, sql, &utxo_rows, overwrite)?;
+            utxo_rows.clear();
+            if !overwrite {
+                running.utxos += i64::try_from(inserted)?;
+            }
         }
-        // The two BIP30 blocks re-create unspent coinbase outpoints; capture
-        // their old value before `ON CONFLICT` overwrites it. Everywhere else a
-        // marker is enough: the outpoint cannot exist before this block.
-        let overwrite = bip30 && coinbase;
-        if overwrite {
-            insert_undo_from_utxos(tx, sql, height, &missing_rows)?;
+        if bip30 {
+            running.utxos = tx.query_row("SELECT count(*) FROM utxos", [], |r| r.get(0))?;
         }
-        insert_undo_missing(tx, sql, height, &missing_rows)?;
-        missing_rows.clear();
-        for script in scripts {
-            history_rows.push((script, height, position));
-        }
-        // Outputs of this transaction must be visible before the next one can
-        // spend them, so UTXOs are flushed per transaction (still multi-row).
-        let inserted = insert_utxos(tx, sql, &utxo_rows, overwrite)?;
-        utxo_rows.clear();
-        if !overwrite {
-            running.utxos += i64::try_from(inserted)?;
-        }
+        insert_occurrences(tx, sql, &occurrence_rows)?;
+        running.history += i64::try_from(insert_history(tx, sql, &history_rows)?)?;
     }
-    if bip30 {
-        running.utxos = tx.query_row("SELECT count(*) FROM utxos", [], |r| r.get(0))?;
-    }
-    insert_occurrences(tx, sql, &occurrence_rows)?;
-    running.history += i64::try_from(insert_history(tx, sql, &history_rows)?)?;
     running.tip = Some((height, block.block_hash()));
     ensure!(
         running
@@ -941,6 +987,101 @@ fn prepare_block(
             [height - UNDO_WINDOW],
         )?;
     }
+    Ok(())
+}
+
+/// Resolve a block in transaction order against a bounded per-block overlay.
+/// SQLite sees only the final UTXO delta; undo records the pre-block state,
+/// including absent markers for outputs consumed within the same block.
+fn prepare_regular_block(
+    tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    running: &mut Running,
+    height: u32,
+    block: &Block,
+    txids: &[Txid],
+) -> Result<()> {
+    let inputs: Vec<_> = block
+        .txdata
+        .iter()
+        .filter(|t| !t.is_coinbase())
+        .flat_map(|t| {
+            t.input
+                .iter()
+                .map(|i| outpoint_key(i.previous_output.txid, i.previous_output.vout))
+        })
+        .collect();
+    let mut external = lookup_prevouts(tx, sql, &inputs)?;
+    let mut created: HashMap<[u8; 36], UtxoRow> = HashMap::new();
+    let mut output_keys = HashSet::new();
+    let mut undo = Vec::new();
+    let mut deleted = Vec::new();
+    let mut history = Vec::new();
+    let mut occurrences = Vec::new();
+    for (position, transaction) in block.txdata.iter().enumerate() {
+        let txid = txids[position];
+        let position = i64::try_from(position)?;
+        occurrences.push((height, position, txid.as_byte_array().to_vec()));
+        let mut scripts = HashSet::new();
+        if !transaction.is_coinbase() {
+            for input in &transaction.input {
+                let key = outpoint_key(input.previous_output.txid, input.previous_output.vout);
+                if let Some(output) = created.remove(&key) {
+                    scripts.insert(output.script);
+                } else {
+                    let prevout = external
+                        .remove(&key)
+                        .context("missing or already spent prevout")?;
+                    scripts.insert(prevout.script);
+                    undo.push((key, prevout));
+                    deleted.push(key);
+                }
+            }
+        }
+        for (vout, output) in transaction.output.iter().enumerate() {
+            let script = bitcoin::hashes::sha256::Hash::hash(output.script_pubkey.as_bytes())
+                .to_byte_array();
+            scripts.insert(script);
+            if height == 0
+                || output.script_pubkey.is_op_return()
+                || output.script_pubkey.len() > 10_000
+            {
+                continue;
+            }
+            let key = outpoint_key(txid, vout.try_into()?);
+            ensure!(
+                output_keys.insert(key) && !external.contains_key(&key),
+                "duplicate unspent outpoint"
+            );
+            created.insert(
+                key,
+                UtxoRow {
+                    key,
+                    script,
+                    value: i64::try_from(output.value.to_sat())?,
+                    height,
+                    coinbase: transaction.is_coinbase(),
+                },
+            );
+        }
+        history.extend(scripts.into_iter().map(|script| (script, height, position)));
+    }
+    // First-touch pre-block values take precedence over absent output markers.
+    insert_undo_existing(tx, sql, height, &undo)?;
+    insert_undo_missing(
+        tx,
+        sql,
+        height,
+        &output_keys.into_iter().collect::<Vec<_>>(),
+    )?;
+    let removed = delete_utxos(tx, sql, &deleted)?;
+    ensure!(removed == deleted.len(), "missing or already spent prevout");
+    let mut outputs: Vec<_> = created.into_values().collect();
+    outputs.sort_unstable_by_key(|output| output.key);
+    let inserted = insert_utxos(tx, sql, &outputs, false)?;
+    running.utxos += i64::try_from(inserted)? - i64::try_from(removed)?;
+    insert_occurrences(tx, sql, &occurrences)?;
+    running.history += i64::try_from(insert_history(tx, sql, &history)?)?;
     Ok(())
 }
 
