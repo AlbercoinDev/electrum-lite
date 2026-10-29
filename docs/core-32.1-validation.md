@@ -54,5 +54,33 @@ LSM y despliegue de producción no están demostrados por estas pruebas.
 actualización, idempotencia, preservación de datos y rechazo de enlaces del tar.
 Los tests de política comprueban exclusión mutua actualización/ejecución y
 rechazo de metadatos de versiones no estables. El bootstrap público todavía
-no utiliza este flujo. El lanzador nuevo mantiene los locks mediante exec;
-su distribución conjunta en el bootstrap sigue pendiente.
+no utilizaba este flujo en la validación inicial. El lanzador nuevo mantiene
+los locks mediante exec.
+
+## Publicación y bootstrap remoto
+
+[CONFIRMADO] Se publicó `8bd972f2dee74c9db24bc828faa14a079705d545` en main.
+Se ejecutó la línea pública de README con HOME dentro de un TemporaryDirectory
+propio, no importando el instalador local. El bootstrap informó ese commit
+exacto como origen. Resultado real:
+
+```text
+PASS remote one-line bootstrap installs under isolated HOME
+PASS public installed launcher starts dedicated Signet Core (offline)
+PASS public launcher confirms clean Core/Lite exit
+PASS remote one-line update is idempotent, preserves data, removes staging
+PASS isolated HOME, binaries and node data removed: True
+```
+
+Se ejecutó el comando instalado `electrum-lite --network signet --offline`;
+se verificó `getblockchaininfo.chain=signet` por el bitcoin-cli instalado.
+SIGTERM al lanzador confirmó salida cero y desaparición de cookie Core.
+Una segunda ejecución de la línea pública preservó el manifiesto y un archivo
+testigo dentro de data; tmp quedó vacío. No se descargó cadena pública ni se
+afirma sincronización Signet completa. El tag original no se movió y el paquete
+Lite sigue identificando el commit real `d258034`, no el tag original.
+
+Pruebas Python en el árbol de trabajo: 27 tests superados (incluyen el test
+pendiente de co-sync, cuyo cambio fuente NO se publicó con este bloque).
+Shell `sh -n install.sh` y `git diff --check` sin errores. Este bloque modifica
+Python/shell/documentación; no recompila ni atribuye cambios Rust al paquete.
