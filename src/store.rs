@@ -268,11 +268,21 @@ impl Store {
         let result = (|| -> Result<()> {
             let tx = self.conn.transaction()?;
             let mut first = None;
-            for (height, block) in blocks {
-                prepare(&tx, self.chain, self.limits, *height, block)?;
-                let location = archive.append_staged(*height, block)?;
-                first.get_or_insert(location.segment);
-                publish(&tx, *height, block, location)?;
+            {
+                let mut statements = BlockStatements::new(&tx)?;
+                for (height, block) in blocks {
+                    prepare_using(
+                        &tx,
+                        self.chain,
+                        self.limits,
+                        *height,
+                        block,
+                        &mut statements,
+                    )?;
+                    let location = archive.append_staged(*height, block)?;
+                    first.get_or_insert(location.segment);
+                    publish(&tx, *height, block, location)?;
+                }
             }
             hook(CommitStage::Prepared)?;
             archive.sync_staged(first.context("empty batch")?)?;
@@ -689,12 +699,50 @@ fn remember(
     Ok(())
 }
 
+struct BlockStatements<'a> {
+    occurrence: rusqlite::Statement<'a>,
+    lookup: rusqlite::Statement<'a>,
+    remove: rusqlite::Statement<'a>,
+    exists_query: rusqlite::Statement<'a>,
+    insert_coin: rusqlite::Statement<'a>,
+    insert_history: rusqlite::Statement<'a>,
+    undo_existing: rusqlite::Statement<'a>,
+    undo_missing: rusqlite::Statement<'a>,
+}
+
+impl<'a> BlockStatements<'a> {
+    fn new(tx: &'a Transaction<'_>) -> Result<Self> {
+        Ok(Self {
+            occurrence: tx.prepare("INSERT INTO occurrences VALUES(?1,?2,?3)")?,
+            lookup: tx.prepare("SELECT script FROM utxos WHERE outpoint=?1")?,
+            remove: tx.prepare("DELETE FROM utxos WHERE outpoint=?1")?,
+            exists_query: tx.prepare("SELECT EXISTS(SELECT 1 FROM utxos WHERE outpoint=?1)")?,
+            insert_coin: tx.prepare("INSERT INTO utxos VALUES(?1,?2,?3,?4,?5) ON CONFLICT(outpoint) DO UPDATE SET script=excluded.script,value=excluded.value,height=excluded.height,coinbase=excluded.coinbase")?,
+            insert_history: tx.prepare("INSERT INTO history VALUES(?1,?2,?3)")?,
+            undo_existing: tx.prepare("INSERT OR IGNORE INTO undo SELECT ?1,outpoint,script,value,height,coinbase FROM utxos WHERE outpoint=?2")?,
+            undo_missing: tx.prepare("INSERT OR IGNORE INTO undo(height,outpoint) VALUES(?1,?2)")?,
+        })
+    }
+}
+
 fn prepare(
     tx: &Transaction<'_>,
     chain: Chain,
     limits: Limits,
     height: u32,
     block: &Block,
+) -> Result<()> {
+    let mut statements = BlockStatements::new(tx)?;
+    prepare_using(tx, chain, limits, height, block, &mut statements)
+}
+
+fn prepare_using(
+    tx: &Transaction<'_>,
+    chain: Chain,
+    limits: Limits,
+    height: u32,
+    block: &Block,
+    statements: &mut BlockStatements<'_>,
 ) -> Result<()> {
     validate_block(block)?;
     let old = stats(tx)?;
@@ -719,15 +767,16 @@ fn prepare(
     let mut utxos = old.utxos;
     let mut history = old.history;
     tx.execute("INSERT INTO undo_blocks VALUES(?1)", [height])?;
-    let mut occurrence = tx.prepare("INSERT INTO occurrences VALUES(?1,?2,?3)")?;
-    let mut lookup = tx.prepare("SELECT script FROM utxos WHERE outpoint=?1")?;
-    let mut remove = tx.prepare("DELETE FROM utxos WHERE outpoint=?1")?;
-    let mut exists_query = tx.prepare("SELECT EXISTS(SELECT 1 FROM utxos WHERE outpoint=?1)")?;
-    let mut insert_coin = tx.prepare("INSERT INTO utxos VALUES(?1,?2,?3,?4,?5) ON CONFLICT(outpoint) DO UPDATE SET script=excluded.script,value=excluded.value,height=excluded.height,coinbase=excluded.coinbase")?;
-    let mut insert_history = tx.prepare("INSERT INTO history VALUES(?1,?2,?3)")?;
-    let mut undo_existing = tx.prepare("INSERT OR IGNORE INTO undo SELECT ?1,outpoint,script,value,height,coinbase FROM utxos WHERE outpoint=?2")?;
-    let mut undo_missing =
-        tx.prepare("INSERT OR IGNORE INTO undo(height,outpoint) VALUES(?1,?2)")?;
+    let BlockStatements {
+        occurrence,
+        lookup,
+        remove,
+        exists_query,
+        insert_coin,
+        insert_history,
+        undo_existing,
+        undo_missing,
+    } = statements;
     for (position, transaction) in block.txdata.iter().enumerate() {
         let txid = transaction.compute_txid();
         occurrence.execute(params![
@@ -744,7 +793,7 @@ fn prepare(
                     .optional()?
                     .context("missing or already spent prevout")?;
                 scripts.insert(script);
-                remember(&mut undo_existing, &mut undo_missing, height, &key)?;
+                remember(undo_existing, undo_missing, height, &key)?;
                 utxos -= remove.execute([&key])? as i64;
             }
         }
@@ -771,7 +820,7 @@ fn prepare(
                 !exists || bip30,
                 "duplicate unspent outpoint outside BIP30 exception"
             );
-            remember(&mut undo_existing, &mut undo_missing, height, &key)?;
+            remember(undo_existing, undo_missing, height, &key)?;
             insert_coin.execute(params![
                 key,
                 script,

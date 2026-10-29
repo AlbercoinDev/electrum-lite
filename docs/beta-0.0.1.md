@@ -67,6 +67,13 @@ descargas RPC concurrentes (máximo cuatro) y sentencias SQL reutilizadas
 308,2/307,7 bloques/s. Orden A-B-B-A; no IBD, no SSD, no bloques densos ni
 medición de RAM. No implica que Electrum Lite siga el ritmo de Core.
 
+Ensayo adicional A-B-B-A: `0cfd41e` obtuvo 329,8/331,9 bloques/s y una versión
+intermedia del pipeline 432,8/440,1 bloques/s, con 1 001 bloques regtest de solo
+coinbase y Core 31.0 detenido de red, sin IBD concurrente. Almacenamiento tmpfs
+en Linux 6.12, Ryzen 9 7940HS, 8 CPU visibles. El ensayo precede al ajuste
+posterior de validación y no mide SSD, RSS ni datos representativos. No prueba
+rendimiento frente a Core ni durabilidad frente a cortes físicos.
+
 - Sincronización sostenida real en Signet/Testnet4 y pruebas de parámetros/casos históricos representativos de mainnet. Génesis offline no valida toda una red.
 - Prueba exhaustiva de undo histórico BIP30 real y recuperación a escala.
 - Fault injection exhaustiva, fallos de disco lleno y recuperación validada de pérdida de energía. Las pruebas de truncado/corrupción no cubren todos esos escenarios.

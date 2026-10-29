@@ -87,6 +87,7 @@ def test_server(binary, root, cookie, core_port, rpc, address, historical_txid):
             wait(lambda: client.request("server.health")["ready"])
             snapshot = client.request("server.health")
             assert snapshot["status"] == "ready" and snapshot["historical_blocks_missing"] is False
+            assert snapshot["sync_metrics"]["total_ms"] >= 0 and snapshot["sync_metrics"]["commit_ms"] >= 0
             assert isinstance(snapshot["core_pruned"], bool) and snapshot["core_observation_age_seconds"] is not None
             monitor = subprocess.Popen([binary,"--network","regtest","monitor","--address",f"127.0.0.1:{port}","--interval","1"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:

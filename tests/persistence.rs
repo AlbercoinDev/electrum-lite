@@ -105,6 +105,27 @@ fn durable_batch_replays_after_failure_and_preserves_order() {
 }
 
 #[test]
+fn batch_rejects_invalid_merkle_without_publishing() {
+    let root = tempdir().unwrap();
+    let chain = Chain::Regtest;
+    let genesis = genesis_block(chain.network());
+    let mut invalid = next(&genesis, vec![coinbase(1)]);
+    invalid.txdata[0].output[0].value = Amount::from_sat(1);
+    let mut archive = Archive::open(root.path(), chain, true).unwrap();
+    let mut store =
+        Store::open(&archive.directory().join("index.sqlite"), chain, limits()).unwrap();
+    store.recover(&mut archive).unwrap();
+    store.commit(&mut archive, 0, &genesis).unwrap();
+    let error = store
+        .commit_batch(&mut archive, &[(1, invalid)])
+        .unwrap_err();
+    assert!(error.to_string().contains("Merkle"));
+    assert_eq!(store.stats().unwrap().tip, Some((0, genesis.block_hash())));
+    store.recover(&mut archive).unwrap();
+    store.audit(&mut archive).unwrap();
+}
+
+#[test]
 fn batch_crash_worker() {
     let Ok(root) = std::env::var("ELECTRUM_BATCH_CRASH_ROOT") else {
         return;

@@ -140,6 +140,7 @@ struct State {
     core_network: Value,
     observed_at: Option<Instant>,
     catching_up: bool,
+    sync_metrics: Value,
 }
 
 // Only expose predefined diagnostics; underlying errors may include local paths or RPC data.
@@ -217,6 +218,14 @@ impl State {
             line.push_str(" | causa: ");
             line.push_str(error);
         }
+        if let (Some(fetch), Some(commit)) = (
+            self.sync_metrics["fetch_wait_ms"].as_u64(),
+            self.sync_metrics["commit_ms"].as_u64(),
+        ) {
+            line.push_str(&format!(
+                " | último ciclo: espera bloques {fetch} ms, commit {commit} ms"
+            ));
+        }
         Ok((line, tip.map(|height| (height, now))))
     }
 
@@ -233,17 +242,20 @@ impl State {
         self.core_info = self.options.core.verify(self.options.chain)?;
         self.observed_at = Some(Instant::now());
         self.core_network = self.options.core.call("getnetworkinfo", json!([]))?;
-        if let Err(error) = sync::batch(
+        match sync::batch(
             &mut self.store,
             &mut self.archive,
             &self.options.core,
             self.options.chain,
-            20,
+            64,
             None,
             Some(&self.stop),
         ) {
-            self.recovery_required = true;
-            return Err(error);
+            Ok(info) => self.sync_metrics = info["electrum_sync_metrics"].clone(),
+            Err(error) => {
+                self.recovery_required = true;
+                return Err(error);
+            }
         }
         let info = self.options.core.verify(self.options.chain)?;
         self.core_info = info.clone();
@@ -414,6 +426,7 @@ impl State {
                     "core_pruned":self.core_info["pruned"],"core_automatic_pruning":self.core_info["automatic_pruning"],
                     "core_prune_height":floor,"next_required_height":next,"historical_blocks_missing":missing,
                     "core_observation_age_seconds":self.observed_at.map(|t|t.elapsed().as_secs()),"status":status,
+                    "sync_metrics":self.sync_metrics,
                     "core_network_active":self.core_network["networkactive"],"core_connections":self.core_network["connections"],
                     "core_mempool_transactions":self.core_info["mempool"]["size"],"core_mempool_vbytes":self.core_info["mempool"]["bytes"],
                     "transactions":stats.transactions,"utxos":stats.utxos,"history_entries":stats.history,
@@ -929,6 +942,7 @@ pub async fn serve(options: Options) -> Result<()> {
             core_network: Value::Null,
             observed_at: None,
             catching_up: false,
+            sync_metrics: Value::Null,
         };
         state.options.listen = listen;
         let _ = boot.send(());
@@ -1106,6 +1120,7 @@ mod tests {
             core_network: Value::Null,
             observed_at: None,
             catching_up: false,
+            sync_metrics: Value::Null,
         }
     }
 

@@ -44,6 +44,11 @@ pub fn batch(
     to_height: Option<u32>,
     stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Value> {
+    let started = std::time::Instant::now();
+    let mut fetch_wait = std::time::Duration::ZERO;
+    let mut commit_time = std::time::Duration::ZERO;
+    let mut committed_blocks = 0usize;
+    let mut committed_bytes = 0usize;
     ensure!(maximum > 0, "batch size must be positive");
     let info = core.verify(chain)?;
     let core_height: u32 = info["blocks"]
@@ -91,50 +96,86 @@ pub fn batch(
             );
         }
         let anchor = core.hash(end)?;
-        let mut pending = Vec::new();
-        let mut pending_bytes = 0usize;
-        let mut height = start;
-        loop {
-            ensure!(
-                !stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)),
-                "shutdown requested"
-            );
+        std::thread::scope(|scope| -> Result<()> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let mut height = start;
+                loop {
+                    if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)) {
+                        break;
+                    }
+                    let last = height.saturating_add(3).min(end);
+                    let group = fetch_group(core, height, last);
+                    let failed = group.is_err();
+                    if sender.send(group).is_err() || failed || last == end {
+                        break;
+                    }
+                    height = last + 1;
+                }
+            });
+            let mut pending = Vec::new();
+            let mut pending_bytes = 0usize;
+            let mut height = start;
+            loop {
+                ensure!(
+                    !stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)),
+                    "shutdown requested"
+                );
+                ensure!(
+                    core.hash(end)? == anchor,
+                    "Core changed branch during sync; retry safely"
+                );
+                let last = height.saturating_add(3).min(end);
+                let waiting = std::time::Instant::now();
+                let received = receiver.recv().context("block fetch worker stopped")??;
+                fetch_wait += waiting.elapsed();
+                for (block_height, block) in received {
+                    ensure!(
+                        block_height >= height && block_height <= last,
+                        "block fetch order mismatch"
+                    );
+                    let size = bitcoin::consensus::serialize(&block).len();
+                    if !pending.is_empty()
+                        && (pending.len() == 16 || pending_bytes.saturating_add(size) > 16_000_000)
+                    {
+                        ensure!(
+                            core.hash(end)? == anchor,
+                            "Core changed branch during sync; retry safely"
+                        );
+                        let before = std::time::Instant::now();
+                        store.commit_batch(archive, &pending)?;
+                        commit_time += before.elapsed();
+                        committed_blocks += pending.len();
+                        committed_bytes += pending_bytes;
+                        pending.clear();
+                        pending_bytes = 0;
+                    }
+                    pending_bytes = pending_bytes
+                        .checked_add(size)
+                        .context("batch byte count overflow")?;
+                    pending.push((block_height, block));
+                }
+                if last == end {
+                    break;
+                }
+                height = last + 1;
+            }
             ensure!(
                 core.hash(end)? == anchor,
-                "Core changed branch during sync; retry safely"
+                "Core reorg at batch end; retry safely"
             );
-            let last = height.saturating_add(3).min(end);
-            for (block_height, block) in fetch_group(core, height, last)? {
-                let size = bitcoin::consensus::serialize(&block).len();
-                if !pending.is_empty()
-                    && (pending.len() == 64 || pending_bytes.saturating_add(size) > 16_000_000)
-                {
-                    ensure!(
-                        core.hash(end)? == anchor,
-                        "Core changed branch during sync; retry safely"
-                    );
-                    store.commit_batch(archive, &pending)?;
-                    pending.clear();
-                    pending_bytes = 0;
-                }
-                pending_bytes = pending_bytes
-                    .checked_add(size)
-                    .context("batch byte count overflow")?;
-                pending.push((block_height, block));
+            if !pending.is_empty() {
+                let before = std::time::Instant::now();
+                store.commit_batch(archive, &pending)?;
+                commit_time += before.elapsed();
+                committed_blocks += pending.len();
+                committed_bytes += pending_bytes;
             }
-            if last == end {
-                break;
-            }
-            height = last + 1;
-        }
-        ensure!(
-            core.hash(end)? == anchor,
-            "Core reorg at batch end; retry safely"
-        );
-        if !pending.is_empty() {
-            store.commit_batch(archive, &pending)?;
-        }
+            Ok(())
+        })?;
     }
+    let mut info = info;
+    info["electrum_sync_metrics"] = serde_json::json!({"batch_blocks":committed_blocks,"batch_bytes":committed_bytes,"total_ms":started.elapsed().as_millis(),"fetch_wait_ms":fetch_wait.as_millis(),"commit_ms":commit_time.as_millis()});
     Ok(info)
 }
 

@@ -201,12 +201,12 @@ impl Archive {
     }
 
     pub fn append(&mut self, height: u32, block: &Block) -> Result<Location> {
-        self.append_record(height, block, true)
+        self.append_record(height, block, true, true)
     }
 
-    // Only Store's transaction coordinator may stage unsynced records.
+    // Only Store's coordinator calls this immediately after prepare validates this block.
     pub(crate) fn append_staged(&mut self, height: u32, block: &Block) -> Result<Location> {
-        self.append_record(height, block, false)
+        self.append_record(height, block, false, false)
     }
 
     pub(crate) fn sync_staged(&mut self, first: u32) -> Result<()> {
@@ -223,13 +223,21 @@ impl Archive {
         self.scanned = false;
     }
 
-    fn append_record(&mut self, height: u32, block: &Block, sync: bool) -> Result<Location> {
+    fn append_record(
+        &mut self,
+        height: u32,
+        block: &Block,
+        sync: bool,
+        verify: bool,
+    ) -> Result<Location> {
         ensure!(
             self.scanned,
             "scan the complete archive successfully before appending"
         );
         self.check_next(height, block)?;
-        validate_block(block)?;
+        if verify {
+            validate_block(block)?;
+        }
         let raw = serialize(block);
         ensure!(raw.len() <= MAX_BLOCK_BYTES, "block too large");
         let compressed = zstd::stream::encode_all(raw.as_slice(), 3)?;
