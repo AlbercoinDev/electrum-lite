@@ -2,6 +2,9 @@
 
 Estado: decidido para la continuación de `0.0.1-beta.1`. No implica formato estable ni autorización de poda.
 
+Experimento opt-in posterior: [prototipo LSM aislado](../benchmarks/lsm-prototype.md).
+No sustituye esta decisión ni habilita RocksDB como almacenamiento runtime.
+
 Nota histórica: el esquema 1 y las limitaciones originales corresponden a la primera entrega de persistencia. La implementación actual usa schema 2 y el log de ramas de [ADR-002](0002-branch-log.md).
 
 ## Decisión
