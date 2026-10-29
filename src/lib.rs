@@ -11,7 +11,7 @@ pub mod supervisor;
 pub mod sync;
 
 use anyhow::{ensure, Result};
-use bitcoin::{blockdata::constants::genesis_block, Block, BlockHash, Network};
+use bitcoin::{blockdata::constants::genesis_block, Block, BlockHash, Network, Txid};
 use clap::ValueEnum;
 use serde::Serialize;
 
@@ -67,7 +67,9 @@ impl Chain {
     }
 }
 
-pub fn validate_block(block: &Block) -> Result<()> {
+/// Validate consensus-visible block commitments once and return the transaction IDs
+/// so callers never hash the same transaction twice (Merkle root plus indexing).
+pub fn validate_block_txids(block: &Block) -> Result<Vec<bitcoin::Txid>> {
     ensure!(!block.txdata.is_empty(), "empty transaction list");
     ensure!(
         block.txdata[0].is_coinbase(),
@@ -77,10 +79,19 @@ pub fn validate_block(block: &Block) -> Result<()> {
         block.txdata.iter().skip(1).all(|tx| !tx.is_coinbase()),
         "multiple coinbase transactions"
     );
-    ensure!(block.check_merkle_root(), "invalid transaction Merkle root");
+    let txids: Vec<bitcoin::Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+    ensure!(
+        bitcoin::merkle_tree::calculate_root(txids.iter().copied())
+            == Some(Txid::from_raw_hash(block.header.merkle_root.to_raw_hash())),
+        "invalid transaction Merkle root"
+    );
     ensure!(
         block.check_witness_commitment(),
         "invalid witness commitment"
     );
-    Ok(())
+    Ok(txids)
+}
+
+pub fn validate_block(block: &Block) -> Result<()> {
+    validate_block_txids(block).map(|_| ())
 }

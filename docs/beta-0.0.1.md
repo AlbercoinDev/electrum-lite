@@ -1,5 +1,17 @@
 # Beta 0.0.1 — estado y validación
 
+## Optimización de ingesta — 2026-10-29
+
+- Pool fijo de descarga, colas acotadas por worker y publicación en orden; commits de hasta 16 bloques/16 MB. SQL multi-fila y sentencias reutilizadas, contadores por lote y undo conservando el orden de gastos intra-bloque.
+- Se prepara el registro padre `blocks` dentro de la transacción antes de sus hijos. Sus referencias provisionales se sustituyen después del append y antes del commit: no son una generación publicada. Esto evita comprobaciones diferidas repetidas sobre el historial. No cambia el esquema ni requiere migración.
+- SQLite conserva DELETE/EXTRA, claves foráneas, mmap desactivado y sincronización del archivo antes del commit. Caché sugerida actual de 64 MiB; páginas de 32 KiB solo para bases nuevas. Las bases existentes no se reescriben. Para rollback, conservar binario y backup previo; las operaciones de recuperación siguen usando destinos nuevos.
+- `scripts/bench_sync.py` genera regtest aislado sin P2P, transacciones independientes con witness y mide ingesta RPC desde génesis frente a Core 31.0 `-reindex-chainstate`. Incluye arranque de Core en su tiempo; Lite consulta un Core ya iniciado. No son cargas equivalentes: Core reconstruye consenso/chainstate, Lite escribe además archivo e historial. Caché caliente y `/tmp` tmpfs: no demuestra rendimiento durable en SSD, mainnet ni hardware objetivo.
+- M1 (replay ≥1,5× Core), M2 (co-sincronización sin retraso creciente) y M3 (consultas p95 <5 s) siguen siendo metas, no garantías. `prune=550` permanece deshabilitado; el modo gestionado usa `prune=1`.
+
+Banco local de 120 bloques densos × 200 TX, más maduración: altura 431, 24 432 transacciones y 24 863 entradas de historial. Tres ingestas completas: **1,090 / 1,119 / 1,094 s**; Core reindex-chainstate: **1,295 s**. Relación Core/Lite entre **1,16× y 1,19×**, frente a 10,89–11,78 s de Lite antes de corregir el orden padre/hijos. M1 de 1,5× no alcanzada. Hubo otras pruebas en la misma máquina durante la ejecución: resultado exploratorio, no comparación aislada ni estadísticamente concluyente. Tamaños finales: Lite 10,4 MB y Core 30,9 MB (sumar ambos; no son ahorro ni picos temporales). No extrapolar estos números a IBD pública.
+
+Verificación final: 47 tests Rust, fmt, Clippy con warnings como errores y build release; `core_smoke.py` (TCP, mempool/RBF, reorgs y recuperación separada), `prune_smoke.py` (eliminación real y TX witness/Merkle históricos locales) y `managed_smoke.py` (parada del Core dedicado ante fallos). Todos satisfactorios. Versión y tag original sin cambios.
+
 Versión Cargo: `0.0.1-beta.1`, mantenida por petición del usuario. Fecha: 2026-10-28. El tag inicial conserva A/B; main contiene el servidor privado funcional de laboratorio. Los apartados iniciales documentan entregas históricas, no las limitaciones actuales.
 
 ## Entrega inicial (tag v0.0.1-beta.1)

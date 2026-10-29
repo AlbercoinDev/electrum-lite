@@ -9,7 +9,7 @@ use electrum_lite::{
     store::{Limits, Store},
     Chain,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Parser)]
 #[command(
@@ -461,7 +461,7 @@ fn main() -> Result<()> {
                 limits,
             )?;
             index.recover(&mut archive)?;
-            electrum_lite::sync::batch(
+            let info = electrum_lite::sync::batch(
                 &mut index,
                 &mut archive,
                 &core,
@@ -470,7 +470,11 @@ fn main() -> Result<()> {
                 to_height,
                 None,
             )?;
-            print_stats(&index, cli.network)?;
+            print_stats(
+                &index,
+                cli.network,
+                Some(info["electrum_sync_metrics"].clone()),
+            )?;
         }
         Command::RebuildIndex { output } => {
             ensure!(
@@ -491,7 +495,7 @@ fn main() -> Result<()> {
             let mut store = Store::open(&output, cli.network, limits)?;
             store.recover(&mut archive)?;
             store.integrity_check()?;
-            print_stats(&store, cli.network)?;
+            print_stats(&store, cli.network, None)?;
             eprintln!("Built separate index {}; existing index and archive unchanged. See recovery instructions before replacement.", output.display());
         }
         Command::Inspect | Command::History { .. } | Command::Transaction { .. } => {
@@ -532,7 +536,7 @@ fn main() -> Result<()> {
                     );
                     println!("{}", serde_json::to_string_pretty(&found)?);
                 }
-                _ => print_stats(&index, cli.network)?,
+                _ => print_stats(&index, cli.network, None)?,
             }
         }
     }
@@ -571,11 +575,9 @@ fn core(chain: Chain, endpoint: Option<String>, cookie: PathBuf) -> Result<Core>
     )
 }
 
-fn print_stats(index: &Store, chain: Chain) -> Result<()> {
+fn print_stats(index: &Store, chain: Chain, metrics: Option<Value>) -> Result<()> {
     let stats = index.stats()?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
+    let mut report = json!({
             "version":env!("CARGO_PKG_VERSION"), "network":chain,
             "indexed_tip": stats.tip.map(|(height, hash)| json!({"height":height,"hash":hash})),
             "durable_tip":stats.tip.map(|(height,hash)| json!({"height":height,"hash":hash})),
@@ -583,7 +585,10 @@ fn print_stats(index: &Store, chain: Chain) -> Result<()> {
             "index_backend":"sqlite-schema-2",
             "scope":"local archived prefix only; not necessarily synchronized with Core",
             "electrum_server":false, "pruning_enabled":false
-        }))?
-    );
+    });
+    if let Some(metrics) = metrics {
+        report["sync_metrics"] = metrics;
+    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

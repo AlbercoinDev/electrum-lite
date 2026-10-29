@@ -1,4 +1,11 @@
-use std::{fs, io::Read, net::IpAddr, path::Path, time::Duration};
+use std::{
+    fs,
+    io::Read,
+    net::IpAddr,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -25,6 +32,7 @@ pub struct Core {
     agent: ureq::Agent,
     url: String,
     cookie: std::path::PathBuf,
+    authorization: Arc<Mutex<Option<(u64, u64, String)>>>,
 }
 
 impl Core {
@@ -56,7 +64,39 @@ impl Core {
             agent,
             url: url.to_string(),
             cookie: cookie.to_owned(),
+            authorization: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Cache the Basic header and revalidate it with metadata so cookie rotation
+    /// still works without reading and base64-encoding the file on every RPC.
+    fn authorization(&self) -> Result<String> {
+        let metadata = fs::metadata(&self.cookie).context("cannot read RPC cookie")?;
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let length = metadata.len();
+        let mut cache = self
+            .authorization
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_modified, cached_length, header)) = cache.as_ref() {
+            if *cached_modified == modified && *cached_length == length {
+                return Ok(header.clone());
+            }
+        }
+        // Re-read to support Core cookie rotation. Never include credentials in errors.
+        let cookie = fs::read_to_string(&self.cookie).context("cannot read RPC cookie")?;
+        let cookie = cookie.trim();
+        ensure!(
+            cookie.contains(':') && !cookie.contains(['\n', '\r']),
+            "invalid RPC cookie"
+        );
+        let header = format!("Basic {}", STANDARD.encode(cookie));
+        *cache = Some((modified, length, header.clone()));
+        Ok(header)
     }
 
     pub fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
@@ -73,20 +113,11 @@ impl Core {
             limit > 0 && limit <= 64 * 1024 * 1024,
             "invalid RPC response budget"
         );
-        // Re-read to support Core cookie rotation. Never include credentials in errors.
-        let cookie = fs::read_to_string(&self.cookie).context("cannot read RPC cookie")?;
-        let cookie = cookie.trim();
-        ensure!(
-            cookie.contains(':') && !cookie.contains(['\n', '\r']),
-            "invalid RPC cookie"
-        );
+        let authorization = self.authorization()?;
         let response = self
             .agent
             .post(&self.url)
-            .set(
-                "Authorization",
-                &format!("Basic {}", STANDARD.encode(cookie)),
-            )
+            .set("Authorization", &authorization)
             .send_json(
                 json!({"jsonrpc":"2.0", "id":"electrum-lite", "method":method, "params":params}),
             );
@@ -115,8 +146,10 @@ impl Core {
             .into());
         }
         ensure!(status == 200, "Core HTTP status {status}");
-        serde_json::from_value(value.get("result").context("RPC missing result")?.clone())
-            .context("unexpected RPC result")
+        // Move the result out instead of cloning a multi-megabyte block string.
+        let mut value = value;
+        let result = std::mem::take(value.get_mut("result").context("RPC missing result")?);
+        serde_json::from_value(result).context("unexpected RPC result")
     }
 
     pub fn verify(&self, chain: Chain) -> Result<Value> {
@@ -135,16 +168,27 @@ impl Core {
     }
 
     pub fn block(&self, hash: BlockHash) -> Result<Block> {
+        Ok(self.block_with_size(hash)?.0)
+    }
+
+    /// Return the deserialized block plus its consensus byte length so callers
+    /// never re-serialize a block just to account for its size.
+    pub fn block_with_size(&self, hash: BlockHash) -> Result<(Block, usize)> {
         let encoded: String = self.call("getblock", json!([hash.to_string(), 0]))?;
         ensure!(
             encoded.len() <= MAX_BLOCK_BYTES * 2,
             "Core block exceeds size limit"
         );
-        let block: Block = deserialize(&hex::decode(encoded)?)?;
+        let raw = hex::decode(encoded)?;
+        ensure!(
+            raw.len() <= MAX_BLOCK_BYTES,
+            "Core block exceeds size limit"
+        );
+        let block: Block = deserialize(&raw)?;
         ensure!(
             block.block_hash() == hash,
             "Core returned a different block"
         );
-        Ok(block)
+        Ok((block, raw.len()))
     }
 }

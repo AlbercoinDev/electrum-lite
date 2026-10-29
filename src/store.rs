@@ -1,5 +1,9 @@
 //! Durable SQLite index. Hold the Archive's exclusive lock for this store's lifetime.
-use std::{collections::HashSet, fs::File, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fs::File,
+    path::Path,
+};
 
 use anyhow::{ensure, Context, Result};
 use bitcoin::{
@@ -7,13 +11,15 @@ use bitcoin::{
     hashes::Hash,
     Block, BlockHash, OutPoint, Txid,
 };
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{
+    params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension, Transaction,
+};
 use serde::Serialize;
 
 use crate::{
     archive::{Archive, Location},
     index::{Coin, Occurrence, ScriptView},
-    validate_block, Chain,
+    validate_block_txids, Chain,
 };
 
 pub const UNDO_WINDOW: u32 = 288;
@@ -78,7 +84,12 @@ impl Store {
             );
         }
         // EXTRA also syncs the directory after rollback-journal removal on Unix.
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA trusted_schema=OFF;")?;
+        // 64 MiB page cache: random B-tree inserts over billions of rows otherwise
+        // evict every page. It is a cap, not a preallocation, and stays documented.
+        // 32 KiB pages reduced random TXID insertion costs in the local bench;
+        // the pragma only takes effect on a brand-new database, so
+        // existing generations keep their page size (no silent rewrite).
+        conn.execute_batch("PRAGMA page_size=32768; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; PRAGMA foreign_keys=ON; PRAGMA cache_size=-65536; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; PRAGMA trusted_schema=OFF;")?;
         let journal: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
         let synchronous: i64 = conn.pragma_query_value(None, "synchronous", |r| r.get(0))?;
         let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
@@ -269,20 +280,23 @@ impl Store {
             let tx = self.conn.transaction()?;
             let mut first = None;
             {
-                let mut statements = BlockStatements::new(&tx)?;
+                let mut sql = BatchSql::new(&tx);
+                let mut running = Running::load(&tx)?;
                 for (height, block) in blocks {
-                    prepare_using(
+                    prepare_block(
                         &tx,
                         self.chain,
                         self.limits,
+                        &mut running,
                         *height,
                         block,
-                        &mut statements,
+                        &mut sql,
                     )?;
                     let location = archive.append_staged(*height, block)?;
                     first.get_or_insert(location.segment);
                     publish(&tx, *height, block, location)?;
                 }
+                running.save(&tx)?;
             }
             hook(CommitStage::Prepared)?;
             archive.sync_staged(first.context("empty batch")?)?;
@@ -688,41 +702,68 @@ fn stats(conn: &Connection) -> Result<Stats> {
     })
 }
 
-fn remember(
-    existing: &mut rusqlite::Statement<'_>,
-    missing: &mut rusqlite::Statement<'_>,
-    height: u32,
-    key: &[u8],
-) -> Result<()> {
-    existing.execute(params![height, key])?;
-    missing.execute(params![height, key])?;
-    Ok(())
+const INSERT_CHUNK: usize = 100;
+
+/// Counters kept in memory for a whole batch: one `state` read and one `state`
+/// write instead of two queries per block.
+struct Running {
+    tip: Option<(u32, BlockHash)>,
+    transactions: i64,
+    utxos: i64,
+    history: i64,
 }
 
-struct BlockStatements<'a> {
-    occurrence: rusqlite::Statement<'a>,
-    lookup: rusqlite::Statement<'a>,
-    remove: rusqlite::Statement<'a>,
-    exists_query: rusqlite::Statement<'a>,
-    insert_coin: rusqlite::Statement<'a>,
-    insert_history: rusqlite::Statement<'a>,
-    undo_existing: rusqlite::Statement<'a>,
-    undo_missing: rusqlite::Statement<'a>,
-}
-
-impl<'a> BlockStatements<'a> {
-    fn new(tx: &'a Transaction<'_>) -> Result<Self> {
+impl Running {
+    fn load(conn: &Connection) -> Result<Self> {
+        let s = stats(conn)?;
         Ok(Self {
-            occurrence: tx.prepare("INSERT INTO occurrences VALUES(?1,?2,?3)")?,
-            lookup: tx.prepare("SELECT script FROM utxos WHERE outpoint=?1")?,
-            remove: tx.prepare("DELETE FROM utxos WHERE outpoint=?1")?,
-            exists_query: tx.prepare("SELECT EXISTS(SELECT 1 FROM utxos WHERE outpoint=?1)")?,
-            insert_coin: tx.prepare("INSERT INTO utxos VALUES(?1,?2,?3,?4,?5) ON CONFLICT(outpoint) DO UPDATE SET script=excluded.script,value=excluded.value,height=excluded.height,coinbase=excluded.coinbase")?,
-            insert_history: tx.prepare("INSERT INTO history VALUES(?1,?2,?3)")?,
-            undo_existing: tx.prepare("INSERT OR IGNORE INTO undo SELECT ?1,outpoint,script,value,height,coinbase FROM utxos WHERE outpoint=?2")?,
-            undo_missing: tx.prepare("INSERT OR IGNORE INTO undo(height,outpoint) VALUES(?1,?2)")?,
+            tip: s.tip,
+            transactions: s.transactions,
+            utxos: s.utxos,
+            history: s.history,
         })
     }
+
+    fn save(&self, tx: &Transaction<'_>) -> Result<()> {
+        tx.execute(
+            "UPDATE state SET transactions=?1,utxos=?2,history=?3 WHERE id=1",
+            params![self.transactions, self.utxos, self.history],
+        )?;
+        Ok(())
+    }
+}
+
+struct UtxoRow {
+    key: [u8; 36],
+    script: [u8; 32],
+    value: i64,
+    height: u32,
+    coinbase: bool,
+}
+
+fn placeholders(rows: usize, columns: usize) -> String {
+    let mut sql = String::with_capacity(rows * (columns * 2 + 3));
+    for row in 0..rows {
+        if row > 0 {
+            sql.push(',');
+        }
+        sql.push('(');
+        for column in 0..columns {
+            if column > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+    }
+    sql
+}
+
+fn outpoint_key(txid: Txid, vout: u32) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[..32].copy_from_slice(txid.as_byte_array());
+    key[32..].copy_from_slice(&vout.to_le_bytes());
+    key
 }
 
 fn prepare(
@@ -732,21 +773,23 @@ fn prepare(
     height: u32,
     block: &Block,
 ) -> Result<()> {
-    let mut statements = BlockStatements::new(tx)?;
-    prepare_using(tx, chain, limits, height, block, &mut statements)
+    let mut sql = BatchSql::new(tx);
+    let mut running = Running::load(tx)?;
+    prepare_block(tx, chain, limits, &mut running, height, block, &mut sql)?;
+    running.save(tx)
 }
 
-fn prepare_using(
+fn prepare_block(
     tx: &Transaction<'_>,
     chain: Chain,
     limits: Limits,
+    running: &mut Running,
     height: u32,
     block: &Block,
-    statements: &mut BlockStatements<'_>,
+    sql: &mut BatchSql<'_, '_>,
 ) -> Result<()> {
-    validate_block(block)?;
-    let old = stats(tx)?;
-    match old.tip {
+    let txids = validate_block_txids(block)?;
+    match running.tip {
         None => ensure!(
             height == 0 && block.block_hash() == chain.genesis(),
             "persistent index must start at selected genesis"
@@ -756,97 +799,123 @@ fn prepare_using(
             "persistent index discontinuity or reorg; automatic rollback is not enabled"
         ),
     }
-    let transactions = old
+    running.transactions = running
         .transactions
         .checked_add(block.txdata.len().try_into()?)
         .context("transaction count overflow")?;
     ensure!(
-        transactions <= i64::try_from(limits.transactions)?,
+        running.transactions <= i64::try_from(limits.transactions)?,
         "persistent transaction limit reached; adjust --max-index-transactions"
     );
-    let mut utxos = old.utxos;
-    let mut history = old.history;
-    tx.execute("INSERT INTO undo_blocks VALUES(?1)", [height])?;
-    let BlockStatements {
-        occurrence,
-        lookup,
-        remove,
-        exists_query,
-        insert_coin,
-        insert_history,
-        undo_existing,
-        undo_missing,
-    } = statements;
-    for (position, transaction) in block.txdata.iter().enumerate() {
-        let txid = transaction.compute_txid();
-        occurrence.execute(params![
+    // Stage the parent before its children, avoiding deferred-FK child scans.
+    // These placeholder references are never committed: publish replaces them
+    // after archive append, before the durable SQL commit.
+    tx.execute(
+        "INSERT INTO blocks VALUES(?1,?2,0,0,1,?3)",
+        params![
             height,
-            i64::try_from(position)?,
-            txid.as_byte_array().as_slice()
-        ])?;
-        let mut scripts = HashSet::new();
+            block.block_hash().as_byte_array().as_slice(),
+            serialize(&block.header)
+        ],
+    )?;
+    tx.execute("INSERT INTO undo_blocks VALUES(?1)", [height])?;
+    // BIP30 exceptions are the only place where an unspent outpoint may be
+    // overwritten; every other conflict is a hard integrity error.
+    let bip30 = chain == Chain::Mainnet && matches!(height, 91842 | 91880);
+    let mut utxo_rows: Vec<UtxoRow> = Vec::new();
+    let mut history_rows: Vec<([u8; 32], u32, i64)> = Vec::new();
+    let mut occurrence_rows: Vec<(u32, i64, Vec<u8>)> = Vec::new();
+    let mut undo_rows: Vec<([u8; 36], Prevout)> = Vec::new();
+    let mut missing_rows: Vec<[u8; 36]> = Vec::new();
+    for (position, transaction) in block.txdata.iter().enumerate() {
+        let position = i64::try_from(position)?;
+        let txid = txids[usize::try_from(position)?];
+        occurrence_rows.push((height, position, txid.as_byte_array().to_vec()));
+        let mut scripts: HashSet<[u8; 32]> = HashSet::new();
         if !transaction.is_coinbase() {
-            for input in &transaction.input {
-                let key = serialize(&input.previous_output);
-                let script: Vec<u8> = lookup
-                    .query_row([&key], |r| r.get(0))
-                    .optional()?
+            let keys: Vec<[u8; 36]> = transaction
+                .input
+                .iter()
+                .map(|input| outpoint_key(input.previous_output.txid, input.previous_output.vout))
+                .collect();
+            let prevouts = lookup_prevouts(tx, sql, &keys)?;
+            for key in &keys {
+                let prevout = prevouts
+                    .get(key)
                     .context("missing or already spent prevout")?;
-                scripts.insert(script);
-                remember(undo_existing, undo_missing, height, &key)?;
-                utxos -= remove.execute([&key])? as i64;
+                scripts.insert(prevout.script);
+                undo_rows.push((
+                    *key,
+                    Prevout {
+                        script: prevout.script,
+                        value: prevout.value,
+                        height: prevout.height,
+                        coinbase: prevout.coinbase,
+                    },
+                ));
             }
+            // Undo intent must be durable before the prevouts disappear.
+            insert_undo_existing(tx, sql, height, &undo_rows)?;
+            undo_rows.clear();
+            let removed = delete_utxos(tx, sql, &keys)?;
+            let unique = keys.iter().copied().collect::<BTreeSet<[u8; 36]>>().len();
+            ensure!(removed == unique, "missing or already spent prevout");
+            running.utxos -= i64::try_from(removed)?;
         }
+        let coinbase = transaction.is_coinbase();
         for (vout, output) in transaction.output.iter().enumerate() {
             let script = bitcoin::hashes::sha256::Hash::hash(output.script_pubkey.as_bytes())
-                .to_byte_array()
-                .to_vec();
-            scripts.insert(script.clone());
+                .to_byte_array();
+            scripts.insert(script);
             if height == 0
                 || output.script_pubkey.is_op_return()
                 || output.script_pubkey.len() > 10_000
             {
                 continue;
             }
-            let key = serialize(&OutPoint {
-                txid,
-                vout: vout.try_into()?,
-            });
-            let exists: bool = exists_query.query_row([&key], |r| r.get(0))?;
-            let bip30 = chain == Chain::Mainnet
-                && matches!(height, 91842 | 91880)
-                && transaction.is_coinbase();
-            ensure!(
-                !exists || bip30,
-                "duplicate unspent outpoint outside BIP30 exception"
-            );
-            remember(undo_existing, undo_missing, height, &key)?;
-            insert_coin.execute(params![
+            let key = outpoint_key(txid, vout.try_into()?);
+            missing_rows.push(key);
+            utxo_rows.push(UtxoRow {
                 key,
                 script,
-                i64::try_from(output.value.to_sat())?,
+                value: i64::try_from(output.value.to_sat())?,
                 height,
-                transaction.is_coinbase()
-            ])?;
-            if !exists {
-                utxos += 1;
-            }
+                coinbase,
+            });
         }
+        // The two BIP30 blocks re-create unspent coinbase outpoints; capture
+        // their old value before `ON CONFLICT` overwrites it. Everywhere else a
+        // marker is enough: the outpoint cannot exist before this block.
+        let overwrite = bip30 && coinbase;
+        if overwrite {
+            insert_undo_from_utxos(tx, sql, height, &missing_rows)?;
+        }
+        insert_undo_missing(tx, sql, height, &missing_rows)?;
+        missing_rows.clear();
         for script in scripts {
-            history +=
-                insert_history.execute(params![script, height, i64::try_from(position)?])? as i64;
+            history_rows.push((script, height, position));
+        }
+        // Outputs of this transaction must be visible before the next one can
+        // spend them, so UTXOs are flushed per transaction (still multi-row).
+        let inserted = insert_utxos(tx, sql, &utxo_rows, overwrite)?;
+        utxo_rows.clear();
+        if !overwrite {
+            running.utxos += i64::try_from(inserted)?;
         }
     }
+    if bip30 {
+        running.utxos = tx.query_row("SELECT count(*) FROM utxos", [], |r| r.get(0))?;
+    }
+    insert_occurrences(tx, sql, &occurrence_rows)?;
+    running.history += i64::try_from(insert_history(tx, sql, &history_rows)?)?;
+    running.tip = Some((height, block.block_hash()));
     ensure!(
-        utxos
-            .checked_add(history)
+        running
+            .utxos
+            .checked_add(running.history)
             .is_some_and(|n| usize::try_from(n).is_ok_and(|n| n <= limits.entries)),
         "persistent entry limit reached; adjust --max-index-entries"
     );
-    tx.execute(
-        "UPDATE state SET transactions=?1,utxos=?2,history=?3 WHERE id=1",
-        params![transactions, utxos, history],
-    )?;
     // Retain a bounded window of reversible blocks; never delete immutable archived bytes.
     if height >= UNDO_WINDOW {
         tx.execute(
@@ -857,9 +926,340 @@ fn prepare_using(
     Ok(())
 }
 
+/// Lazily prepared multi-row statements, one per row count. They are created
+/// once per durable batch so row batching never pays a prepare per block.
+struct BatchSql<'a, 'conn> {
+    tx: &'a Transaction<'conn>,
+    lookup: Vec<Option<rusqlite::Statement<'a>>>,
+    delete: Vec<Option<rusqlite::Statement<'a>>>,
+    utxos: Vec<Option<rusqlite::Statement<'a>>>,
+    utxos_bip30: Vec<Option<rusqlite::Statement<'a>>>,
+    undo_existing: Vec<Option<rusqlite::Statement<'a>>>,
+    undo_missing: Vec<Option<rusqlite::Statement<'a>>>,
+    undo_select: Vec<Option<rusqlite::Statement<'a>>>,
+    occurrences: Vec<Option<rusqlite::Statement<'a>>>,
+    history: Vec<Option<rusqlite::Statement<'a>>>,
+}
+
+impl<'a, 'conn> BatchSql<'a, 'conn> {
+    fn new(tx: &'a Transaction<'conn>) -> Self {
+        let empty = || {
+            std::iter::repeat_with(|| None)
+                .take(INSERT_CHUNK + 1)
+                .collect()
+        };
+        Self {
+            tx,
+            lookup: empty(),
+            delete: empty(),
+            utxos: empty(),
+            utxos_bip30: empty(),
+            undo_existing: empty(),
+            undo_missing: empty(),
+            undo_select: empty(),
+            occurrences: empty(),
+            history: empty(),
+        }
+    }
+
+    fn lookup(&mut self, rows: usize) -> Result<&mut rusqlite::Statement<'a>> {
+        prepared(self.tx, &mut self.lookup, rows, || {
+            format!(
+                "SELECT outpoint,script,value,height,coinbase FROM utxos WHERE outpoint IN ({})",
+                vec!["?"; rows].join(",")
+            )
+        })
+    }
+
+    fn delete(&mut self, rows: usize) -> Result<&mut rusqlite::Statement<'a>> {
+        prepared(self.tx, &mut self.delete, rows, || {
+            format!(
+                "DELETE FROM utxos WHERE outpoint IN ({})",
+                vec!["?"; rows].join(",")
+            )
+        })
+    }
+
+    fn utxos(&mut self, rows: usize, bip30: bool) -> Result<&mut rusqlite::Statement<'a>> {
+        if bip30 {
+            prepared(self.tx, &mut self.utxos_bip30, rows, || {
+                format!(
+                    "INSERT INTO utxos VALUES{} ON CONFLICT(outpoint) DO UPDATE SET script=excluded.script,value=excluded.value,height=excluded.height,coinbase=excluded.coinbase",
+                    placeholders(rows, 5)
+                )
+            })
+        } else {
+            prepared(self.tx, &mut self.utxos, rows, || {
+                format!(
+                    "INSERT OR IGNORE INTO utxos VALUES{}",
+                    placeholders(rows, 5)
+                )
+            })
+        }
+    }
+
+    fn undo_existing(&mut self, rows: usize) -> Result<&mut rusqlite::Statement<'a>> {
+        prepared(self.tx, &mut self.undo_existing, rows, || {
+            format!("INSERT OR IGNORE INTO undo VALUES{}", placeholders(rows, 6))
+        })
+    }
+
+    fn undo_missing(&mut self, rows: usize) -> Result<&mut rusqlite::Statement<'a>> {
+        prepared(self.tx, &mut self.undo_missing, rows, || {
+            format!(
+                "INSERT OR IGNORE INTO undo(height,outpoint) VALUES{}",
+                placeholders(rows, 2)
+            )
+        })
+    }
+
+    fn undo_select(&mut self, rows: usize) -> Result<&mut rusqlite::Statement<'a>> {
+        prepared(self.tx, &mut self.undo_select, rows, || {
+            format!(
+                "INSERT OR IGNORE INTO undo SELECT ?1,outpoint,script,value,height,coinbase FROM utxos WHERE outpoint IN ({})",
+                vec!["?"; rows].join(",")
+            )
+        })
+    }
+
+    fn occurrences(&mut self, rows: usize) -> Result<&mut rusqlite::Statement<'a>> {
+        prepared(self.tx, &mut self.occurrences, rows, || {
+            format!("INSERT INTO occurrences VALUES{}", placeholders(rows, 3))
+        })
+    }
+
+    fn history(&mut self, rows: usize) -> Result<&mut rusqlite::Statement<'a>> {
+        prepared(self.tx, &mut self.history, rows, || {
+            format!("INSERT INTO history VALUES{}", placeholders(rows, 3))
+        })
+    }
+}
+
+fn prepared<'a, 'b, 'conn>(
+    tx: &'a Transaction<'conn>,
+    slots: &'b mut [Option<rusqlite::Statement<'a>>],
+    rows: usize,
+    build: impl FnOnce() -> String,
+) -> Result<&'b mut rusqlite::Statement<'a>> {
+    if slots[rows].is_none() {
+        slots[rows] = Some(tx.prepare(&build())?);
+    }
+    Ok(slots[rows].as_mut().expect("statement just prepared"))
+}
+
+struct Prevout {
+    script: [u8; 32],
+    value: i64,
+    height: i64,
+    coinbase: bool,
+}
+
+fn lookup_prevouts(
+    _tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    keys: &[[u8; 36]],
+) -> Result<HashMap<[u8; 36], Prevout>> {
+    let unique: Vec<[u8; 36]> = keys
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut found = HashMap::with_capacity(unique.len());
+    for chunk in unique.chunks(INSERT_CHUNK) {
+        let values = chunk
+            .iter()
+            .map(|key| Value::Blob(key.to_vec()))
+            .collect::<Vec<_>>();
+        let mut rows = sql.lookup(chunk.len())?.query(params_from_iter(values))?;
+        while let Some(row) = rows.next()? {
+            let key: Vec<u8> = row.get(0)?;
+            let script: Vec<u8> = row.get(1)?;
+            let key: [u8; 36] = key
+                .as_slice()
+                .try_into()
+                .context("invalid stored outpoint")?;
+            let script: [u8; 32] = script
+                .as_slice()
+                .try_into()
+                .context("invalid stored script hash")?;
+            found.insert(
+                key,
+                Prevout {
+                    script,
+                    value: row.get(2)?,
+                    height: row.get(3)?,
+                    coinbase: row.get(4)?,
+                },
+            );
+        }
+    }
+    Ok(found)
+}
+
+/// Record the pre-block state of every outpoint a transaction touches. Inputs
+/// are known from the prevout lookup; outputs only need a "did not exist"
+/// marker, except during the two historical BIP30 overwrites.
+fn insert_undo_existing(
+    _tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    height: u32,
+    rows: &[([u8; 36], Prevout)],
+) -> Result<()> {
+    let height = i64::from(height);
+    for chunk in rows.chunks(INSERT_CHUNK) {
+        let mut values = Vec::with_capacity(chunk.len() * 6);
+        for (key, prevout) in chunk {
+            values.push(Value::Integer(height));
+            values.push(Value::Blob(key.to_vec()));
+            values.push(Value::Blob(prevout.script.to_vec()));
+            values.push(Value::Integer(prevout.value));
+            values.push(Value::Integer(prevout.height));
+            values.push(Value::Integer(i64::from(prevout.coinbase)));
+        }
+        sql.undo_existing(chunk.len())?
+            .execute(params_from_iter(values))?;
+    }
+    Ok(())
+}
+
+fn insert_undo_missing(
+    _tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    height: u32,
+    keys: &[[u8; 36]],
+) -> Result<()> {
+    let height = i64::from(height);
+    for chunk in keys.chunks(INSERT_CHUNK) {
+        let mut values = Vec::with_capacity(chunk.len() * 2);
+        for key in chunk {
+            values.push(Value::Integer(height));
+            values.push(Value::Blob(key.to_vec()));
+        }
+        sql.undo_missing(chunk.len())?
+            .execute(params_from_iter(values))?;
+    }
+    Ok(())
+}
+
+fn insert_undo_from_utxos(
+    _tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    height: u32,
+    keys: &[[u8; 36]],
+) -> Result<()> {
+    for chunk in keys.chunks(INSERT_CHUNK) {
+        let mut values = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::Integer(i64::from(height)));
+        for key in chunk {
+            values.push(Value::Blob(key.to_vec()));
+        }
+        sql.undo_select(chunk.len())?
+            .execute(params_from_iter(values))?;
+    }
+    Ok(())
+}
+
+fn delete_utxos(
+    tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    keys: &[[u8; 36]],
+) -> Result<usize> {
+    let unique: Vec<[u8; 36]> = keys
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut removed = 0;
+    for chunk in unique.chunks(INSERT_CHUNK) {
+        let values = chunk
+            .iter()
+            .map(|key| Value::Blob(key.to_vec()))
+            .collect::<Vec<_>>();
+        sql.delete(chunk.len())?.execute(params_from_iter(values))?;
+        removed += usize::try_from(tx.changes())?;
+    }
+    Ok(removed)
+}
+
+fn insert_utxos(
+    tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    rows: &[UtxoRow],
+    bip30: bool,
+) -> Result<usize> {
+    let mut inserted = 0;
+    for chunk in rows.chunks(INSERT_CHUNK) {
+        let mut values = Vec::with_capacity(chunk.len() * 5);
+        for row in chunk {
+            values.push(Value::Blob(row.key.to_vec()));
+            values.push(Value::Blob(row.script.to_vec()));
+            values.push(Value::Integer(row.value));
+            values.push(Value::Integer(i64::from(row.height)));
+            values.push(Value::Integer(i64::from(row.coinbase)));
+        }
+        sql.utxos(chunk.len(), bip30)?
+            .execute(params_from_iter(values))?;
+        let changed = usize::try_from(tx.changes())?;
+        if !bip30 {
+            ensure!(
+                changed == chunk.len(),
+                "duplicate unspent outpoint outside BIP30 exception"
+            );
+            inserted += changed;
+        }
+    }
+    Ok(inserted)
+}
+
+fn insert_occurrences(
+    tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    rows: &[(u32, i64, Vec<u8>)],
+) -> Result<()> {
+    for chunk in rows.chunks(INSERT_CHUNK) {
+        let mut values = Vec::with_capacity(chunk.len() * 3);
+        for (height, position, txid) in chunk {
+            values.push(Value::Integer(i64::from(*height)));
+            values.push(Value::Integer(*position));
+            values.push(Value::Blob(txid.clone()));
+        }
+        sql.occurrences(chunk.len())?
+            .execute(params_from_iter(values))?;
+        ensure!(
+            usize::try_from(tx.changes())? == chunk.len(),
+            "occurrence insert mismatch"
+        );
+    }
+    Ok(())
+}
+
+fn insert_history(
+    tx: &Transaction<'_>,
+    sql: &mut BatchSql<'_, '_>,
+    rows: &[([u8; 32], u32, i64)],
+) -> Result<usize> {
+    let mut inserted = 0;
+    for chunk in rows.chunks(INSERT_CHUNK) {
+        let mut values = Vec::with_capacity(chunk.len() * 3);
+        for (script, height, position) in chunk {
+            values.push(Value::Blob(script.to_vec()));
+            values.push(Value::Integer(i64::from(*height)));
+            values.push(Value::Integer(*position));
+        }
+        sql.history(chunk.len())?
+            .execute(params_from_iter(values))?;
+        let changed = usize::try_from(tx.changes())?;
+        ensure!(changed == chunk.len(), "history insert mismatch");
+        inserted += changed;
+    }
+    Ok(inserted)
+}
+
 fn publish(tx: &Transaction<'_>, height: u32, block: &Block, location: Location) -> Result<()> {
-    tx.execute(
-        "INSERT INTO blocks VALUES(?1,?2,?3,?4,?5,?6)",
+    let changed = tx.execute(
+        "UPDATE blocks SET hash=?2,segment=?3,offset=?4,length=?5,header=?6 WHERE height=?1",
         params![
             height,
             block.block_hash().as_byte_array().as_slice(),
@@ -869,6 +1269,7 @@ fn publish(tx: &Transaction<'_>, height: u32, block: &Block, location: Location)
             serialize(&block.header)
         ],
     )?;
+    ensure!(changed == 1, "missing staged block reference");
     set_cursor(tx, location)
 }
 

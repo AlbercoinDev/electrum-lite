@@ -134,7 +134,7 @@ Para observar progreso continuamente: `./target/release/electrum-lite --network 
 
 La sincronización agrupa hasta 16 bloques y 16 MB serializados por commit durable (el daemon procesa hasta 64 por ciclo). El archivo se sincroniza antes de confirmar SQLite. Una cola incompleta sigue fallando de forma segura; no se trunca automáticamente. Este cambio no demuestra que la indexación pueda seguir a Core: se necesitan pruebas sostenidas y mediciones representativas.
 
-Se descargan hasta cuatro bloques simultáneamente por RPC, con una cola adicional de un grupo, y se solapan descargas con commits mediante el único escritor; las sentencias SQL se reutilizan durante el lote. Además del lote serializado acotado, hay memoria transitoria de los bloques y sus respuestas JSON/hex; no es un límite total de RSS. Un error RPC interrumpe el grupo, no se interpreta como una reorganización. `health` incluye `sync_metrics` del último ciclo: tiempo total, espera de grupos y commit. Son tiempos agregados, no una descomposición completa de RPC, compresión y SQLite.
+Un pool fijo de 2–8 workers descarga grupos de cuatro bloques, con una cola de un grupo por worker, y se solapan descargas con commits mediante el único escritor; las sentencias SQL se reutilizan durante el lote. Además del lote serializado acotado, hay memoria transitoria de los bloques y sus respuestas JSON/hex; no es un límite total de RSS. Un error RPC interrumpe el grupo, no se interpreta como una reorganización. `health` incluye `sync_metrics` del último ciclo: tiempo total, espera de grupos y commit. Son tiempos agregados, no una descomposición completa de RPC, compresión y SQLite.
 
 Para Sparrow, selecciona la misma red y **Private Electrum server**, host `127.0.0.1` y el puerto elegido. TCP sin SSL solo en loopback/túnel privado; nunca transportes abierto por Internet. La interfaz con Sparrow real sigue pendiente de validación aquí: no se ha instalado ni probado su GUI. Ver [perfil de protocolo y pruebas](docs/protocol.md).
 
@@ -150,7 +150,7 @@ Para Sparrow, selecciona la misma red y **Private Electrum server**, host `127.0
 
 También hay `history SCRIPTHASH`, `transaction TXID [--height ALTURA]`, `rebuild-index --output NUEVO.sqlite`, `backup`, `verify-backup`, `restore`, `recover-chain` y `prune`. Las herramientas de archivos requieren el servicio detenido por su bloqueo exclusivo. Las respuestas offline representan el histórico local, que puede estar incompleto o pertenecer a una rama que ya cambió en Core.
 
-- SQLite sugiere caché de páginas de 8 MiB; no es un límite total de RAM.
+- SQLite usa una caché de páginas sugerida de 64 MiB (no preasignación ni límite duro); no es un límite total de RAM.
 - Mempool: 50 000 transacciones, 64 MiB serializados y 500 000 entradas input/output por defecto; `--max-mempool-transactions`, `--max-mempool-mib`, `--max-mempool-entries`. Se calienta la caché en lotes de hasta 500 TX/ciclo. Si no cabe, no se sirve un historial parcial: queda no listo.
 - Transporte: 16 conexiones y 1 000 suscripciones por conexión por defecto, configurables con `--max-connections`/`--max-subscriptions`. Lotes JSON-RPC de hasta 64, 200 peticiones por 10 s/conexión, mensaje hasta 8,1 MB, respuesta hasta 16,2 MB, idle 120 s y escritura 15 s.
 - `--max-query-results` limita a 10 000 entradas por script y produce error, nunca truncado silencioso. Checkpoints de cabeceras hasta altura 2 000 000; chunks de 2 016.
@@ -197,9 +197,12 @@ Con Bitcoin Core 31.0 instalado y verificado:
 BITCOIND=/ruta/a/bitcoind BITCOINCLI=/ruta/a/bitcoin-cli \
   python3 scripts/core_smoke.py
 BITCOIND=/ruta/a/bitcoind python3 scripts/prune_smoke.py
+BITCOIND=/ruta/a/bitcoind BITCOINCLI=/ruta/a/bitcoin-cli \
+ELECTRUM_LITE=./target/release/electrum-lite \
+  python3 scripts/bench_sync.py --blocks 120 --txs-per-block 200 --rounds 2
 ```
 
-Crean únicamente nodos temporales aislados. La segunda prueba genera unos 300 MiB de datos muy compresibles, poda realmente Core y verifica TX/Merkle por Electrum sin ese bloque en Core: **no es un benchmark de compresión**. Las pruebas públicas acotadas son opcionales: `scripts/live_smoke.py --network signet` o `--network testnet4`; implican conexiones P2P y descarga limitada.
+Crean únicamente nodos temporales aislados. `bench_sync.py` genera una cadena regtest densa, mide la ingesta completa de Electrum Lite por RPC y, con los mismos bloques, un `-reindex-chainstate` de Core: es una comparación relativa en una sola máquina con caché caliente, no una promesa de mainnet. La segunda prueba genera unos 300 MiB de datos muy compresibles, poda realmente Core y verifica TX/Merkle por Electrum sin ese bloque en Core: **no es un benchmark de compresión**. Las pruebas públicas acotadas son opcionales: `scripts/live_smoke.py --network signet` o `--network testnet4`; implican conexiones P2P y descarga limitada.
 
 Ver [evidencias y pendientes](docs/beta-0.0.1.md), [operación/systemd](docs/operations.md), [protocolo](docs/protocol.md), [decisión SQLite](docs/decisions/0001-sqlite.md) y [especificación](ELECTRUM_LITE_ENGINE_v1.0.md). GitHub Actions ejecuta tests, integración TCP y poda real regtest. No sustituye sincronización sostenida, ensayo con Sparrow ni pruebas de pérdida real de energía.
 

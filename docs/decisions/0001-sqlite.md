@@ -6,7 +6,7 @@ Nota histórica: el esquema 1 y las limitaciones originales corresponden a la pr
 
 ## Decisión
 
-Una base SQLite mediante rusqlite 0.41.1 y SQLite empaquetado (`bundled`). Esquema 1 en `src/schema.sql`; bloques originales fuera de la base en ELBETA01. Usar journal DELETE, synchronous EXTRA, claves foráneas activas, mmap desactivado y caché de páginas sugerida de 8 MiB. No usar WAL inicialmente para simplificar copias cerradas y recuperación.
+Una base SQLite mediante rusqlite 0.41.1 y SQLite empaquetado (`bundled`). Esquema 1 en `src/schema.sql`; bloques originales fuera de la base en ELBETA01. Usar journal DELETE, synchronous EXTRA, claves foráneas activas, mmap desactivado y caché de páginas sugerida de 8 MiB (ampliada a 64 MiB en runtime tras el banco de ingesta; el microbenchmark original de esta ADR se midió con 8 MiB). No usar WAL inicialmente para simplificar copias cerradas y recuperación.
 
 Historial, UTXO y ocurrencias encajan en tablas e índices estándar. Elegimos SQLite por simplicidad transaccional, restricciones verificables y herramientas de integridad/reconstrucción, **no por afirmar que sea el más rápido**. redb solo queda como dependencia de desarrollo para reproducir la comparación.
 

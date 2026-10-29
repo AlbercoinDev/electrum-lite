@@ -243,9 +243,8 @@ impl State {
             fs2::available_space(self.archive.directory())? >= self.options.min_free_bytes,
             "free-space threshold reached"
         );
-        self.core_info = self.options.core.verify(self.options.chain)?;
-        self.observed_at = Some(Instant::now());
-        self.core_network = self.options.core.call("getnetworkinfo", json!([]))?;
+        // `sync::batch` verifies Core identity and genesis itself; a second
+        // pre-sync getblockchaininfo only adds RPC latency per cycle.
         let archive_bytes_before = self.archive.size_bytes();
         match sync::batch(
             &mut self.store,
