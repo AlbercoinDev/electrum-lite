@@ -678,12 +678,14 @@ fn stats(conn: &Connection) -> Result<Stats> {
     })
 }
 
-fn remember(tx: &Transaction<'_>, height: u32, key: &[u8]) -> Result<()> {
-    tx.execute("INSERT OR IGNORE INTO undo SELECT ?1,outpoint,script,value,height,coinbase FROM utxos WHERE outpoint=?2", params![height,key])?;
-    tx.execute(
-        "INSERT OR IGNORE INTO undo(height,outpoint) VALUES(?1,?2)",
-        params![height, key],
-    )?;
+fn remember(
+    existing: &mut rusqlite::Statement<'_>,
+    missing: &mut rusqlite::Statement<'_>,
+    height: u32,
+    key: &[u8],
+) -> Result<()> {
+    existing.execute(params![height, key])?;
+    missing.execute(params![height, key])?;
     Ok(())
 }
 
@@ -717,29 +719,33 @@ fn prepare(
     let mut utxos = old.utxos;
     let mut history = old.history;
     tx.execute("INSERT INTO undo_blocks VALUES(?1)", [height])?;
+    let mut occurrence = tx.prepare("INSERT INTO occurrences VALUES(?1,?2,?3)")?;
+    let mut lookup = tx.prepare("SELECT script FROM utxos WHERE outpoint=?1")?;
+    let mut remove = tx.prepare("DELETE FROM utxos WHERE outpoint=?1")?;
+    let mut exists_query = tx.prepare("SELECT EXISTS(SELECT 1 FROM utxos WHERE outpoint=?1)")?;
+    let mut insert_coin = tx.prepare("INSERT INTO utxos VALUES(?1,?2,?3,?4,?5) ON CONFLICT(outpoint) DO UPDATE SET script=excluded.script,value=excluded.value,height=excluded.height,coinbase=excluded.coinbase")?;
+    let mut insert_history = tx.prepare("INSERT INTO history VALUES(?1,?2,?3)")?;
+    let mut undo_existing = tx.prepare("INSERT OR IGNORE INTO undo SELECT ?1,outpoint,script,value,height,coinbase FROM utxos WHERE outpoint=?2")?;
+    let mut undo_missing =
+        tx.prepare("INSERT OR IGNORE INTO undo(height,outpoint) VALUES(?1,?2)")?;
     for (position, transaction) in block.txdata.iter().enumerate() {
         let txid = transaction.compute_txid();
-        tx.execute(
-            "INSERT INTO occurrences VALUES(?1,?2,?3)",
-            params![
-                height,
-                i64::try_from(position)?,
-                txid.as_byte_array().as_slice()
-            ],
-        )?;
+        occurrence.execute(params![
+            height,
+            i64::try_from(position)?,
+            txid.as_byte_array().as_slice()
+        ])?;
         let mut scripts = HashSet::new();
         if !transaction.is_coinbase() {
             for input in &transaction.input {
                 let key = serialize(&input.previous_output);
-                let script: Vec<u8> = tx
-                    .query_row("SELECT script FROM utxos WHERE outpoint=?1", [&key], |r| {
-                        r.get(0)
-                    })
+                let script: Vec<u8> = lookup
+                    .query_row([&key], |r| r.get(0))
                     .optional()?
                     .context("missing or already spent prevout")?;
                 scripts.insert(script);
-                remember(tx, height, &key)?;
-                utxos -= tx.execute("DELETE FROM utxos WHERE outpoint=?1", [&key])? as i64;
+                remember(&mut undo_existing, &mut undo_missing, height, &key)?;
+                utxos -= remove.execute([&key])? as i64;
             }
         }
         for (vout, output) in transaction.output.iter().enumerate() {
@@ -757,11 +763,7 @@ fn prepare(
                 txid,
                 vout: vout.try_into()?,
             });
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM utxos WHERE outpoint=?1)",
-                [&key],
-                |r| r.get(0),
-            )?;
+            let exists: bool = exists_query.query_row([&key], |r| r.get(0))?;
             let bip30 = chain == Chain::Mainnet
                 && matches!(height, 91842 | 91880)
                 && transaction.is_coinbase();
@@ -769,17 +771,21 @@ fn prepare(
                 !exists || bip30,
                 "duplicate unspent outpoint outside BIP30 exception"
             );
-            remember(tx, height, &key)?;
-            tx.execute("INSERT INTO utxos VALUES(?1,?2,?3,?4,?5) ON CONFLICT(outpoint) DO UPDATE SET script=excluded.script,value=excluded.value,height=excluded.height,coinbase=excluded.coinbase", params![key,script,i64::try_from(output.value.to_sat())?,height,transaction.is_coinbase()])?;
+            remember(&mut undo_existing, &mut undo_missing, height, &key)?;
+            insert_coin.execute(params![
+                key,
+                script,
+                i64::try_from(output.value.to_sat())?,
+                height,
+                transaction.is_coinbase()
+            ])?;
             if !exists {
                 utxos += 1;
             }
         }
         for script in scripts {
-            history += tx.execute(
-                "INSERT INTO history VALUES(?1,?2,?3)",
-                params![script, height, i64::try_from(position)?],
-            )? as i64;
+            history +=
+                insert_history.execute(params![script, height, i64::try_from(position)?])? as i64;
         }
     }
     ensure!(

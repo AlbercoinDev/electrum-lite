@@ -130,6 +130,8 @@ Para observar progreso continuamente: `./target/release/electrum-lite --network 
 
 La sincronización agrupa hasta 64 bloques y 16 MB serializados por commit durable (el daemon usa lotes de hasta 20). El archivo se sincroniza antes de confirmar SQLite. Una cola incompleta sigue fallando de forma segura; no se trunca automáticamente. Este cambio no demuestra que la indexación pueda seguir a Core: se necesitan pruebas sostenidas y mediciones representativas.
 
+Se descargan hasta cuatro bloques simultáneamente por RPC y se aplican en orden mediante el único escritor; las sentencias SQL principales se reutilizan dentro de cada bloque. Además del lote serializado acotado, hay memoria transitoria de los bloques y sus respuestas JSON/hex; no es un límite total de RSS. Un error RPC interrumpe el grupo, no se interpreta como una reorganización.
+
 Para Sparrow, selecciona la misma red y **Private Electrum server**, host `127.0.0.1` y el puerto elegido. TCP sin SSL solo en loopback/túnel privado; nunca transportes abierto por Internet. La interfaz con Sparrow real sigue pendiente de validación aquí: no se ha instalado ni probado su GUI. Ver [perfil de protocolo y pruebas](docs/protocol.md).
 
 ## Herramientas y límites

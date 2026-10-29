@@ -59,7 +59,13 @@ regtest offline generó 1 000 bloques coinbase. Indexar 1 001 bloques en
 por lotes: 108,8 frente a 138,2 bloques/s. Orden fijo, una repetición, sin
 IBD concurrente. **No es un benchmark de SSD ni prueba que alcance a Core**;
 tmpfs no mide la latencia de sincronización de disco físico. Continúan
-pendientes pipeline concurrente, mediciones por etapa y pruebas sostenidas.
+pendientes mediciones por etapa y pruebas sostenidas.
+
+Comparación posterior en el mismo tmpfs con 1 001 bloques coinbase regtest y
+Core 31.0 offline: dos ejecuciones anteriores 133,5/129,3 bloques/s, dos con
+descargas RPC concurrentes (máximo cuatro) y sentencias SQL reutilizadas
+308,2/307,7 bloques/s. Orden A-B-B-A; no IBD, no SSD, no bloques densos ni
+medición de RAM. No implica que Electrum Lite siga el ritmo de Core.
 
 - Sincronización sostenida real en Signet/Testnet4 y pruebas de parámetros/casos históricos representativos de mainnet. Génesis offline no valida toda una red.
 - Prueba exhaustiva de undo histórico BIP30 real y recuperación a escala.
