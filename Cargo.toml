@@ -23,6 +23,9 @@ zstd = { version = "=0.13.3", default-features = false }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
 tempfile = "3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.191"
+
 [dev-dependencies]
 redb = "=4.4.0"
 

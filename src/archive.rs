@@ -118,6 +118,11 @@ impl Archive {
         self.bytes
     }
 
+    /// An unsuccessful append poisons the handle until a complete scan succeeds.
+    pub(crate) fn requires_scan(&self) -> bool {
+        !self.scanned
+    }
+
     pub fn scan_records(
         &mut self,
         mut visit: impl FnMut(u32, &Block, Location) -> Result<()>,

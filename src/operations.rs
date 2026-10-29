@@ -210,16 +210,29 @@ pub fn restore(backup: &Path, destination: &Path, chain: Chain) -> Result<()> {
     Ok(())
 }
 
-/// Controlled deep-reorg recovery: keep the old generation untouched and build a new one.
+pub struct RecoveryOptions<'a> {
+    pub chain: Chain,
+    pub limits: crate::store::Limits,
+    pub output: &'a Path,
+    pub min_free: u64,
+    pub historical: Option<&'a Core>,
+}
+
+/// Controlled recovery: keep the old generation untouched and build a new one.
 pub fn recover_chain(
     source: &Store,
     archive: &Archive,
     core: &Core,
-    chain: Chain,
-    limits: crate::store::Limits,
-    output: &Path,
-    min_free: u64,
+    options: RecoveryOptions<'_>,
+    mut confirm_historical: impl FnMut(u32) -> Result<bool>,
 ) -> Result<Value> {
+    let RecoveryOptions {
+        chain,
+        limits,
+        output,
+        min_free,
+        historical,
+    } = options;
     let info = core.verify(chain)?;
     let height: u32 = info["blocks"]
         .as_u64()
@@ -235,6 +248,8 @@ pub fn recover_chain(
         limits,
     )?;
     recovered_store.recover(&mut recovered_archive)?;
+    let mut historical_confirmed = false;
+    let mut historical_blocks = 0u32;
     for h in 0..=height {
         ensure!(
             fs2::available_space(output)? >= min_free,
@@ -251,9 +266,47 @@ pub fn recover_chain(
             ensure!(block.block_hash() == old, "source archive mismatch");
             block
         } else {
-            core.block(hash).context(
-                "new canonical branch unavailable from Core; restore a trusted historical source",
-            )?
+            match core.block(hash) {
+                Ok(block) => block,
+                Err(error) => {
+                    // An RPC failure alone is never evidence of pruning or permission to
+                    // contact another source. Confirm the local prune floor separately.
+                    let pruned_error = error
+                        .downcast_ref::<crate::rpc::RpcFailure>()
+                        .is_some_and(|e| e.code == -1);
+                    if !pruned_error {
+                        return Err(error.context("local Core block request failed"));
+                    }
+                    let current = core.verify(chain)?;
+                    let missing = current["pruned"] == true
+                        && current["pruneheight"]
+                            .as_u64()
+                            .is_some_and(|floor| u64::from(h) < floor);
+                    if !missing {
+                        return Err(error.context(
+                            "local Core block unavailable but pruning was not established",
+                        ));
+                    }
+                    let alternative = historical.context("local Core has pruned required historical blocks; configure a trusted historical Core and confirm its use")?;
+                    if !historical_confirmed {
+                        ensure!(
+                            confirm_historical(h)?,
+                            "historical source not confirmed; source generation preserved"
+                        );
+                        alternative
+                            .verify(chain)
+                            .context("historical Core identity verification failed")?;
+                        historical_confirmed = true;
+                    }
+                    let block = alternative.block(hash).context(
+                        "trusted historical Core cannot supply the required canonical block",
+                    )?;
+                    historical_blocks = historical_blocks
+                        .checked_add(1)
+                        .context("historical block count overflow")?;
+                    block
+                }
+            }
         };
         recovered_store.commit(&mut recovered_archive, h, &block)?;
         if h > 0 && h % 1000 == 0 {
@@ -265,7 +318,9 @@ pub fn recover_chain(
         "Core changed branch at recovery end; original data preserved"
     );
     recovered_store.integrity_check()?;
-    Ok(json!({"recovered":output,"height":height,"hash":anchor,"original_unchanged":true}))
+    Ok(
+        json!({"recovered":output,"height":height,"hash":anchor,"original_unchanged":true,"historical_source_blocks":historical_blocks}),
+    )
 }
 
 pub fn prune(

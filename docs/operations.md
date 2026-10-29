@@ -34,6 +34,41 @@ La plantilla usa `~/.local/share/electrum-lite` como raíz de datos, umask 0077 
 
 La plantilla NO arranca Core, abre firewall, habilita poda ni configura TLS. Para actualizar un binario ya instalado `cargo install` necesita `--force`: detén antes el servicio y conserva una copia del ejecutable previo.
 
+## Supervisor Linux experimental
+
+`managed-serve` arranca primero Electrum Lite y espera a que su worker termine
+de abrir y recuperar el índice antes de iniciar un **Core de pruebas dedicado**.
+Exige Linux, un directorio Core nuevo o creado anteriormente por este modo,
+puertos loopback libres y `--confirm-dedicated`. No adopta, configura ni detiene
+tu nodo existente. Mainnet está rechazada. Emplea `prune=1`, no `prune=550`.
+
+```sh
+electrum-lite --network signet --data-dir "$HOME/electrum-lab-index" managed-serve \
+  --bitcoind /ruta/absoluta/a/bitcoind \
+  --core-dir "$HOME/electrum-lab-core" --rpc-port 38333 \
+  --listen 127.0.0.1:60601 --confirm-dedicated
+```
+
+No ejecutes ese ejemplo con datos valiosos. El Core se crea sin cartera y
+necesita espacio para sincronizar. El directorio dedicado debe ser distinto y
+externo al índice; el supervisor no adopta carpetas existentes sin su marcador.
+Los datos se conservan al detenerlo. `--offline` solo sirve para laboratorio.
+
+Si el daemon termina, no responde durante 45 s o informa errores persistentes,
+el supervisor solicita SIGTERM al Core hijo que él creó, espera hasta 120 s y
+notifica si la parada se confirma. Tres errores persistentes se consideran
+fallo, salvo calentamiento normal de mempool. Durante el arranque de Core existe
+un periodo de gracia para esperar su RPC. Ctrl+C detiene ambos. En Linux se usa
+también `PR_SET_PDEATHSIG` para solicitar SIGTERM a los hijos si muere el
+supervisor; se rechazan ejecutables con setuid/setgid o capacidades de archivo.
+
+Esto **no es una garantía universal**: una orden puede no ser atendida, una VM o
+el hardware pueden fallar, o puede haber otros Core iniciados fuera del supervisor.
+No hay adopción de procesos existentes ni control del nodo normal mediante su
+RPC. El test automatizado crea su propio Core regtest offline y simula SIGKILL
+del daemon y del supervisor; no equivale a pruebas de energía ni a sincronización
+real sostenida. La compatibilidad segura con `prune=550` sigue pendiente.
+
 ## Transporte remoto
 
 TCP solo se enlaza a loopback. No desactives esa restricción ni abras RPC. Ejemplo de túnel SSH desde la máquina de la cartera:
@@ -85,6 +120,30 @@ electrum-lite --network signet --data-dir ./recovered-data audit
 ```
 
 Reutiliza bloques de la cadena activa archivada cuando coinciden con Core; obtiene de Core la rama canónica que falta. Conserva intacta la generación original. Necesita espacio para otra copia y puede ser lento. Si Core ya no tiene los bloques canónicos necesarios, falla: se requiere una fuente confiable que sí los tenga. No promete recuperar cualquier reorg sin datos.
+
+Opcionalmente puede configurarse otro Bitcoin Core histórico de confianza en
+loopback (o mediante un túnel seguro). **Solo se contacta si el Core local
+realmente devuelve error de bloque podado y su `pruneheight` confirma la
+ausencia.** Al detectar el primer bloque faltante, pide escribir `SI` en una
+terminal interactiva antes de conectar a la fuente; no hay confirmación por
+defecto ni conexión silenciosa. La confirmación cubre los bloques ausentes de
+esa recuperación. La fuente puede aprender qué bloques se solicitan.
+
+```sh
+electrum-lite --network signet --data-dir ./data recover-chain \
+  --cookie-file "$HOME/.bitcoin/signet/.cookie" --output-root ./recovered-data \
+  --historical-rpc-url http://127.0.0.1:38333/ \
+  --historical-cookie-file /ruta/privada/a/cookie-del-core-historico
+```
+
+Son parámetros de ejemplo: la fuente debe existir, ser confiable, estar en la
+misma red y conservar los bloques. El hash canónico se obtiene del Core local;
+se valida la identidad de la fuente, el hash del bloque, Merkle y witness al
+importarlo. Si se deniega, no hay terminal, falla la red o no se confirma poda,
+no se contacta la fuente. La raíz nueva puede quedar incompleta; consérvala para
+revisión y usa otra raíz nueva en un intento posterior. El índice original no
+se sustituye. La prueba de confirmación usa servicios RPC simulados; falta una
+prueba pública sostenida con fuente histórica real.
 
 ## Poda explícita de redes de prueba
 

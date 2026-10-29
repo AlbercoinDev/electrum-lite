@@ -16,11 +16,14 @@ Versiones concretas resueltas y checksums en `Cargo.lock`. No se ha realizado un
 | rusqlite 0.41.1 / SQLite empaquetado | Base transaccional de índices, undo y referencias | MIT / SQLite en dominio público |
 | url | Validación de endpoint | MIT OR Apache-2.0 |
 | Tokio 1.54.1 | Transporte TCP, señales y coordinación async | MIT |
+| libc 0.2.191 (solo Linux) | Señales a procesos hijos dedicados y detección de muerte del supervisor | MIT OR Apache-2.0 |
 | tempfile | Auditoría temporal y tests aislados | MIT OR Apache-2.0 |
 | redb 4.4.0 (solo desarrollo) | Comparación sintética de backends | MIT OR Apache-2.0 |
 
 Las licencias completas, incluidas las transitivas y código nativo como secp256k1/Zstandard, están en los paquetes originales. Antes de distribuir binarios o elegir licencia propia, revisar y proporcionar avisos/licencias que correspondan. Esta tabla no reemplaza esos textos.
 
 Tokio gestiona transporte y señales; un worker dedicado ejecuta RPC, SQLite y compresión síncronos sin bloquear el executor async. Metadatos: https://docs.rs/tokio/1.54.1/tokio/.
+
+El supervisor Linux usa `PR_SET_PDEATHSIG` y SIGTERM para sus hijos dedicados; consulta [libc](https://docs.rs/libc/0.2.191/libc/) y [semántica y límites Linux](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html). No ofrece garantía frente a fallos de hardware o un Core lanzado fuera del supervisor.
 
 Referencias consultadas: documentación oficial de [rust-bitcoin](https://docs.rs/bitcoin/0.32.102/bitcoin/), [ureq](https://docs.rs/ureq/2.12.1/ureq/), [zstd](https://docs.rs/zstd/0.13.3/zstd/), metadatos de crates.io y RPC [getblock de Core 31.0](https://bitcoincore.org/en/doc/31.0.0/rpc/blockchain/getblock/). El transporte RPC entrega hex dentro de JSON. Se eligieron APIs concretas comprobadas al compilar, no versiones inferidas de pseudocódigo.

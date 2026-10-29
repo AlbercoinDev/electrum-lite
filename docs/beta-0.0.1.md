@@ -45,11 +45,34 @@ Resultado local de la continuación: **25 tests aprobados**, fmt y clippy correc
 - Electrum 1.4 TCP loopback, consultas históricas/Merkle, mempool padre/hijo y RBF, difusión, fees y suscripciones; worker único con límites y readiness.
 - SQLite schema 2: cursor y rewind durable, reorgs hasta undo retenido y recuperación profunda a otra raíz conservando el origen. Migración explícita con backup, manifiestos, restore y auditoría semántica.
 - Poda manual de prueba con auditoría, backup nuevo y Core offline; mainnet bloqueada sin override. Ejemplos systemd no iniciados aquí.
-- Verificación Rust: **37 tests**, formato, clippy y release. Integración Core 31.0: TCP, RBF, reorg superficial/profunda, generación reconstruida y bytes SQLite originales preservados.
+- Verificación anterior: **37 tests** Rust, formato, clippy y release. Integración Core 31.0: TCP, RBF, reorg superficial/profunda, generación reconstruida y bytes SQLite originales preservados.
 - Poda efectiva regtest: 1 600 bloques, 600 con OP_RETURN grandes; Core deja de servir el bloque histórico y el socket Electrum devuelve TX original con witness y Merkle válido. Datos deliberadamente compresibles, no benchmark.
 - P2P público acotado: Signet y Testnet4, 100 bloques/101 TX cada una, auditados. Signet: 4 pares, 49 038 902 bytes recibidos; Testnet4: 1 par, 21 299 775 bytes. No sincronización completa.
 
 ## Aceptación externa pendiente
+
+### Supervisión y fuente histórica experimental
+
+Linux añade `managed-serve` para un Core de prueba dedicado que crea y controla,
+con poda **manual** `prune=1`, nunca el Core existente ni mainnet. En regtest
+offline propio se probó la parada del Core al matar el daemon, la señal a ambos
+hijos al matar el supervisor y la parada ante daemon congelado. No es una prueba
+de energía física, IBD público ni una garantía ante todo tipo de fallos.
+
+`recover-chain` puede ofrecer otro Core histórico configurado por loopback,
+solo cuando el Core local ha confirmado que podó el bloque. Solicita
+confirmación en terminal antes del primer contacto. Tests con RPC simulados
+verificaron que sin ausencia, ante otro error RPC y al rechazar, la fuente
+alternativa no recibe peticiones; al aceptar se comprueba y reconstruye en una
+raíz nueva. Falta un ensayo con una fuente histórica real y red pública.
+
+Verificación de esta continuación: **47 tests** Rust, fmt, clippy y compilación
+release; integración TCP/reorg Core 31.0, poda manual real en regtest y las
+tres pruebas de fallo del supervisor en nodos temporales aislados.
+
+**Pendiente:** demostrar y habilitar de forma segura la supervisión de Core con
+poda automática `prune=550`; el modo gestionado actual no la usa. Sigue sin
+demostrarse que el indexador alcance siempre el ritmo de Core.
 
 ### Experimento de lotes de sincronización
 

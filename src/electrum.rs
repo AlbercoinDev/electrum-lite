@@ -173,6 +173,10 @@ fn diagnostic(error: &anyhow::Error) -> &'static str {
     }
 }
 
+fn recovery_needed(archive: &Archive, bytes_before: u64) -> bool {
+    archive.requires_scan() || archive.size_bytes() != bytes_before
+}
+
 impl State {
     fn progress(
         &self,
@@ -242,6 +246,7 @@ impl State {
         self.core_info = self.options.core.verify(self.options.chain)?;
         self.observed_at = Some(Instant::now());
         self.core_network = self.options.core.call("getnetworkinfo", json!([]))?;
+        let archive_bytes_before = self.archive.size_bytes();
         match sync::batch(
             &mut self.store,
             &mut self.archive,
@@ -253,7 +258,10 @@ impl State {
         ) {
             Ok(info) => self.sync_metrics = info["electrum_sync_metrics"].clone(),
             Err(error) => {
-                self.recovery_required = true;
+                // An RPC error before any archive mutation cannot leave an unpublished
+                // tail. I/O failures poison the archive even when its byte counter did
+                // not advance; any complete append also requires conservative replay.
+                self.recovery_required = recovery_needed(&self.archive, archive_bytes_before);
                 return Err(error);
             }
         }
@@ -1068,6 +1076,21 @@ mod tests {
         assert!(text.contains("poda automática") && text.contains("faltan bloques históricos"));
         assert!(!text.contains("secret"));
         assert_eq!(previous.unwrap().0, 0);
+    }
+
+    #[test]
+    fn rpc_failure_without_archive_writes_does_not_require_full_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let bytes = state.archive.size_bytes();
+        assert!(state.refresh().is_err()); // Core cookie is unavailable before sync starts.
+        assert!(!state.recovery_required);
+        assert_eq!(state.archive.size_bytes(), bytes);
+        assert!(!state.archive.requires_scan());
+        assert!(!recovery_needed(&state.archive, bytes));
+        assert!(recovery_needed(&state.archive, bytes + 1));
+        state.archive.require_scan();
+        assert!(recovery_needed(&state.archive, bytes));
     }
 
     fn state(root: &std::path::Path) -> State {

@@ -29,3 +29,9 @@ jobs:
         run: python3 scripts/prune_smoke.py
         env:
           BITCOIND: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoind
+      - name: Dedicated Core supervisor crash tests (offline regtest)
+        timeout-minutes: 6
+        run: python3 scripts/managed_smoke.py
+        env:
+          BITCOIND: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoind
+          BITCOINCLI: ${{ runner.temp }}/bitcoin-31.0/bin/bitcoin-cli

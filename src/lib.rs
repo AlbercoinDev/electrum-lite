@@ -6,6 +6,8 @@ pub mod mempool;
 pub mod operations;
 pub mod rpc;
 pub mod store;
+#[cfg(target_os = "linux")]
+pub mod supervisor;
 pub mod sync;
 
 use anyhow::{ensure, Result};

@@ -120,7 +120,7 @@ El arranque verifica íntegramente archivo, referencias e índices; puede tardar
 
 La misma terminal de `serve` muestra cada aproximadamente cinco segundos las alturas observadas de Core e índice, retraso, velocidad entre muestras, altura de poda, antigüedad de la observación y espacio libre. También informa de errores y alerta de poda automática o histórico ausente. Si el worker está ocupado o Core no responde, la actualización puede tardar más; `?` significa que no hay dato disponible. No registra cookies ni consultas de cartera.
 
-**La parada automática de Core aún no está implementada.** `serve` no supervisa ni detiene Core si falla. La poda automática de Core no está validada para preservar el histórico de esta beta: utiliza la configuración manual y los procedimientos seguros descritos abajo.
+`serve` normal **no supervisa ni detiene Core**. En Linux existe `managed-serve`, experimental y solo para un Core dedicado nuevo de Signet/Testnet4/regtest: verifica el índice antes de arrancarlo y solicita la parada de su propio proceso si Electrum Lite falla. Exige `--confirm-dedicated` y **usa poda manual `prune=1`**, no `prune=550`. La poda automática de Core no está validada para preservar el histórico. Ver [supervisión y límites](docs/operations.md#supervisor-linux-experimental).
 
 En otra terminal:
 

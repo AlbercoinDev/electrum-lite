@@ -37,6 +37,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Supervise a NEW dedicated test Core (manual prune only); Linux experimental.
+    #[cfg(target_os = "linux")]
+    ManagedServe {
+        #[arg(long)]
+        bitcoind: PathBuf,
+        #[arg(long)]
+        core_dir: PathBuf,
+        #[arg(long)]
+        rpc_port: u16,
+        #[arg(long, default_value = "127.0.0.1:50001")]
+        listen: SocketAddr,
+        /// Confirm the supervisor may start and stop its dedicated child Core.
+        #[arg(long)]
+        confirm_dedicated: bool,
+        /// Disable P2P for isolated tests.
+        #[arg(long)]
+        offline: bool,
+    },
     /// Recover a deep reorg into a NEW root using matching archived blocks and Core's new branch.
     RecoverChain {
         #[arg(long)]
@@ -47,6 +65,11 @@ enum Command {
         output_root: PathBuf,
         #[arg(long, default_value_t = 512)]
         min_free_mib: u64,
+        /// Optional trusted historical Core via numeric loopback (e.g. an SSH tunnel).
+        #[arg(long, requires = "historical_cookie_file")]
+        historical_rpc_url: Option<String>,
+        #[arg(long, requires = "historical_rpc_url")]
+        historical_cookie_file: Option<PathBuf>,
     },
     /// Validate a backup manifest and checksums without modifying data.
     VerifyBackup {
@@ -169,13 +192,46 @@ fn main() -> Result<()> {
         entries: cli.max_index_entries,
     };
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Command::ManagedServe {
+            bitcoind,
+            core_dir,
+            rpc_port,
+            listen,
+            confirm_dedicated,
+            offline,
+        } => {
+            ensure!(
+                confirm_dedicated,
+                "explicit --confirm-dedicated is required; this supervises its own test Core only"
+            );
+            let options = electrum_lite::supervisor::Options {
+                chain: cli.network,
+                data_dir: cli.data_dir,
+                core_dir,
+                bitcoind,
+                rpc_port,
+                listen,
+                offline,
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(electrum_lite::supervisor::run(options))?;
+        }
         Command::RecoverChain {
             rpc_url,
             cookie_file,
             output_root,
             min_free_mib,
+            historical_rpc_url,
+            historical_cookie_file,
         } => {
             let core = core(cli.network, rpc_url, cookie_file)?;
+            let historical = historical_rpc_url
+                .zip(historical_cookie_file)
+                .map(|(url, cookie)| Core::new(&url, &cookie))
+                .transpose()?;
             let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
             let mut store = Store::open(
                 &archive.directory().join("index.sqlite"),
@@ -189,12 +245,25 @@ fn main() -> Result<()> {
                     &store,
                     &archive,
                     &core,
-                    cli.network,
-                    limits,
-                    &output_root,
-                    min_free_mib
-                        .checked_mul(1024 * 1024)
-                        .context("free-space limit overflow")?
+                    electrum_lite::operations::RecoveryOptions {
+                        chain: cli.network,
+                        limits,
+                        output: &output_root,
+                        min_free: min_free_mib
+                            .checked_mul(1024 * 1024)
+                            .context("free-space limit overflow")?,
+                        historical: historical.as_ref(),
+                    },
+                    |height| {
+                        use std::io::{IsTerminal, Write};
+                        ensure!(std::io::stdin().is_terminal(), "historical source requires interactive terminal confirmation; no connection attempted");
+                        eprintln!("El Core local ha podado el bloque {height}. La recuperación usará el Core histórico configurado para bloques canónicos ausentes. Solo usa una fuente confiable; puede revelar qué bloques necesitas.");
+                        eprint!("¿Autorizar esta fuente para esta recuperación? Escribe SI: ");
+                        std::io::stderr().flush()?;
+                        let mut answer = String::new();
+                        std::io::stdin().read_line(&mut answer)?;
+                        Ok(answer.trim() == "SI")
+                    }
                 )?)?
             );
         }

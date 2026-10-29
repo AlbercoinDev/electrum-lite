@@ -84,8 +84,10 @@ validada públicamente de forma sostenida en este proyecto.
 La terminal del servidor muestra progreso aproximadamente cada cinco segundos:
 alturas de Core e índice, retraso, velocidad entre muestras, espacio libre y
 alertas de poda o errores. La observación puede estar desactualizada o demorarse
-si el worker está ocupado. No hay parada automática de Core si falla el servidor;
-la poda automática de Core no está validada para preservar el histórico.
+si el worker está ocupado. `serve` normal no detiene Core. `managed-serve` es un
+modo Linux experimental para un Core de prueba dedicado y distinto, con poda
+manual, descrito en `docs/operations.md`; no adopta tu Core existente. La poda
+automática de Core no está validada para preservar el histórico.
 
 Desde otra terminal:
 

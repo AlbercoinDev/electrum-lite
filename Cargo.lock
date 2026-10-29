@@ -246,6 +246,7 @@ dependencies = [
  "clap",
  "fs2",
  "hex",
+ "libc",
  "redb",
  "rusqlite",
  "serde",
