@@ -1,6 +1,8 @@
 //! Beta archive/index primitives. Not an Electrum server or a pruning controller.
 pub mod archive;
 pub mod electrum;
+#[cfg(feature = "experimental-lsm")]
+pub mod experimental_lsm;
 pub mod index;
 pub mod mempool;
 pub mod operations;

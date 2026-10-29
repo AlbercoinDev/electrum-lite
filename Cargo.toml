@@ -14,6 +14,10 @@ experimental-lsm = ["dep:rocksdb"]
 name = "lsm_compare"
 required-features = ["experimental-lsm"]
 
+[[example]]
+name = "lsm_bitcoin_check"
+required-features = ["experimental-lsm"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

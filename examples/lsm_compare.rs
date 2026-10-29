@@ -1,10 +1,7 @@
 //! Isolated durable KV experiment, NOT a Bitcoin index or performance claim.
-#[path = "support/lsm.rs"]
-mod lsm;
-
 use anyhow::{ensure, Result};
 use bitcoin::hashes::{sha256, Hash};
-use lsm::Prototype;
+use electrum_lite::experimental_lsm::kv::Prototype;
 use rusqlite::{params, Connection};
 use std::time::Instant;
 

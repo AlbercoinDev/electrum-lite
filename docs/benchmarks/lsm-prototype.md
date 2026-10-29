@@ -2,6 +2,10 @@
 
 Fecha: 2026-10-29. Estado: **experimental, no integrado**.
 
+Continuación: [generaciones Bitcoin con archivo/UTXO/undo y backup completo](lsm-bitcoin-generations.md).
+La primitiva KV se trasladó a `src/experimental_lsm/kv.rs`; las cifras siguientes
+son las del primer experimento aislado, no del coordinador Bitcoin posterior.
+
 ## Alcance y decisión
 
 [CONFIRMADO] `examples/support/lsm.rs` implementa una capa KV usando la

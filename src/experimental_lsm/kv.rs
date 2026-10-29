@@ -1,5 +1,4 @@
-//! Throwaway LSM backend contract experiment. Not connected to Store or pruning.
-//! No archive cursor or Bitcoin semantics are claimed by this KV-only layer.
+//! Experimental generic LSM primitive; Bitcoin coordination lives in its parent.
 use anyhow::{ensure, Context, Result};
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use rocksdb::{
@@ -89,16 +88,14 @@ impl Prototype {
 
     /// A single ordered owner must resolve Bitcoin state before passing deltas.
     /// All mutations and generation publish in one WAL-enabled sync WriteBatch.
-    pub fn commit(&mut self, expected: u64, changes: &Changes) -> Result<()> {
+    pub fn validate_changes(&self, expected: u64, changes: &Changes) -> Result<()> {
         ensure!(self.generation()? == expected, "stale generation");
         ensure!(
             !changes.is_empty() && changes.len() <= 65_536,
             "invalid delta count"
         );
-        let next = expected.checked_add(1).context("generation overflow")?;
         let mut seen = HashSet::new();
         let mut bytes = 0usize;
-        let mut batch = WriteBatch::default();
         for (key, value) in changes {
             ensure!(
                 !key.is_empty() && key[0] != 0 && key.len() <= 128,
@@ -109,6 +106,16 @@ impl Prototype {
                 .checked_add(key.len() + value.as_ref().map_or(0, Vec::len))
                 .context("delta overflow")?;
             ensure!(bytes <= 16 * 1024 * 1024, "delta byte limit");
+        }
+        expected.checked_add(1).context("generation overflow")?;
+        Ok(())
+    }
+
+    pub fn commit(&mut self, expected: u64, changes: &Changes) -> Result<()> {
+        self.validate_changes(expected, changes)?;
+        let next = expected.checked_add(1).context("generation overflow")?;
+        let mut batch = WriteBatch::default();
+        for (key, value) in changes {
             if let Some(value) = value {
                 batch.put(key, value);
             } else {
@@ -119,6 +126,30 @@ impl Prototype {
         if let Err(error) = self.db.write_opt(batch, &durable()) {
             self.failed = true;
             return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Streaming, checksum-verified iteration; no unbounded collection of history.
+    pub fn visit_prefix(
+        &self,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            !self.failed && !prefix.is_empty() && prefix[0] != 0,
+            "invalid prefix or poisoned DB"
+        );
+        let snapshot = self.db.snapshot();
+        for row in snapshot.iterator(rocksdb::IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, value) = row?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            visit(&key, &value)?;
         }
         Ok(())
     }
@@ -272,7 +303,11 @@ mod tests {
         let root = tempfile::tempdir()?;
         let path = root.path().join("db");
         let status = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "lsm::tests::crash_child", "--nocapture"])
+            .args([
+                "--exact",
+                "experimental_lsm::kv::tests::crash_child",
+                "--nocapture",
+            ])
             .env("LITE_LSM_CRASH_CHILD", &path)
             .status()?;
         ensure!(status.success(), "child failed");
