@@ -63,6 +63,8 @@ pub fn batch(
             );
         }
         let anchor = core.hash(end)?;
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0usize;
         for height in start..=end {
             ensure!(
                 !stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)),
@@ -78,12 +80,26 @@ pub fn batch(
                 core.hash(height)? == hash,
                 "Core reorg while fetching block"
             );
-            store.commit(archive, height, &block)?;
+            let size = bitcoin::consensus::serialize(&block).len();
+            if !pending.is_empty()
+                && (pending.len() == 64 || pending_bytes.saturating_add(size) > 16_000_000)
+            {
+                store.commit_batch(archive, &pending)?;
+                pending.clear();
+                pending_bytes = 0;
+            }
+            pending_bytes = pending_bytes
+                .checked_add(size)
+                .context("batch byte count overflow")?;
+            pending.push((height, block));
         }
         ensure!(
             core.hash(end)? == anchor,
             "Core reorg at batch end; retry safely"
         );
+        if !pending.is_empty() {
+            store.commit_batch(archive, &pending)?;
+        }
     }
     Ok(info)
 }

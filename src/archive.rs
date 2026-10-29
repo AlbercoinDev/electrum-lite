@@ -201,6 +201,29 @@ impl Archive {
     }
 
     pub fn append(&mut self, height: u32, block: &Block) -> Result<Location> {
+        self.append_record(height, block, true)
+    }
+
+    // Only Store's transaction coordinator may stage unsynced records.
+    pub(crate) fn append_staged(&mut self, height: u32, block: &Block) -> Result<Location> {
+        self.append_record(height, block, false)
+    }
+
+    pub(crate) fn sync_staged(&mut self, first: u32) -> Result<()> {
+        self.scanned = false;
+        for path in self.segments.iter().skip(first as usize) {
+            File::open(path)?.sync_all()?;
+        }
+        File::open(&self.dir)?.sync_all()?;
+        self.scanned = true;
+        Ok(())
+    }
+
+    pub(crate) fn require_scan(&mut self) {
+        self.scanned = false;
+    }
+
+    fn append_record(&mut self, height: u32, block: &Block, sync: bool) -> Result<Location> {
         ensure!(
             self.scanned,
             "scan the complete archive successfully before appending"
@@ -252,7 +275,9 @@ impl Archive {
         };
         file.write_all(&header)?;
         file.write_all(&compressed)?;
-        file.sync_all()?;
+        if sync {
+            file.sync_all()?;
+        }
         self.bytes = self
             .bytes
             .checked_add(u64::from(location.length))

@@ -128,6 +128,8 @@ Comprueba `ready`, tip local/Core, IBD, conexiones/red activa, espacio, tamaños
 
 Para observar progreso continuamente: `./target/release/electrum-lite --network signet monitor --address 127.0.0.1:60601`. Emite JSON cada cinco segundos con velocidad entre muestras, retraso frente al Core observado, espacio y alertas de poda; `--interval` cambia el periodo. Las observaciones pueden quedar desactualizadas y no sustituyen una ventana de mantenimiento segura. No hay garantía medida de alcanzar a Core durante IBD.
 
+La sincronización agrupa hasta 64 bloques y 16 MB serializados por commit durable (el daemon usa lotes de hasta 20). El archivo se sincroniza antes de confirmar SQLite. Una cola incompleta sigue fallando de forma segura; no se trunca automáticamente. Este cambio no demuestra que la indexación pueda seguir a Core: se necesitan pruebas sostenidas y mediciones representativas.
+
 Para Sparrow, selecciona la misma red y **Private Electrum server**, host `127.0.0.1` y el puerto elegido. TCP sin SSL solo en loopback/túnel privado; nunca transportes abierto por Internet. La interfaz con Sparrow real sigue pendiente de validación aquí: no se ha instalado ni probado su GUI. Ver [perfil de protocolo y pruebas](docs/protocol.md).
 
 ## Herramientas y límites

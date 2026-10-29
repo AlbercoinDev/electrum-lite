@@ -66,6 +66,115 @@ fn spend(previous: OutPoint) -> Transaction {
 }
 
 #[test]
+fn durable_batch_replays_after_failure_and_preserves_order() {
+    let root = tempdir().unwrap();
+    let chain = Chain::Regtest;
+    let genesis = genesis_block(chain.network());
+    let first = next(&genesis, vec![coinbase(1)]);
+    let payment = spend(OutPoint {
+        txid: first.txdata[0].compute_txid(),
+        vout: 0,
+    });
+    let second = next(&first, vec![coinbase(2), payment]);
+    let mut archive = Archive::open(root.path(), chain, true).unwrap();
+    let mut store =
+        Store::open(&archive.directory().join("index.sqlite"), chain, limits()).unwrap();
+    store.recover(&mut archive).unwrap();
+    store.commit(&mut archive, 0, &genesis).unwrap();
+    let batch = vec![(1, first.clone()), (2, second.clone())];
+    assert!(store
+        .commit_batch_with_hook(&mut archive, &batch, |stage| {
+            if stage == CommitStage::ArchiveSynced {
+                anyhow::bail!("injected failure");
+            }
+            Ok(())
+        })
+        .is_err());
+    assert_eq!(store.stats().unwrap().tip.unwrap().0, 0);
+    assert!(archive.append(1, &first).is_err());
+    store.recover(&mut archive).unwrap();
+    assert_eq!(store.stats().unwrap().tip, Some((2, second.block_hash())));
+    store.audit(&mut archive).unwrap();
+    for (height, expected) in batch {
+        let (_, location) = store.record(height).unwrap().unwrap();
+        assert_eq!(
+            serialize(&archive.read(location).unwrap().1),
+            serialize(&expected)
+        );
+    }
+}
+
+#[test]
+fn batch_crash_worker() {
+    let Ok(root) = std::env::var("ELECTRUM_BATCH_CRASH_ROOT") else {
+        return;
+    };
+    let stage = std::env::var("ELECTRUM_BATCH_CRASH_STAGE").unwrap();
+    let mut archive = Archive::open(std::path::Path::new(&root), Chain::Regtest, false).unwrap();
+    let mut store = Store::open(
+        &archive.directory().join("index.sqlite"),
+        Chain::Regtest,
+        limits(),
+    )
+    .unwrap();
+    store.recover(&mut archive).unwrap();
+    let genesis = genesis_block(Chain::Regtest.network());
+    let first = next(&genesis, vec![coinbase(1)]);
+    let second = next(&first, vec![coinbase(2)]);
+    store
+        .commit_batch_with_hook(&mut archive, &[(1, first), (2, second)], |current| {
+            if format!("{current:?}") == stage {
+                std::process::exit(86);
+            }
+            Ok(())
+        })
+        .unwrap();
+    panic!("crash stage not reached");
+}
+
+#[test]
+fn batch_subprocess_crashes_recover_consistently() {
+    for stage in ["Prepared", "ArchiveSynced", "ReferencesStaged", "Committed"] {
+        let root = tempdir().unwrap();
+        {
+            let mut archive = Archive::open(root.path(), Chain::Regtest, true).unwrap();
+            let mut store = Store::open(
+                &archive.directory().join("index.sqlite"),
+                Chain::Regtest,
+                limits(),
+            )
+            .unwrap();
+            store.recover(&mut archive).unwrap();
+            store
+                .commit(&mut archive, 0, &genesis_block(Chain::Regtest.network()))
+                .unwrap();
+        }
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "batch_crash_worker", "--nocapture"])
+            .env("ELECTRUM_BATCH_CRASH_ROOT", root.path())
+            .env("ELECTRUM_BATCH_CRASH_STAGE", stage)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.code(),
+            Some(86),
+            "{stage}: {}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let mut archive = Archive::open(root.path(), Chain::Regtest, false).unwrap();
+        let mut store = Store::open(
+            &archive.directory().join("index.sqlite"),
+            Chain::Regtest,
+            limits(),
+        )
+        .unwrap();
+        store.recover(&mut archive).unwrap();
+        assert_eq!(store.stats().unwrap().tip.unwrap().0, 2);
+        store.audit(&mut archive).unwrap();
+    }
+}
+
+#[test]
 fn imports_legacy_archives_and_resumes_on_every_network() {
     for chain in [
         Chain::Mainnet,

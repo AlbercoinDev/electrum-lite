@@ -249,6 +249,45 @@ impl Store {
         self.commit_with_hook(archive, height, block, |_| Ok(()))
     }
 
+    /// One durable generation for contiguous blocks; incomplete archive tails fail closed.
+    pub fn commit_batch(&mut self, archive: &mut Archive, blocks: &[(u32, Block)]) -> Result<()> {
+        self.commit_batch_with_hook(archive, blocks, |_| Ok(()))
+    }
+
+    #[doc(hidden)]
+    pub fn commit_batch_with_hook(
+        &mut self,
+        archive: &mut Archive,
+        blocks: &[(u32, Block)],
+        mut hook: impl FnMut(CommitStage) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            !blocks.is_empty() && blocks.len() <= 64,
+            "invalid commit batch size"
+        );
+        let result = (|| -> Result<()> {
+            let tx = self.conn.transaction()?;
+            let mut first = None;
+            for (height, block) in blocks {
+                prepare(&tx, self.chain, self.limits, *height, block)?;
+                let location = archive.append_staged(*height, block)?;
+                first.get_or_insert(location.segment);
+                publish(&tx, *height, block, location)?;
+            }
+            hook(CommitStage::Prepared)?;
+            archive.sync_staged(first.context("empty batch")?)?;
+            hook(CommitStage::ArchiveSynced)?;
+            hook(CommitStage::ReferencesStaged)?;
+            tx.commit()?;
+            hook(CommitStage::Committed)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            archive.require_scan();
+        }
+        result
+    }
+
     /// Fault-injection hook for tests. There is deliberately no unsafe production CLI flag.
     #[doc(hidden)]
     pub fn commit_with_hook(

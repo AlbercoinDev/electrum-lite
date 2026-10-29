@@ -25,3 +25,7 @@ Schema 1 requiere `migrate-index` y backup completo antes de la transacción. Sc
 Undo inicial: 288 bloques; reorg más profunda falla sin reset silencioso. `recover-chain` crea otra raíz a partir de bloques locales coincidentes y la rama canónica disponible en Core, sin modificar el origen. Si faltan bytes canónicos se requiere otra fuente confiable.
 
 Los huérfanos no tienen GC inicial y ocupan espacio. Verificar todo el log e índices al arrancar cuesta E/S proporcional al histórico. Schema 2 no certifica durabilidad frente a hardware que ignore fsync ni implica que mainnet esté validada para poda.
+
+## Commit de sincronización por lotes
+
+La sincronización puede confirmar hasta 64 bloques/16 MB serializados por transacción (serve solicita hasta 20). Se preparan índices en orden y se escriben los registros; se sincronizan todos los segmentos y el directorio antes de confirmar SQLite y publicar el cursor. El lector no observa la transacción parcial. Un fallo exige escanear antes de volver a escribir; un registro incompleto falla cerrado, sin truncado automático. Registros completos posteriores al cursor se reimportan idempotentemente. La validación y el undo conservan sus reglas anteriores. No se cambia el esquema ni la configuración durable de SQLite. Una caída de proceso ensayada no demuestra comportamiento ante pérdida física de energía.

@@ -51,6 +51,16 @@ Resultado local de la continuación: **25 tests aprobados**, fmt y clippy correc
 
 ## Aceptación externa pendiente
 
+### Experimento de lotes de sincronización
+
+En Linux x86-64 (Ryzen 9 7940HS, 8 CPU visibles, Linux 6.12), Core 31.0
+regtest offline generó 1 000 bloques coinbase. Indexar 1 001 bloques en
+`/tmp/opencode` (tmpfs) tomó 9,202 s con `8c66dd8` y 7,245 s con el commit
+por lotes: 108,8 frente a 138,2 bloques/s. Orden fijo, una repetición, sin
+IBD concurrente. **No es un benchmark de SSD ni prueba que alcance a Core**;
+tmpfs no mide la latencia de sincronización de disco físico. Continúan
+pendientes pipeline concurrente, mediciones por etapa y pruebas sostenidas.
+
 - Sincronización sostenida real en Signet/Testnet4 y pruebas de parámetros/casos históricos representativos de mainnet. Génesis offline no valida toda una red.
 - Prueba exhaustiva de undo histórico BIP30 real y recuperación a escala.
 - Fault injection exhaustiva, fallos de disco lleno y recuperación validada de pérdida de energía. Las pruebas de truncado/corrupción no cubren todos esos escenarios.
