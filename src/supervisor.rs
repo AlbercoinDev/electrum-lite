@@ -14,6 +14,7 @@ use std::{
 };
 
 pub struct Options {
+    pub lsm: bool,
     pub chain: Chain,
     pub data_dir: PathBuf,
     pub core_dir: PathBuf,
@@ -43,8 +44,34 @@ fn automatic_maintenance(
     endpoint: String,
     chain: Chain,
     backup_root: &Path,
+    lsm: bool,
 ) -> Result<Value> {
     let core = crate::rpc::Core::new(&endpoint, &cookie)?;
+    #[cfg(feature = "experimental-lsm")]
+    if lsm {
+        let mut store = crate::experimental_lsm::BitcoinStore::open(data, chain)?;
+        store.prune_checkpoint()?;
+        let active = core.call::<Value>("getnetworkinfo", json!([]))?["networkactive"]
+            .as_bool()
+            .context("missing network state")?;
+        let _: Value = core.call("setnetworkactive", json!([false]))?;
+        let parent = tempfile::Builder::new()
+            .prefix("lsm-prune-")
+            .tempdir_in(backup_root)?
+            .keep();
+        let result = store.prune_offline(
+            &core,
+            &parent.join("backup"),
+            &parent.join("verified"),
+            512 * 1024 * 1024,
+            true,
+        )?;
+        if active {
+            let _: Value = core.call("setnetworkactive", json!([true]))?;
+        }
+        return Ok(result);
+    }
+    ensure!(!lsm, "LSM feature required");
     let mut archive = crate::archive::Archive::open(data, chain, true)?;
     let mut store = crate::store::Store::open(
         &archive.directory().join("index.sqlite"),
@@ -246,6 +273,10 @@ fn prepare_core_root(path: &Path, chain: Chain) -> Result<PathBuf> {
 
 pub async fn run(options: Options) -> Result<()> {
     ensure!(
+        !options.lsm || cfg!(feature = "experimental-lsm"),
+        "LSM feature required"
+    );
+    ensure!(
         options.chain != Chain::Mainnet,
         "managed Core is experimental and limited to test networks"
     );
@@ -294,17 +325,28 @@ pub async fn run(options: Options) -> Result<()> {
             backup.is_dir() && !backup.starts_with(&app_root) && !backup.starts_with(&root),
             "backup root must be a directory outside Core and application data"
         );
-        let mut archive = crate::archive::Archive::open(&app_root, options.chain, true)?;
-        let mut store = crate::store::Store::open(
-            &archive.directory().join("index.sqlite"),
-            options.chain,
-            crate::store::Limits {
-                transactions: 10_000_000_000,
-                entries: 100_000_000_000,
-            },
-        )?;
-        store.recover(&mut archive)?;
-        prune_checkpoint = store.prune_checkpoint()?;
+        #[cfg(feature = "experimental-lsm")]
+        if options.lsm {
+            let store = if app_root.exists() {
+                crate::experimental_lsm::BitcoinStore::open(&app_root, options.chain)?
+            } else {
+                crate::experimental_lsm::BitcoinStore::create(&app_root, options.chain)?
+            };
+            prune_checkpoint = store.prune_checkpoint()?.map_or(0, |audit| audit.requested);
+        }
+        if !options.lsm {
+            let mut archive = crate::archive::Archive::open(&app_root, options.chain, true)?;
+            let mut store = crate::store::Store::open(
+                &archive.directory().join("index.sqlite"),
+                options.chain,
+                crate::store::Limits {
+                    transactions: 10_000_000_000,
+                    entries: 100_000_000_000,
+                },
+            )?;
+            store.recover(&mut archive)?;
+            prune_checkpoint = store.prune_checkpoint()?;
+        }
     }
     // Refuse occupied ports before launching either child; the applications also
     // independently bind them, and failures stop the owned Core.
@@ -321,7 +363,7 @@ pub async fn run(options: Options) -> Result<()> {
         .arg(options.chain.name())
         .arg("--data-dir")
         .arg(&options.data_dir)
-        .arg("serve")
+        .arg(if options.lsm { "lsm-serve" } else { "serve" })
         .arg("--cookie-file")
         .arg(&cookie)
         .arg("--rpc-url")
@@ -345,8 +387,10 @@ pub async fn run(options: Options) -> Result<()> {
         }
         let address = options.listen;
         let chain = options.chain;
-        if let Ok(Ok(_)) = tokio::task::spawn_blocking(move || probe(address, chain)).await {
-            break;
+        if let Ok(Ok(health)) = tokio::task::spawn_blocking(move || probe(address, chain)).await {
+            if !options.lsm || (health["backend"] == "lsm" && health["generation"].is_number()) {
+                break;
+            }
         }
         ensure!(
             startup.elapsed() < Duration::from_secs(600),
@@ -432,8 +476,9 @@ pub async fn run(options: Options) -> Result<()> {
                         let cookie = cookie.clone();
                         let endpoint = endpoint.clone();
                         let backup_root = policy.backup_root.clone();
+                        let lsm = options.lsm;
                         let result = tokio::task::spawn_blocking(move || {
-                            automatic_maintenance(&data, cookie, endpoint, chain, &backup_root)
+                            automatic_maintenance(&data, cookie, endpoint, chain, &backup_root, lsm)
                         })
                         .await;
                         match result {
@@ -466,7 +511,9 @@ pub async fn run(options: Options) -> Result<()> {
                 }
                 if core_seen || core_started.elapsed() > Duration::from_secs(120) {
                     if let Some(error) = health["last_error"].as_str() {
-                        if !error.contains("mempool snapshot warming") {
+                        if !error.contains("mempool snapshot warming")
+                            && !(options.lsm && error == "confirmed index catching up")
+                        {
                             errors += 1;
                         } else {
                             errors = 0;

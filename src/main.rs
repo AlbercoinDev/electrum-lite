@@ -68,6 +68,9 @@ enum Command {
     /// Supervise a dedicated test Core; optional coordinated automatic pruning.
     #[cfg(target_os = "linux")]
     ManagedServe {
+        /// Select the experimental LSM child and maintenance path (feature required).
+        #[arg(long)]
+        lsm: bool,
         #[arg(long)]
         bitcoind: PathBuf,
         #[arg(long)]
@@ -279,6 +282,7 @@ fn main() -> Result<()> {
         }
         #[cfg(target_os = "linux")]
         Command::ManagedServe {
+            lsm,
             bitcoind,
             core_dir,
             rpc_port,
@@ -294,6 +298,7 @@ fn main() -> Result<()> {
                 "explicit --confirm-dedicated is required; this supervises its own test Core only"
             );
             let options = electrum_lite::supervisor::Options {
+                lsm,
                 chain: cli.network,
                 data_dir: cli.data_dir,
                 core_dir,

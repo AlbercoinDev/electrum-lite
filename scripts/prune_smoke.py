@@ -28,7 +28,10 @@ def main():
     binary = str(Path(os.environ.get("ELECTRUM_LITE", "target/release/electrum-lite")).resolve())
     bitcoind = os.environ.get("BITCOIND", "bitcoind")
     automatic = os.environ.get("AUTO_PRUNE") == "1"
-    with tempfile.TemporaryDirectory(prefix="electrum-lite-prune-") as temporary:
+    lsm = os.environ.get("LSM_PRUNE") == "1"
+    assert not lsm or automatic, "LSM proof requires dedicated automatic supervisor"
+    backend = ["--lsm"] if lsm else []
+    with tempfile.TemporaryDirectory(dir="/tmp/opencode", prefix="electrum-lite-prune-") as temporary:
         root = Path(temporary)
         data = root / "core"
         rpc_port = port()
@@ -40,7 +43,7 @@ def main():
             with (root / "bootstrap.log").open("w") as bootstrap_log:
                 bootstrap = subprocess.Popen([
                     binary, "--network", "regtest", "--data-dir", str(root / "archive"),
-                    "managed-serve", "--bitcoind", bitcoind, "--core-dir", str(data),
+                    "managed-serve", *backend, "--bitcoind", bitcoind, "--core-dir", str(data),
                     "--rpc-port", str(rpc_port), "--listen", f"127.0.0.1:{bootstrap_port}",
                     "--confirm-dedicated", "--offline",
                 ], stdout=bootstrap_log, stderr=bootstrap_log)
@@ -81,7 +84,7 @@ def main():
                             raise RuntimeError((root / "core.log").read_text())
                         time.sleep(0.1)
                 rpc("createwallet", ["prune-proof"])
-                address = rpc("getnewaddress")
+                address = rpc("getnewaddress", ["", "bech32"])
                 rpc("generatetoaddress", [1000, address])
                 target_hash = rpc("getblockhash", [10])
                 target_txid = rpc("getblock", [target_hash, 1])["tx"][0]
@@ -98,6 +101,12 @@ def main():
                     assert signed["complete"]
                     rpc("generateblock", [address, [signed["hex"]]])
                     decoded = rpc("decoderawtransaction", [signed["hex"]])
+                    if lsm and height == 0:
+                        assert any(vin.get("txinwitness") for vin in decoded["vin"])
+                        target_hash = rpc("getblockhash", [1001])
+                        target_txid = decoded["txid"]
+                        target_raw = signed["hex"]
+                        expected_root = rpc("getblockheader", [target_hash])["merkleroot"]
                     txid, vout, amount = decoded["txid"], 0, output_amount
                     if (height + 1) % 100 == 0:
                         print(f"Generated {height + 1}/600 large regtest blocks", flush=True)
@@ -110,7 +119,23 @@ def main():
                     assert result.returncode == 0, result.stderr
                     return json.loads(result.stdout)
 
-                assert run("sync", *online, "--max-blocks", "5000")["indexed_tip"]["height"] == 1600
+                target_height = 1001 if lsm else 10
+                if lsm:
+                    sync_port = port()
+                    with (root / "lsm-sync.log").open("w") as sync_log:
+                        syncing = subprocess.Popen([*app, "lsm-serve", *online, "--listen", f"127.0.0.1:{sync_port}"], stdout=sync_log, stderr=sync_log)
+                        client = None
+                        try:
+                            client = wait(lambda: Electrum(sync_port), timeout=120)
+                            wait(lambda: client.request("server.health")["ready"], timeout=600)
+                            assert client.request("server.health")["indexed_tip"]["height"] == 1600
+                        finally:
+                            if client:
+                                client.close()
+                            syncing.terminate()
+                            assert syncing.wait(timeout=150) == 0, (root / "lsm-sync.log").read_text()
+                else:
+                    assert run("sync", *online, "--max-blocks", "5000")["indexed_tip"]["height"] == 1600
                 if automatic:
                     # Stop the generator completely before managed maintenance.
                     rpc("stop")
@@ -120,7 +145,7 @@ def main():
                     managed_port = port()
                     with (root / "automatic.log").open("w") as managed_log:
                         managed = subprocess.Popen([
-                            *app, "managed-serve", "--bitcoind", bitcoind,
+                            *app, "managed-serve", *backend, "--bitcoind", bitcoind,
                             "--core-dir", str(data), "--rpc-port", str(rpc_port),
                             "--listen", f"127.0.0.1:{managed_port}", "--confirm-dedicated", "--offline",
                             "--auto-prune", "--prune-backup-root", str(backups),
@@ -128,20 +153,21 @@ def main():
                         ], stdout=managed_log, stderr=managed_log)
                         client = None
                         try:
-                            wait(lambda: "Poda automática completada:" in (root / "automatic.log").read_text(), timeout=240)
+                            wait(lambda: "Poda automática completada:" in (root / "automatic.log").read_text(), timeout=600)
                             client = wait(lambda: Electrum(managed_port), timeout=120)
                             wait(lambda: client.request("server.health")["ready"], timeout=120)
                             assert client.request("blockchain.transaction.get", [target_txid]) == target_raw
-                            branch = client.request("blockchain.transaction.get_merkle", [target_txid, 10])
+                            branch = client.request("blockchain.transaction.get_merkle", [target_txid, target_height])
                             assert proof(target_txid, branch["merkle"], branch["pos"]) == expected_root
-                            assert rpc("getblockchaininfo")["pruneheight"] >= 10
+                            assert rpc("getblockchaininfo")["pruneheight"] > target_height
                             try:
                                 rpc("getblock", [target_hash, 0])
                             except RuntimeError as error:
                                 assert "pruned" in str(error)
                             else:
                                 raise AssertionError("automatic prune did not delete historical Core bytes")
-                            manifests = list(backups.glob("auto-prune-*/backup/BACKUP_COMPLETE.json"))
+                            manifest_glob = "lsm-prune-*/backup/generation.json" if lsm else "auto-prune-*/backup/BACKUP_COMPLETE.json"
+                            manifests = list(backups.glob(manifest_glob))
                             assert len(manifests) == 1, manifests
                         finally:
                             if client:
@@ -157,13 +183,29 @@ def main():
                             client = wait(lambda: Electrum(managed_port), timeout=120)
                             wait(lambda: client.request("server.health")["ready"], timeout=120)
                             time.sleep(3)
-                            assert len(list(backups.glob("auto-prune-*/backup/BACKUP_COMPLETE.json"))) == 1
+                            assert len(list(backups.glob(manifest_glob))) == 1
                         finally:
                             if client:
                                 client.close()
                             restarted.terminate()
                             assert restarted.wait(timeout=150) == 0, (root / "automatic-restart.log").read_text()
                     print("PASS AUTOMATIC PRUNING: owned supervisor, verified backup, real Core deletion, local witness TX/Merkle, restart cursor", flush=True)
+                    if lsm:
+                        # Fault injection only in this disposable owned generation:
+                        # retain the durable request, omit its completion record.
+                        journal = root / "archive/regtest/prune-audit.jsonl"
+                        records = journal.read_bytes().splitlines(keepends=True)
+                        assert len(records) == 2 and json.loads(records[0])["actual"] is None
+                        journal.write_bytes(records[0])
+                        with journal.open("rb") as file:
+                            os.fsync(file.fileno())
+                        assert not cookie.exists()
+                        rejected = subprocess.run(managed.args, capture_output=True, text=True, timeout=150)
+                        assert rejected.returncode != 0 and "unfinished LSM prune audit" in rejected.stderr
+                        assert not cookie.exists(), "Core was started despite unfinished prune audit"
+                        assert journal.read_bytes() == records[0]
+                        assert len(list(backups.glob(manifest_glob))) == 1
+                        print("PASS LSM unfinished prune intent blocks supervisor before Core startup; journal and backup preserved", flush=True)
                     return
                 result = run("prune", *online, "--confirm", "--backup-dir", str(root / "before-prune"), "--min-free-mib", "8")
                 assert result["actual"] >= 10, result

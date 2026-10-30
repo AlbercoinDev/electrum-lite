@@ -1,5 +1,7 @@
 # Servidor Electrum LSM — 2026-10-30
 
+Continuación: [supervisor y poda real LSM con Core aislado](lsm-maintenance-status.md).
+
 [CONFIRMADO] `lsm-serve`, disponible en Linux con la feature `experimental-lsm`,
 integra sincronizador, snapshots y mempool del nuevo motor. No es el motor
 entregado por el instalador público y no administra todavía Bitcoin Core.

@@ -1,6 +1,7 @@
 //! Experimental Bitcoin/LSM generation coordinator, deliberately not wired to CLI.
 //! Mainnet pruning and runtime backend selection are NOT enabled by this module.
 pub mod kv;
+pub mod maintenance;
 pub mod mempool;
 pub mod query;
 #[cfg(target_os = "linux")]
@@ -635,10 +636,11 @@ impl BitcoinStore {
         fs::create_dir(&archive)?;
         for entry in fs::read_dir(self.archive.directory())? {
             let entry = entry?;
-            if entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "elb")
+            if entry.file_name() == "prune-audit.jsonl"
+                || entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "elb")
             {
                 ensure!(entry.file_type()?.is_file(), "archive symlink refused");
                 let target = archive.join(entry.file_name());
