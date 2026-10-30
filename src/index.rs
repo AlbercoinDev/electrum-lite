@@ -33,6 +33,61 @@ fn write_options() -> WriteOptions {
     w
 }
 impl Index {
+    /// Create an immutable, NEW checkpoint while the sole index writer is held.
+    /// Before pruning it must be audited and compared against the live index.
+    pub fn create_snapshot(&self, path: &Path) -> Result<(u32, bitcoin::BlockHash)> {
+        ensure!(
+            std::fs::symlink_metadata(path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "snapshot destination must be NEW"
+        );
+        let height = self.tip()?.context("empty index")?;
+        let hash = self.header(height)?.block_hash();
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)?;
+        std::fs::File::open(path)?.sync_all()?;
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            })?
+            .sync_all()?;
+        }
+        Ok((height, hash))
+    }
+
+    /// Compare an independently audited checkpoint with the currently locked
+    /// index before a prepared prune. This is not itself prune authorization:
+    /// the caller must also verify Core's tip, network and mempool immediately
+    /// before invoking the pruning RPC, and preserve durable prune intent.
+    pub fn verify_snapshot_matches(&self, path: &Path) -> Result<(u32, bitcoin::BlockHash)> {
+        ensure!(
+            std::fs::symlink_metadata(path)?.file_type().is_dir(),
+            "snapshot must be a real directory"
+        );
+        let snapshot = DB::open_for_read_only(&Options::default(), path, false)?;
+        let identity = format!("thin-v1:{}", self.network);
+        ensure!(
+            snapshot.get(b"identity")?.as_deref() == Some(identity.as_bytes()),
+            "snapshot network identity mismatch"
+        );
+        let height = self.tip()?.context("empty live index")?;
+        ensure!(
+            snapshot.get(b"tip")?.as_deref() == Some(height.to_be_bytes().as_slice()),
+            "snapshot tip differs from live index"
+        );
+        let mut live = self.db.iterator(IteratorMode::Start);
+        let mut frozen = snapshot.iterator(IteratorMode::Start);
+        loop {
+            match (live.next(), frozen.next()) {
+                (None, None) => break,
+                (Some(a), Some(b)) => ensure!(a? == b?, "snapshot state differs from live index"),
+                _ => anyhow::bail!("snapshot and live index key count differ"),
+            }
+        }
+        Ok((height, self.header(height)?.block_hash()))
+    }
+
     /// Create a NEW checkpoint from an independently verified audit prefix.
     ///
     /// This only checks the local network and ancestor header. The caller must
@@ -690,6 +745,41 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_snapshot_rejects_tip_or_state_changes() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "el-snapshot-check-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let live = Index::open(&root.join("live"), Network::Regtest)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        live.commit(0, &genesis)?;
+        let snapshot = root.join("snapshot");
+        live.backup(&snapshot)?;
+        assert_eq!(
+            live.verify_snapshot_matches(&snapshot)?,
+            (0, genesis.block_hash())
+        );
+        // A change to an arbitrary row at the same tip must also be detected.
+        live.db.put(b"unexpected", b"changed")?;
+        assert!(live.verify_snapshot_matches(&snapshot).is_err());
+        live.db.delete(b"unexpected")?;
+        assert!(live.verify_snapshot_matches(&snapshot).is_ok());
+        let mut next = genesis.clone();
+        next.header.prev_blockhash = genesis.block_hash();
+        next.header.time += 1;
+        live.commit(1, &next)?;
+        assert!(live.verify_snapshot_matches(&snapshot).is_err());
+        assert!(snapshot.exists(), "rejected snapshots must be preserved");
+        drop(live);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn incremental_audit_replays_suffix_and_handles_reorg_and_rpc_failure() -> Result<()> {
         use std::io::{Read, Write};

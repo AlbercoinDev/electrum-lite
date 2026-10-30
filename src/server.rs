@@ -8,8 +8,9 @@ use bitcoin::{
 };
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -224,16 +225,153 @@ pub fn dispatch(
 struct Request {
     value: Value,
     reply: mpsc::SyncSender<Value>,
+    internal: bool,
 }
+
+fn snapshot_destination(path: &Path, allowed: &Path) -> Result<u32> {
+    let parent = path.parent().context("snapshot parent missing")?;
+    ensure!(
+        std::fs::canonicalize(parent)? == allowed,
+        "snapshot must be inside the supervisor directory"
+    );
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("invalid snapshot name")?;
+    let suffix = name
+        .strip_prefix("snapshot-")
+        .context("invalid snapshot name")?;
+    let (height, stamp) = suffix.split_once('-').context("invalid snapshot name")?;
+    let parsed_height = height.parse::<u32>()?;
+    stamp.parse::<u128>()?;
+    ensure!(
+        height.bytes().all(|b| b.is_ascii_digit()) && stamp.bytes().all(|b| b.is_ascii_digit()),
+        "invalid snapshot name"
+    );
+    ensure!(
+        std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "snapshot destination must be NEW"
+    );
+    Ok(parsed_height)
+}
+
+#[cfg(unix)]
+struct PrivateControl {
+    listener: std::os::unix::net::UnixListener,
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl PrivateControl {
+    fn bind(path: PathBuf) -> Result<(Self, PathBuf)> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let private = path
+            .parent()
+            .context("control socket needs a private parent")?;
+        let meta = std::fs::symlink_metadata(private)?;
+        ensure!(
+            meta.file_type().is_dir() && meta.mode() & 0o077 == 0,
+            "control directory must be a real private directory"
+        );
+        let allowed = private.parent().context("supervisor directory missing")?;
+        ensure!(
+            std::fs::symlink_metadata(allowed)?.file_type().is_dir(),
+            "supervisor directory must be real"
+        );
+        let allowed = std::fs::canonicalize(allowed)?;
+        ensure!(
+            std::fs::symlink_metadata(&path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "control socket path must be NEW"
+        );
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        let meta = std::fs::symlink_metadata(&path)?;
+        Ok((
+            Self {
+                listener,
+                path,
+                device: meta.dev(),
+                inode: meta.ino(),
+            },
+            allowed,
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PrivateControl {
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if std::fs::symlink_metadata(&self.path).is_ok_and(|m| {
+            m.file_type().is_socket() && m.dev() == self.device && m.ino() == self.inode
+        }) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn private_request(
+    mut stream: std::os::unix::net::UnixStream,
+    tx: mpsc::SyncSender<Request>,
+) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut line = Vec::new();
+    BufReader::new(stream.try_clone()?)
+        .take(4097)
+        .read_until(b'\n', &mut line)?;
+    ensure!(
+        line.len() <= 4096 && line.ends_with(b"\n"),
+        "invalid private request"
+    );
+    let value: Value = serde_json::from_slice(&line)?;
+    ensure!(
+        value["method"] == "snapshot" && value["path"].is_string(),
+        "invalid private request"
+    );
+    let (reply, rx) = mpsc::sync_channel(1);
+    tx.try_send(Request {
+        value,
+        reply,
+        internal: true,
+    })
+    .context("index worker queue full")?;
+    let result = rx.recv_timeout(Duration::from_secs(120))?;
+    serde_json::to_writer(&mut stream, &result)?;
+    stream.write_all(b"\n")?;
+    Ok(())
+}
+
 pub fn serve(
     index: Index,
     core: Core,
     listen: SocketAddr,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    control_socket: Option<PathBuf>,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
     let (tx, rx) = mpsc::sync_channel::<Request>(64);
+    #[cfg(unix)]
+    let (control, snapshot_dir) = if let Some(path) = control_socket {
+        let (control, allowed) = PrivateControl::bind(path)?;
+        (Some(control), Some(allowed))
+    } else {
+        (None, None)
+    };
+    #[cfg(not(unix))]
+    let snapshot_dir: Option<PathBuf> = {
+        ensure!(
+            control_socket.is_none(),
+            "private supervisor control requires Unix"
+        );
+        None
+    };
     let health = std::sync::Arc::new(std::sync::Mutex::new(
         json!({"pid":std::process::id(),"ready":false,"indexed_height":index.tip()?,"network":index.network.to_string(),"transport":if index.fetcher.proxy.is_some(){"socks5"}else{"direct"},"mempool_transactions":0,"experimental":true}),
     ));
@@ -296,6 +434,37 @@ pub fn serve(
                     let method = r.value["method"].as_str().unwrap_or("");
                     let params = &r.value["params"];
                     let result = (|| {
+                        if r.internal {
+                            ensure!(method == "snapshot", "unsupported private method");
+                            ensure!(
+                                ready && mempool.raw.is_empty(),
+                                "snapshot requires a ready index and empty mempool"
+                            );
+                            let dir = snapshot_dir
+                                .as_ref()
+                                .context("private control unavailable")?;
+                            let path =
+                                PathBuf::from(r.value["path"].as_str().context("snapshot path")?);
+                            let expected_height = snapshot_destination(&path, dir)?;
+                            let height = index.tip()?.context("empty index")?;
+                            ensure!(
+                                height == expected_height,
+                                "snapshot requested at a different height"
+                            );
+                            ensure!(
+                                core.call("getbestblockhash", json!([]))?
+                                    == index.header(height)?.block_hash().to_string(),
+                                "Core tip changed before snapshot"
+                            );
+                            ensure!(
+                                core.call("getrawmempool", json!([]))?
+                                    .as_array()
+                                    .is_some_and(|x| x.is_empty()),
+                                "Core mempool changed before snapshot"
+                            );
+                            let (height, hash) = index.create_snapshot(&path)?;
+                            return Ok(json!({"height":height,"hash":hash.to_string()}));
+                        }
                         if method == "server.health" {
                             return Ok(
                                 json!({"pid":std::process::id(),"ready":ready,"indexed_height":index.tip()?,"network":index.network.to_string(),"transport":if index.fetcher.proxy.is_some(){"socks5"}else{"direct"},"mempool_transactions":mempool.raw.len(),"experimental":true}),
@@ -347,7 +516,28 @@ pub fn serve(
         crate::i18n::text("experimental thin-v1", "thin-v1 experimental")
     );
     let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[cfg(unix)]
+    let private_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        #[cfg(unix)]
+        if let Some(control) = &control {
+            match control.listener.accept() {
+                Ok((stream, _)) => {
+                    if !private_active.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let flag = private_active.clone();
+                        let tx = tx.clone();
+                        thread::spawn(move || {
+                            if let Err(e) = private_request(stream, tx) {
+                                eprintln!("private control request failed: {e:#}");
+                            }
+                            flag.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let stream = match listener.accept() {
             Ok((s, _)) => s,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -393,7 +583,11 @@ fn connection(
     let mut last_header = Value::Null;
     fn ask(tx: &mpsc::SyncSender<Request>, v: Value) -> Result<Value> {
         let (a, b) = mpsc::sync_channel(1);
-        tx.send(Request { value: v, reply: a })?;
+        tx.send(Request {
+            value: v,
+            reply: a,
+            internal: false,
+        })?;
         Ok(b.recv_timeout(Duration::from_secs(120))?)
     }
     loop {

@@ -42,6 +42,19 @@ con un error del entorno y no tiene resultado concluyente. Electrum sigue deteni
 durante auditoría y poda, y se reinicia antes de limpiar generaciones antiguas;
 este nuevo orden no se ha probado con una poda física de extremo a extremo.
 
+Trabajo local posterior: el smoke regtest sencillo creó un checkpoint mediante
+un socket Unix en un directorio privado, rechazó un destino inválido y uno ya
+existente, comprobó que el método no está expuesto por Electrum TCP y confirmó que
+`server.ping` respondía después. El supervisor aún no utiliza este canal para
+auditar ni podar; no se ha medido disponibilidad durante checkpoints grandes.
+Otra prueba sencilla mantuvo bloqueada una auditoría de una copia de ese
+checkpoint y comprobó que el servidor Electrum vivo respondió a `server.ping`.
+La conexión automática del supervisor a ese flujo sigue pendiente.
+
+Un regtest dedicado desechable arrancó con `--core-dbcache-mib 256`; se verificó
+en los argumentos del proceso Core `-dbcache=256` y se detuvo limpiamente. Este
+ajuste limita esa caché de Core, no la RAM total, y no es una medición de velocidad.
+
 ## Build
 
 Se ejecutó sobre el árbol nuevo:

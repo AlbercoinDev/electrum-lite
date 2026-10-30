@@ -47,6 +47,9 @@ struct Args {
     bitcoind: PathBuf,
     #[arg(long, default_value_t = 18444)]
     core_p2p_port: u16,
+    /// Dedicated Bitcoin Core database cache in MiB; does not limit total RAM.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(64..=1024))]
+    core_dbcache_mib: u32,
     #[arg(long)]
     confirm_dedicated: bool,
     #[arg(long)]
@@ -57,6 +60,9 @@ struct Args {
     resume_lag: u32,
     #[arg(long, default_value_t = 1)]
     prune_interval: u32,
+    /// Private supervisor control socket; never exposed over Electrum TCP.
+    #[arg(long, hide = true)]
+    control_socket: Option<PathBuf>,
     #[arg(value_parser=["sync","serve","managed-serve","health","backup","audit","prune"], default_value="serve")]
     command: String,
 }
@@ -78,6 +84,9 @@ fn main() -> Result<()> {
                 a.help("Directorio nuevo para Core dedicado")
             })
             .mut_arg("bitcoind", |a| a.help("Ruta al ejecutable de Bitcoin Core"))
+            .mut_arg("core_dbcache_mib", |a| {
+                a.help("Caché de base de datos de Core en MiB; no limita la RAM total")
+            })
             .mut_arg("confirm_dedicated", |a| {
                 a.help("Confirmar uso de un Core dedicado")
             })
@@ -143,6 +152,10 @@ fn main() -> Result<()> {
     };
     if a.command == "managed-serve" {
         ensure!(
+            a.control_socket.is_none(),
+            "managed-serve owns its private control socket"
+        );
+        ensure!(
             a.confirm_dedicated,
             "managed-serve requires --confirm-dedicated; never adopts an existing Core"
         );
@@ -161,6 +174,7 @@ fn main() -> Result<()> {
                 core_rpc: a.core_rpc,
                 listen: a.listen,
                 p2p_port: a.core_p2p_port,
+                core_dbcache_mib: a.core_dbcache_mib,
                 high: a.pause_lag,
                 low: a.resume_lag,
                 auto_prune: a.auto_prune,
@@ -172,6 +186,10 @@ fn main() -> Result<()> {
         );
     }
     ensure!(!a.auto_prune, "--auto-prune only applies to managed-serve");
+    ensure!(
+        a.control_socket.is_none() || a.command == "serve",
+        "private control socket only applies to serve"
+    );
     let mut index = Index::open(&root.join("index"), network)?;
     index.fetcher.peers = a.block_peer;
     index.fetcher.proxy = proxy;
@@ -316,7 +334,7 @@ fn main() -> Result<()> {
                 a.listen.ip().is_loopback() || a.allow_lan,
                 "LAN requires --allow-lan; prefer SSH/WireGuard"
             );
-            electrum_lite::server::serve(index, core, a.listen, stop)?;
+            electrum_lite::server::serve(index, core, a.listen, stop, a.control_socket)?;
         }
     }
     Ok(())

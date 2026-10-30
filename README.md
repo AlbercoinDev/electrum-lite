@@ -220,6 +220,12 @@ Para una prueba sin red pública cambia a `--network regtest`; los nodos regtest
 gestionados no buscan peers automáticamente. Puedes usar `bitcoin-cli` con esa
 ruta y puerto para crear una cartera minera y generar monedas de prueba.
 
+El Core gestionado utiliza por defecto una caché de base de datos de 64 MiB.
+Si la máquina tiene RAM suficiente, se puede añadir antes de `managed-serve`
+`--core-dbcache-mib 256` (rango permitido 64–1024). Es una configuración de
+Core, no un límite de memoria total: Lite, Core y el sistema usan RAM adicional.
+No se ha medido si acelera esta carga de trabajo ni garantiza eliminar pausas.
+
 **Coordinación:** si el índice se retrasa 200 bloques, pausa P2P de su propio Core;
 lo reanuda al bajar a 20 (`--pause-lag` / `--resume-lag`). Core siempre usa
 `prune=1`, nunca poda por su cuenta. Con `--auto-prune`, por defecto comprueba

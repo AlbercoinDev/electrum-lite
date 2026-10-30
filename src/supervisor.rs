@@ -37,6 +37,7 @@ pub struct Config {
     pub core_rpc: String,
     pub listen: SocketAddr,
     pub p2p_port: u16,
+    pub core_dbcache_mib: u32,
     pub high: u32,
     pub low: u32,
     pub auto_prune: bool,
@@ -201,6 +202,10 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         "invalid supervisor thresholds"
     );
     ensure!(
+        (64..=1024).contains(&c.core_dbcache_mib),
+        "Core database cache must be 64..=1024 MiB"
+    );
+    ensure!(
         !c.auto_prune || c.network != "mainnet",
         "mainnet automatic pruning is blocked"
     );
@@ -296,10 +301,10 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             "-nosettings",
             "-prune=1",
             "-txindex=0",
-            "-dbcache=64",
             "-listenonion=0",
             "-discover=0",
         ])
+        .arg(format!("-dbcache={}", c.core_dbcache_mib))
         .arg(format!("-rpcport={}", rpc_address.port()))
         .arg(format!("-port={}", c.p2p_port))
         .arg(format!("-bind=127.0.0.1:{}", c.p2p_port))
@@ -662,6 +667,7 @@ mod tests {
             core_rpc: "http://127.0.0.1:18443".to_owned(),
             listen: "127.0.0.1:50001".parse().expect("address"),
             p2p_port: 18444,
+            core_dbcache_mib: 64,
             high: 200,
             low: 20,
             auto_prune: false,
@@ -697,6 +703,18 @@ mod tests {
             .to_string()
             .contains("mainnet automatic pruning is blocked"));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn core_cache_bounds_are_checked_before_node_start() {
+        let root = std::env::temp_dir().join(format!("el-cache-gate-{}", std::process::id()));
+        for cache in [0, 63, 1025, u32::MAX] {
+            let mut c = config(&root);
+            c.core_dbcache_mib = cache;
+            let error = run(c, Arc::new(AtomicBool::new(false))).unwrap_err();
+            assert!(error.to_string().contains("Core database cache"));
+            assert!(!root.exists());
+        }
     }
 
     #[test]

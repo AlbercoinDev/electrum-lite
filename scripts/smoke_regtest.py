@@ -6,6 +6,7 @@ import http.server
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -64,12 +65,19 @@ def main():
             except json.JSONDecodeError:
                 return c.stdout.strip()
         hide_blocks = False
+        hold_audit = threading.Event()
+        audit_waiting = threading.Event()
+        release_audit = threading.Event()
         class Proxy(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
             def do_POST(self):
                 data = self.rfile.read(int(self.headers["Content-Length"]))
                 message = json.loads(data)
+                if hold_audit.is_set() and message["method"] == "getblock":
+                    audit_waiting.set()
+                    if not release_audit.wait(timeout=20):
+                        raise RuntimeError("audit test gate timed out")
                 if hide_blocks and message["method"] == "getblock":
                     result = json.dumps({"id": 1, "result": None, "error": {"code": -1, "message": "simulated pruned block"}}).encode()
                 else:
@@ -83,6 +91,10 @@ def main():
         proxy = http.server.ThreadingHTTPServer(("127.0.0.1", proxyport), Proxy)
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
         command = [binary, "--network", "regtest", "--data-dir", str(root / "lite"), "--core-cookie", str(core_dir / "regtest" / ".cookie"), "--core-rpc", f"http://127.0.0.1:{proxyport}", "--listen", f"127.0.0.1:{port}", "--block-peer", f"127.0.0.1:{p2pport}"]
+        private = root / "private"
+        private.mkdir(mode=0o700)
+        control = private / "control.sock"
+        server_command = command + ["--control-socket", str(control)]
         counter = 0
         def electrum(method, *params):
             nonlocal counter
@@ -103,9 +115,47 @@ def main():
             address = cli("getnewaddress")
             script = bytes.fromhex(cli("getaddressinfo", address)["scriptPubKey"])
             sh = hashlib.sha256(script).digest()[::-1].hex()
-            server = launch(command + ["serve"], "server")
+            server = launch(server_command + ["serve"], "server")
             wait(lambda: electrum("blockchain.headers.subscribe")["height"] == 101, "initial sync")
             assert electrum("server.version", "smoke", "1.4")[1] == "1.4"
+            # The control capability is a private Unix socket, not an Electrum method.
+            try:
+                electrum("snapshot", str(root / "snapshot-101-1"))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("private snapshot exposed over Electrum")
+            def snapshot(path):
+                with socket.socket(socket.AF_UNIX) as s:
+                    s.settimeout(30)
+                    s.connect(str(control))
+                    s.sendall(json.dumps({"method":"snapshot", "path":str(path)}).encode() + b"\n")
+                    return json.loads(s.makefile("rb").readline())
+            denied = snapshot(root / "not-a-snapshot")
+            assert denied.get("error") and not (root / "not-a-snapshot").exists()
+            shot = root / "snapshot-101-1"
+            result = snapshot(shot)
+            assert result.get("error") is None and result["result"]["height"] == 101 and shot.is_dir()
+            assert snapshot(shot).get("error")
+            assert electrum("server.ping") is None
+            print("PASS: private checkpoint without overwrite or public control method; Electrum responds afterward", flush=True)
+            # Audit an independent copy of the checkpoint. Hold the audit at its
+            # first block RPC to prove the live Electrum worker can answer while
+            # that separate audit process is actively in progress.
+            snapshot_root = root / "snapshot-test-root"
+            (snapshot_root / "regtest").mkdir(parents=True)
+            shutil.copytree(shot, snapshot_root / "regtest/index")
+            audit_command = command.copy()
+            audit_command[audit_command.index("--data-dir") + 1] = str(snapshot_root)
+            hold_audit.set()
+            audit_process = launch(audit_command + ["--audit-dir", str(root / "online-audit"), "audit"], "online-audit")
+            assert audit_waiting.wait(timeout=20), "audit did not start reading blocks"
+            assert audit_process.poll() is None
+            assert electrum("server.ping") is None
+            release_audit.set()
+            hold_audit.clear()
+            assert audit_process.wait(timeout=60) == 0
+            print("PASS: Electrum answered while a separate snapshot audit was in progress", flush=True)
             with socket.create_connection(("127.0.0.1", port), timeout=5) as batch:
                 batch.sendall(json.dumps([{"id": 1, "method": "server.version", "params": ["smoke", ["1.4", "1.4.5"]]}, {"id": 2, "method": "server.ping", "params": []}]).encode() + b"\n")
                 replies = json.loads(batch.makefile("rb").readline())
@@ -179,7 +229,7 @@ def main():
             wait(lambda: electrum("blockchain.headers.subscribe")["height"] == 103, "new branch")
             server.terminate()
             server.wait(timeout=10)
-            server = launch(command + ["serve"], "restart")
+            server = launch(server_command + ["serve"], "restart")
             wait(lambda: electrum("blockchain.headers.subscribe")["height"] == 103, "restart")
             assert electrum("blockchain.scripthash.get_balance", sh)["confirmed"] == 100_000_000
             server.terminate()
@@ -195,6 +245,7 @@ def main():
                 print(f"--- {f.name} ---\n{f.read()[-4000:]}")
             raise
         finally:
+            release_audit.set()
             proxy.shutdown()
             for child in reversed(processes):
                 if child.poll() is None:
