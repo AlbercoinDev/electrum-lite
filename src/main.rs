@@ -55,7 +55,7 @@ struct Args {
     pause_lag: u32,
     #[arg(long, default_value_t = 20)]
     resume_lag: u32,
-    #[arg(long, default_value_t = 2016)]
+    #[arg(long, default_value_t = 1)]
     prune_interval: u32,
     #[arg(value_parser=["sync","serve","managed-serve","health","backup","audit","prune"], default_value="serve")]
     command: String,
@@ -225,19 +225,23 @@ fn main() -> Result<()> {
             let audit = root.join("prune-pending");
             let completed = root.join(format!("prune-complete-{height}"));
             ensure!(
-                !audit.exists(),
+                std::fs::symlink_metadata(&audit)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
                 "unfinished prune: inspect Core and preserve audit before recovery"
             );
             ensure!(
-                !completed.exists(),
+                std::fs::symlink_metadata(&completed)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
                 "this height already has a completed prune record"
             );
-            index.audit_with_cancel(
+            let base = electrum_lite::retention::verified_audit_base(&root, network, height)?;
+            index.audit_with_verified_base(
                 &core,
                 a.audit_dir
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("--audit-dir NEW is required before pruning"))?,
                 &stop,
+                base.as_deref(),
             )?;
             index.backup(
                 a.backup_dir

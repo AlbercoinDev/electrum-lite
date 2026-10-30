@@ -222,11 +222,24 @@ ruta y puerto para crear una cartera minera y generar monedas de prueba.
 
 **Coordinación:** si el índice se retrasa 200 bloques, pausa P2P de su propio Core;
 lo reanuda al bajar a 20 (`--pause-lag` / `--resume-lag`). Core siempre usa
-`prune=1`, nunca poda por su cuenta. Con `--auto-prune`, cada 2016 bloques
-(`--prune-interval`) y estando al día, detiene Electrum, desactiva P2P, ejecuta la
+`prune=1`, nunca poda por su cuenta. Con `--auto-prune`, por defecto comprueba
+tras cada bloque nuevo (`--prune-interval`, valor predeterminado 1) y, estando
+al día y con un archivo candidato, detiene Electrum, desactiva P2P, ejecuta la
 misma auditoría/backup/poda que el comando manual, y solo reanuda tras éxito.
 Con los parámetros normales de Core en las redes de prueba, no intenta podar
 antes de altura **1000**; no usa `-fastprune` ni elude esa protección.
+Antes del mantenimiento, el supervisor inspecciona en segundo plano las cabeceras
+de archivos `blk` cerrados, comprueba que cada archivo no haya cambiado y pide a
+Core las alturas de todas sus cabeceras. Omite la auditoría si no encuentra un
+archivo por debajo del margen de 288 bloques. La inspección es conservadora: Core
+sigue siendo la autoridad sobre la poda y puede conservar archivos por otras
+razones. Si la inspección falla, se aplaza y reintenta; no se eliminan datos.
+Si Core no borra ningún archivo, los candidatos sin cambios se posponen durante
+144 bloques o 15 minutos; el siguiente intento requiere además un bloque nuevo.
+Este aplazamiento se conserva solo mientras el supervisor está en ejecución.
+Sigue aplicándose el intervalo configurado. Esta detección es experimental y
+ha superado una prueba de poda física regtest desechable durante IBD; no se ha
+validado una sincronización Signet completa.
 SIGINT/SIGTERM cierran Electrum, sincronizan su WAL y detienen el Core propio.
 Un fallo de mantenimiento detiene Core y no reanuda automáticamente.
 Una terminación no interceptable del gestor (`SIGKILL`/fallo del sistema) no puede
@@ -235,13 +248,27 @@ activo. Nunca adopta ese proceso automáticamente; `prune=1` impide que Core pod
 por su cuenta sin el gestor.
 
 **No es un límite de 550 MiB.** Core conserva al menos 288 bloques y archivos
-completos; backups y auditorías también consumen espacio. Cada mantenimiento
-conserva una generación nueva de auditoría y backup en `RED/supervisor/`;
-no se borran automáticamente. Vigila disco y conserva copias externas.
-La auditoría actual es completa y costosa; no es aún el mantenimiento incremental
-de mínimo espacio. Para posteriores auditorías pueden necesitarse fuentes
-archivadoras: el supervisor conserva candidatos conocidos antes de apagar P2P,
-o puedes indicarlos explícitamente con `--block-peer host:puerto`.
+completos; backups y auditorías también consumen espacio. Tras cada mantenimiento
+automático exitoso, el supervisor verifica la nueva auditoría y backup y elimina
+parejas anteriores identificadas por registros completos propios en
+`RED/supervisor/`. Conserva la nueva pareja, registros, generaciones incompletas,
+contenido desconocido y enlaces simbólicos; si hay dudas omite la limpieza.
+Una interrupción puede dejar una pareja antigua parcialmente eliminada. La limpieza
+no se ejecuta si hay `prune-pending`. Estos checkpoints pueden compartir archivos
+en el mismo disco y no sustituyen copias externas. Vigila el espacio disponible.
+La primera auditoría es completa. En podas posteriores puede reutilizar una
+pareja anterior con registro completo, identidad y contenido verificados: comprueba
+su ascendencia contra el índice y Core, reproduce los bloques nuevos y compara
+todo el estado confirmado y los undo retenidos. Ante una rama distinta vuelve a
+la auditoría completa; un fallo RPC interrumpe el mantenimiento. La confianza
+en el prefijo procede de su auditoría anterior, no de volver a procesar todos sus
+bloques; los registros no son firmas contra manipulación. Esta auditoría incremental
+es experimental. Electrum sigue detenido durante la auditoría y la poda, pero se
+reinicia antes de verificar y limpiar las generaciones antiguas; la red de Core
+permanece pausada hasta que termine esa limpieza.
+Para auditorías completas pueden necesitarse fuentes archivadoras: el supervisor
+conserva candidatos conocidos antes de apagar P2P, o puedes indicarlos explícitamente
+con `--block-peer host:puerto`.
 La disponibilidad de esas fuentes no está garantizada.
 Los bloques recuperados solo para auditar se verifican y descartan en memoria:
 no llenan la caché persistente de consultas de cartera.

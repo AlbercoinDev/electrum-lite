@@ -33,6 +33,109 @@ fn write_options() -> WriteOptions {
     w
 }
 impl Index {
+    /// Create a NEW checkpoint from an independently verified audit prefix.
+    ///
+    /// This only checks the local network and ancestor header. The caller must
+    /// first verify the audit/backup pair and its durable completion record,
+    /// then compare the ancestor and final tip with Core before using this as
+    /// part of an incremental audit. Existing generations are never modified.
+    pub fn checkpoint_audit_prefix(&self, base: &Path, destination: &Path) -> Result<u32> {
+        ensure!(
+            std::fs::symlink_metadata(destination)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+            "audit checkpoint destination must be NEW"
+        );
+        ensure!(
+            std::fs::symlink_metadata(base)?.file_type().is_dir(),
+            "audit base must be a real directory"
+        );
+        let source = DB::open_for_read_only(&Options::default(), base, false)?;
+        let identity = format!("thin-v1:{}", self.network);
+        ensure!(
+            source.get(b"identity")?.as_deref() == Some(identity.as_bytes()),
+            "audit base network identity mismatch"
+        );
+        let value = source.get(b"tip")?.context("audit base tip missing")?;
+        let height = u32::from_be_bytes(
+            value
+                .as_slice()
+                .try_into()
+                .context("invalid audit base tip")?,
+        );
+        ensure!(
+            self.tip()?.is_some_and(|tip| height <= tip),
+            "audit base is ahead of current index"
+        );
+        let meta = source
+            .get(height_key(b'B', height))?
+            .context("audit base header missing")?;
+        ensure!(meta.len() >= 80, "invalid audit base header");
+        let header: bitcoin::block::Header = deserialize(&meta[..80])?;
+        ensure!(
+            header.block_hash() == self.header(height)?.block_hash(),
+            "audit base is not an ancestor of current index"
+        );
+        // A RocksDB checkpoint created from a read-only DB can omit WAL-backed
+        // state. Copy a stable closed generation byte-for-byte instead, then
+        // reopen the independent copy and compare every key (including undo).
+        std::fs::create_dir(destination)?;
+        let names = |dir: &Path| -> Result<Vec<std::ffi::OsString>> {
+            let mut result = Vec::new();
+            for item in std::fs::read_dir(dir)? {
+                result.push(item?.file_name());
+                ensure!(result.len() <= 100_000, "audit base file count limit");
+            }
+            result.sort();
+            Ok(result)
+        };
+        let entries = names(base)?;
+        ensure!(!entries.is_empty(), "empty audit base directory");
+        for name in &entries {
+            let src = base.join(name);
+            let expected = crate::core_blockfile::file_fingerprint(&src)?;
+            let mut input = std::fs::File::open(&src)?;
+            ensure!(
+                crate::core_blockfile::fingerprint(&input.metadata()?)? == expected,
+                "audit base file changed before copying"
+            );
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination.join(name))?;
+            std::io::copy(&mut input, &mut output)?;
+            output.sync_all()?;
+            ensure!(
+                crate::core_blockfile::fingerprint(&input.metadata()?)? == expected
+                    && crate::core_blockfile::file_fingerprint(&src)? == expected,
+                "audit base file changed during copying"
+            );
+        }
+        ensure!(
+            names(base)? == entries,
+            "audit base directory changed during copying"
+        );
+        std::fs::File::open(destination)?.sync_all()?;
+        if let Some(parent) = destination.parent() {
+            std::fs::File::open(if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            })?
+            .sync_all()?;
+        }
+        let copy = DB::open_for_read_only(&Options::default(), destination, false)?;
+        let mut original_rows = source.iterator(IteratorMode::Start);
+        let mut copied_rows = copy.iterator(IteratorMode::Start);
+        loop {
+            match (original_rows.next(), copied_rows.next()) {
+                (None, None) => break,
+                (Some(a), Some(b)) => ensure!(a? == b?, "audit prefix copy differs from source"),
+                _ => anyhow::bail!("audit prefix copy key count differs"),
+            }
+        }
+        Ok(height)
+    }
+
     /// Full semantic replay into a NEW generation. Source and audit copy are preserved.
     pub fn audit(&self, core: &Core, path: &Path) -> Result<()> {
         self.audit_with_cancel(core, path, &std::sync::atomic::AtomicBool::new(false))
@@ -43,10 +146,63 @@ impl Index {
         path: &Path,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
+        self.audit_with_verified_base(core, path, cancel, None)
+    }
+
+    /// Audit from a base selected by `retention::verified_audit_base`, or replay
+    /// fully if no base exists or its branch no longer matches. RPC failures and
+    /// inconsistent current Core/index state are errors, never fork evidence.
+    pub fn audit_with_verified_base(
+        &self,
+        core: &Core,
+        path: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+        base: Option<&Path>,
+    ) -> Result<()> {
         ensure!(!path.exists(), "audit destination must be NEW");
-        let other = Self::open(path, self.network)?;
         let tip = self.tip()?.context("empty index")?;
-        for h in 0..=tip {
+        let mut incremental = false;
+        let mut first = Some(0u32);
+        if let Some(base) = base {
+            ensure!(
+                std::fs::symlink_metadata(base)?.file_type().is_dir(),
+                "audit base must be a real directory"
+            );
+            let source = DB::open_for_read_only(&Options::default(), base, false)?;
+            let identity = format!("thin-v1:{}", self.network);
+            ensure!(
+                source.get(b"identity")?.as_deref() == Some(identity.as_bytes()),
+                "audit base network identity mismatch"
+            );
+            let value = source.get(b"tip")?.context("audit base tip missing")?;
+            let height = u32::from_be_bytes(
+                value
+                    .as_slice()
+                    .try_into()
+                    .context("invalid audit base tip")?,
+            );
+            if height <= tip {
+                let meta = source
+                    .get(height_key(b'B', height))?
+                    .context("audit base header missing")?;
+                ensure!(meta.len() >= 80, "invalid audit base header");
+                let base_header: bitcoin::block::Header = deserialize(&meta[..80])?;
+                let index_hash = self.header(height)?.block_hash();
+                if base_header.block_hash() == index_hash {
+                    ensure!(
+                        core.call("getblockhash", json!([height]))? == index_hash.to_string(),
+                        "audit base differs from Core"
+                    );
+                    drop(source);
+                    let copied_height = self.checkpoint_audit_prefix(base, path)?;
+                    ensure!(copied_height == height, "audit base changed during copying");
+                    incremental = true;
+                    first = if height < tip { Some(height + 1) } else { None };
+                }
+            }
+        }
+        let other = Self::open(path, self.network)?;
+        for h in first.into_iter().flat_map(|h| h..=tip) {
             ensure!(
                 !cancel.load(std::sync::atomic::Ordering::Relaxed),
                 "semantic audit interrupted; partial audit generation preserved"
@@ -88,14 +244,18 @@ impl Index {
                 "retained undo differs from semantic replay"
             );
         }
-        println!(
-            "{} {tip}: {}",
+        let message = if incremental {
+            crate::i18n::text(
+                "Incremental semantic replay verified at height",
+                "Reproducción semántica incremental verificada en la altura",
+            )
+        } else {
             crate::i18n::text(
                 "Semantic replay verified at height",
-                "Reproducción semántica verificada en la altura"
-            ),
-            path.display()
-        );
+                "Reproducción semántica verificada en la altura",
+            )
+        };
+        println!("{message} {tip}: {}", path.display());
         Ok(())
     }
     pub fn backup(&self, path: &Path) -> Result<()> {
@@ -530,6 +690,229 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn incremental_audit_replays_suffix_and_handles_reorg_and_rpc_failure() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "el-incremental-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let current = Index::open(&root.join("current"), Network::Regtest)?;
+        let base = Index::open(&root.join("base"), Network::Regtest)?;
+        let fork = Index::open(&root.join("fork"), Network::Regtest)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let mut one = genesis.clone();
+        one.header.prev_blockhash = genesis.block_hash();
+        one.header.time += 1;
+        let mut two = one.clone();
+        two.header.prev_blockhash = one.block_hash();
+        two.header.time += 1;
+        let mut alternative = one.clone();
+        alternative.header.time += 10;
+        for index in [&current, &base, &fork] {
+            index.commit(0, &genesis)?;
+        }
+        current.commit(1, &one)?;
+        current.commit(2, &two)?;
+        base.commit(1, &one)?;
+        fork.commit(1, &alternative)?;
+        drop(base);
+        drop(fork);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let fail_rpc = Arc::new(AtomicBool::new(false));
+        let blocks_read = Arc::new(AtomicUsize::new(0));
+        let stop_worker = stop_server.clone();
+        let fail_worker = fail_rpc.clone();
+        let reads_worker = blocks_read.clone();
+        let blocks = [genesis, one, two];
+        let worker = std::thread::spawn(move || -> Result<()> {
+            while !stop_worker.load(Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte)?;
+                    headers.push(byte[0]);
+                    ensure!(headers.len() < 16384, "test RPC headers too large");
+                }
+                let headers = std::str::from_utf8(&headers)?;
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then_some(value.trim())
+                    })
+                    .context("test RPC content length")?
+                    .parse()?;
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body)?;
+                let request: Value = serde_json::from_slice(&body)?;
+                let method = request["method"].as_str().context("test RPC method")?;
+                let mut error = Value::Null;
+                let result = match method {
+                    "getblockhash" if fail_worker.load(Ordering::Relaxed) => {
+                        error = json!({"code":-28});
+                        Value::Null
+                    }
+                    "getblockhash" => json!(blocks
+                        [request["params"][0].as_u64().context("height")? as usize]
+                        .block_hash()
+                        .to_string()),
+                    "getbestblockhash" => {
+                        json!(blocks.last().context("blocks")?.block_hash().to_string())
+                    }
+                    "getblock" => {
+                        reads_worker.fetch_add(1, Ordering::Relaxed);
+                        let hash = request["params"][0].as_str().context("hash")?;
+                        let block = blocks
+                            .iter()
+                            .find(|b| b.block_hash().to_string() == hash)
+                            .context("missing mock block")?;
+                        json!(hex::encode(serialize(block)))
+                    }
+                    _ => anyhow::bail!("unexpected mock RPC"),
+                };
+                let response =
+                    json!({"id":request["id"],"result":result,"error":error}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )?;
+            }
+            Ok(())
+        });
+        let cookie = root.join("cookie");
+        std::fs::write(&cookie, "user:password")?;
+        let core = Core::new(format!("http://{address}"), cookie)?;
+        let cancel = AtomicBool::new(false);
+        current.audit_with_verified_base(
+            &core,
+            &root.join("incremental"),
+            &cancel,
+            Some(&root.join("base")),
+        )?;
+        assert_eq!(
+            blocks_read.swap(0, Ordering::Relaxed),
+            1,
+            "only the new block should be fetched"
+        );
+        current.audit_with_verified_base(
+            &core,
+            &root.join("reorg-full"),
+            &cancel,
+            Some(&root.join("fork")),
+        )?;
+        assert_eq!(
+            blocks_read.swap(0, Ordering::Relaxed),
+            3,
+            "fork must replay from genesis"
+        );
+        fail_rpc.store(true, Ordering::Relaxed);
+        assert!(current
+            .audit_with_verified_base(
+                &core,
+                &root.join("rpc-failed"),
+                &cancel,
+                Some(&root.join("base"))
+            )
+            .is_err());
+        assert!(!root.join("rpc-failed").exists());
+        fail_rpc.store(false, Ordering::Relaxed);
+        {
+            let db = DB::open(&Options::default(), root.join("base"))?;
+            db.put(b"unexpected", b"corruption")?;
+        }
+        assert!(current
+            .audit_with_verified_base(
+                &core,
+                &root.join("corrupt"),
+                &cancel,
+                Some(&root.join("base"))
+            )
+            .is_err());
+        assert!(root.join("corrupt").exists(), "partial audit is preserved");
+        stop_server.store(true, Ordering::Relaxed);
+        worker.join().expect("mock RPC worker")?;
+        drop(current);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_audit_prefix_preserves_source_and_rejects_forks() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "el-audit-prefix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let base_path = root.join("base");
+        let current_path = root.join("current");
+        let fork_path = root.join("fork");
+        let copy_path = root.join("copy");
+        let current = Index::open(&current_path, Network::Regtest)?;
+        let base = Index::open(&base_path, Network::Regtest)?;
+        let fork = Index::open(&fork_path, Network::Regtest)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let mut first = genesis.clone();
+        first.header.prev_blockhash = genesis.block_hash();
+        first.header.time += 1;
+        let mut second = first.clone();
+        second.header.prev_blockhash = first.block_hash();
+        second.header.time += 1;
+        let mut alternative = first.clone();
+        alternative.header.time += 10;
+        for index in [&base, &current, &fork] {
+            index.commit(0, &genesis)?;
+        }
+        base.commit(1, &first)?;
+        current.commit(1, &first)?;
+        current.commit(2, &second)?;
+        fork.commit(1, &alternative)?;
+        drop(base);
+        drop(fork);
+        assert!(current
+            .checkpoint_audit_prefix(&fork_path, &root.join("bad-copy"))
+            .is_err());
+        assert!(!root.join("bad-copy").exists());
+        assert_eq!(current.checkpoint_audit_prefix(&base_path, &copy_path)?, 1);
+        assert!(current
+            .checkpoint_audit_prefix(&base_path, &copy_path)
+            .is_err());
+        let copied = Index::open(&copy_path, Network::Regtest)?;
+        assert_eq!(copied.tip()?, Some(1));
+        copied.commit(2, &second)?;
+        drop(copied);
+        assert_eq!(Index::open(&base_path, Network::Regtest)?.tip()?, Some(1));
+        drop(current);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn genesis_and_rewind() -> Result<()> {
         let path = std::env::temp_dir().join(format!("el-thin-test-{}", std::process::id()));

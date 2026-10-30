@@ -1,6 +1,19 @@
 //! Supervisor for an explicitly dedicated Core. Never adopts an existing process.
-use crate::core::Core;
+use crate::{core::Core, core_blockfile};
 use anyhow::{bail, ensure, Context, Result};
+use bitcoin::Network;
+
+// If Core did not delete anything (for example because of an internal prune
+// lock), retry unchanged candidates after a bounded delay, not on every block.
+const NO_DELETION_RETRY_BLOCKS: u32 = 144;
+const NO_DELETION_RETRY_TIME: Duration = Duration::from_secs(15 * 60);
+
+fn no_deletion_retry_due(same_file: bool, tip: u32, attempted_tip: u32, elapsed: Duration) -> bool {
+    !same_file
+        || tip < attempted_tip
+        || tip - attempted_tip >= NO_DELETION_RETRY_BLOCKS
+        || elapsed >= NO_DELETION_RETRY_TIME
+}
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -119,6 +132,22 @@ fn event(path: &Path, name: &str, extra: Value) -> Result<()> {
         "maintenance_complete" => {
             crate::i18n::text("maintenance completed", "mantenimiento finalizado")
         }
+        "retention_complete" => crate::i18n::text(
+            "old maintenance generations removed",
+            "generaciones antiguas de mantenimiento eliminadas",
+        ),
+        "retention_skipped" => crate::i18n::text(
+            "retention skipped; previous generations preserved",
+            "limpieza omitida; generaciones anteriores conservadas",
+        ),
+        "electrum_resuming" => crate::i18n::text(
+            "Electrum restarting before maintenance cleanup",
+            "Electrum reiniciándose antes de la limpieza de mantenimiento",
+        ),
+        "maintenance_waiting" => crate::i18n::text(
+            "maintenance postponed: no eligible closed block file found",
+            "mantenimiento aplazado: no hay archivos cerrados aptos para podar",
+        ),
         "shutdown" => crate::i18n::text("shutdown complete", "cierre completado"),
         _ => name,
     };
@@ -235,7 +264,8 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     }
     if c.auto_prune {
         ensure!(
-            !root.join("prune-pending").exists(),
+            fs::symlink_metadata(root.join("prune-pending"))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
             "unfinished prune blocks automatic startup; preserve audit and recover"
         );
     }
@@ -320,6 +350,23 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         }
     }
     let mut health_seen = false;
+    let mut waiting_for_files = false;
+    // Inspection is read-only and runs off the supervisor loop: Core may be
+    // downloading while header heights are resolved. Only stable, closed files
+    // are cached, and Core still decides whether deletion is permitted.
+    let mut inspected = std::collections::BTreeMap::new();
+    let mut unsuccessful = std::collections::BTreeMap::new();
+    let mut inspection: Option<
+        std::sync::mpsc::Receiver<Result<(String, core_blockfile::Fingerprint, u32)>>,
+    > = None;
+    let mut inspection_retry = Instant::now();
+    let network = match c.network.as_str() {
+        "mainnet" => Network::Bitcoin,
+        "signet" => Network::Signet,
+        "testnet4" => Network::Testnet4,
+        "regtest" => Network::Regtest,
+        _ => bail!("unsupported network"),
+    };
     let discover_sources = c.peers.is_empty();
     while !stop.load(Ordering::Relaxed) {
         node.live()?;
@@ -379,15 +426,112 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             paused = false;
             event(&events, "backpressure_resume", json!({"lag":lag}))?;
         }
-        if c.auto_prune
+        let maintenance_due = c.auto_prune
             && tip >= crate::TESTNET_PRUNE_MIN_HEIGHT
             && tip.saturating_sub(last_maintenance) >= c.prune_interval
             && lag == 0
             && state["ready"] == true
-            && state["mempool_transactions"] == 0
-        {
+            && state["mempool_transactions"] == 0;
+        if let Some(rx) = &inspection {
+            match rx.try_recv() {
+                Ok(Ok((name, fingerprint, height))) => {
+                    inspected.insert(name, (fingerprint, height));
+                    inspection = None;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("block-file inspection unavailable: {e:#}");
+                    inspection_retry = Instant::now() + Duration::from_secs(30);
+                    inspection = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("block-file inspection worker stopped unexpectedly");
+                    inspection_retry = Instant::now() + Duration::from_secs(30);
+                    inspection = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let block_dir = network_dir.join("blocks");
+        let mut eligible = Vec::new();
+        if maintenance_due {
+            let files = block_files(&block_dir)?;
+            // Core does not prune its current (highest numbered) file. Ignore
+            // all unexpected names rather than guessing their ordering.
+            let mut closed: Vec<_> = files
+                .keys()
+                .map(|name| {
+                    let digits = name
+                        .strip_prefix("blk")
+                        .and_then(|n| n.strip_suffix(".dat"))
+                        .context("invalid Core block filename")?;
+                    ensure!(
+                        digits.len() >= 5 && digits.bytes().all(|b| b.is_ascii_digit()),
+                        "invalid Core block filename"
+                    );
+                    Ok((digits.parse::<u32>()?, name.clone()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            closed.sort_unstable();
+            closed.pop(); // last/current file is never an eligible candidate
+            for (_, name) in &closed {
+                let path = block_dir.join(name);
+                let fp = core_blockfile::file_fingerprint(&path)?;
+                if let Some((old, height)) = inspected.get(name) {
+                    if *old == fp && core_blockfile::eligible(*height, tip) {
+                        let retry = unsuccessful.get(name).is_none_or(
+                            |(previous, previous_tip, previous_time): &(
+                                core_blockfile::Fingerprint,
+                                u32,
+                                Instant,
+                            )| {
+                                no_deletion_retry_due(
+                                    *previous == fp,
+                                    tip,
+                                    *previous_tip,
+                                    previous_time.elapsed(),
+                                )
+                            },
+                        );
+                        if retry {
+                            eligible.push((name.clone(), fp));
+                        }
+                    }
+                }
+            }
+            if eligible.is_empty() && inspection.is_none() && Instant::now() >= inspection_retry {
+                for (_, name) in &closed {
+                    let path = block_dir.join(name);
+                    let fp = core_blockfile::file_fingerprint(&path)?;
+                    if inspected.get(name).is_some_and(|(old, _)| *old == fp) {
+                        continue;
+                    }
+                    let key_path = block_dir.join("xor.dat");
+                    let name = name.clone();
+                    let core = core.clone();
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    thread::spawn(move || {
+                        let result = (|| {
+                            let key = core_blockfile::xor_key(&fs::read(key_path)?)?;
+                            let (fp, height) =
+                                core_blockfile::inspect_file(&path, network, &key, |hashes| {
+                                    core.header_heights(hashes)
+                                })?;
+                            Ok((name, fp, height))
+                        })();
+                        let _ = tx.send(result);
+                    });
+                    inspection = Some(rx);
+                    break;
+                }
+            }
+        }
+        if maintenance_due && eligible.is_empty() && !waiting_for_files {
+            event(&events, "maintenance_waiting", json!({"height":tip}))?;
+            waiting_for_files = true;
+        }
+        if maintenance_due && !eligible.is_empty() {
+            waiting_for_files = false;
             daemon.stop()?;
-            let block_dir = network_dir.join("blocks");
             let before = block_files(&block_dir)?;
             core.call("setnetworkactive", json!([false]))?;
             event(
@@ -403,9 +547,9 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             let mut pruning = OwnedChild::spawn(
                 c.base_command(&cookie)?
                     .args(["--confirm-prune", "--audit-dir"])
-                    .arg(audit)
+                    .arg(&audit)
                     .arg("--backup-dir")
-                    .arg(backup)
+                    .arg(&backup)
                     .arg("prune"),
             )?;
             let status = loop {
@@ -422,21 +566,51 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 status.success(),
                 "coordinated prune failed; Core will stop, no automatic resume"
             );
-            last_maintenance = tip;
             let after = block_files(&block_dir)?;
             let deleted: Vec<_> = before
                 .keys()
                 .filter(|name| !after.contains_key(*name))
                 .cloned()
                 .collect();
+            let post_info = core.call("getblockchaininfo", json!([]))?;
+            last_maintenance = post_info["blocks"]
+                .as_u64()
+                .context("Core height after prune")?
+                .try_into()?;
+            if deleted.is_empty() {
+                let now = Instant::now();
+                for (name, fp) in eligible {
+                    unsuccessful.insert(name, (fp, last_maintenance, now));
+                }
+            } else {
+                unsuccessful.clear();
+            }
             event(
                 &events,
                 "maintenance_complete",
-                json!({"height":tip,"pruneheight":core.call("getblockchaininfo",json!([]))?["pruneheight"],"deleted_block_files":deleted,"block_file_bytes_before":before.values().sum::<u64>(),"block_file_bytes_after":after.values().sum::<u64>()}),
+                json!({"height":tip,"pruneheight":post_info["pruneheight"],"deleted_block_files":deleted,"block_file_bytes_before":before.values().sum::<u64>(),"block_file_bytes_after":after.values().sum::<u64>()}),
             )?;
+            // The audit and prune child has exited and released the index lock.
+            // Retention only reads closed checkpoints, not the live index. Bring
+            // Electrum back before that potentially expensive verification while
+            // Core networking stays paused and no other maintenance can run.
             daemon = c.server(&cookie)?;
             started = Instant::now();
             health_seen = false;
+            event(&events, "electrum_resuming", json!({"networkactive":false}))?;
+            match crate::retention::clean(&root, &maintenance, &audit, &backup, network) {
+                Ok(count) => event(
+                    &events,
+                    "retention_complete",
+                    json!({"removed_pairs":count}),
+                )?,
+                Err(e) => event(
+                    &events,
+                    "retention_skipped",
+                    json!({"reason":format!("{e:#}")}),
+                )?,
+            }
+            daemon.live()?;
             core.call("setnetworkactive", json!([true]))?;
             paused = false;
         }
@@ -491,7 +665,7 @@ mod tests {
             high: 200,
             low: 20,
             auto_prune: false,
-            prune_interval: 2016,
+            prune_interval: 1,
             peers: Vec::new(),
             proxy: None,
         }
@@ -523,5 +697,35 @@ mod tests {
             .to_string()
             .contains("mainnet automatic pruning is blocked"));
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn no_deletion_retries_are_bounded() {
+        assert!(!no_deletion_retry_due(
+            true,
+            1001,
+            1000,
+            Duration::from_secs(10)
+        ));
+        assert!(!no_deletion_retry_due(
+            true,
+            1143,
+            1000,
+            Duration::from_secs(899)
+        ));
+        assert!(no_deletion_retry_due(
+            true,
+            1144,
+            1000,
+            Duration::from_secs(10)
+        ));
+        assert!(no_deletion_retry_due(
+            true,
+            1001,
+            1000,
+            Duration::from_secs(900)
+        ));
+        assert!(no_deletion_retry_due(false, 1001, 1000, Duration::ZERO));
+        assert!(no_deletion_retry_due(true, 999, 1000, Duration::ZERO));
     }
 }

@@ -1,9 +1,11 @@
 //! Original thin Electrum indexer. Experimental; Core owns consensus.
 pub mod core;
+pub mod core_blockfile;
 pub mod i18n;
 pub mod index;
 pub mod mempool;
 pub mod net;
+pub mod retention;
 pub mod server;
 pub mod supervisor;
 /// Conservative Core 31 default gate for Signet, Testnet4 and normal regtest.

@@ -3,6 +3,45 @@
 Fecha: 2026-10-30. Linux x86-64, Rust 1.99.1, Bitcoin Core 31.0.0.
 Pruebas de laboratorio offline, no sincronización pública ni GUI.
 
+## Detección de poda durante IBD — cambios locales posteriores
+
+`scripts/managed_prune_smoke.py --bitcoind /tmp/opencode/bitcoin-31.0/bin/bitcoind
+--electrum-lite target/release/electrum-lite --temp-dir target/prune-smoke`
+ejercitó dos nodos regtest desechables offline. Los bloques fueron generados con
+fechas antiguas y se comprobó `initialblockdownload=true` antes y después de la
+poda. La salida registró eliminación física de `blk00000.dat`, `pruneheight=743`
+y reducción de archivos `blk` de 435757599 a 301586404 bytes. Recuperó por P2P
+una transacción witness byte-exacta y verificó Merkle; un bloque más no provocó
+un mantenimiento redundante. Un `prune-pending` inyectado bloqueó el reinicio.
+No es una prueba de sincronización pública ni de todos los reorgs o fallos de I/O.
+
+Una repetición posterior usó el intervalo predeterminado de **1** bloque (sin
+pasar `--prune-interval`): durante IBD borró `blk00000.dat`, `pruneheight=743`,
+435757601 → 301586405 bytes; también pasaron recuperación witness, Merkle y la
+comprobación de no repetir mantenimiento con el siguiente archivo no elegible.
+La política de espera tras una poda sin archivos borrados se comprobó mediante
+un test unitario; esa rama aún no se ha provocado con un bloqueo real de Core.
+
+Una ejecución adicional incorporó la retención automática: tras la poda física
+durante IBD y la verificación de la pareja nueva, eliminó una pareja anterior
+completa sintética y conservó otra con un archivo ajeno y una auditoría huérfana.
+También verificó witness, Merkle y el bloqueo por `prune-pending`. Las pruebas
+unitarias cubrieron enlaces simbólicos, operación pendiente y discrepancia entre
+auditoría y backup. No se utilizaron ni eliminaron datos de un nodo existente.
+
+La preparación experimental de una base para auditoría incremental se probó
+copiando una generación cerrada, incluido su WAL, a un destino nuevo y comparando
+todas las claves. La prueba rechazó una rama divergente y confirmó que extender
+la copia no modificó la fuente. Un checkpoint de RocksDB creado desde una apertura
+de solo lectura perdió datos en la prueba y no se utiliza. La poda selecciona una
+base con registro completo y pareja coincidente, comprueba la ascendencia con Core,
+reproduce el tramo nuevo y compara el estado completo. Un test de RPC simulado
+verificó que solo se solicita el bloque nuevo, que una rama divergente provoca
+replay completo y que un error RPC aborta. La prueba física de dos podas terminó
+con un error del entorno y no tiene resultado concluyente. Electrum sigue detenido
+durante auditoría y poda, y se reinicia antes de limpiar generaciones antiguas;
+este nuevo orden no se ha probado con una poda física de extremo a extremo.
+
 ## Build
 
 Se ejecutó sobre el árbol nuevo:
