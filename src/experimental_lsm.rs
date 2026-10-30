@@ -2,6 +2,7 @@
 //! Mainnet pruning and runtime backend selection are NOT enabled by this module.
 pub mod kv;
 pub mod query;
+pub mod sync;
 
 use crate::{
     archive::{Archive, Location},
