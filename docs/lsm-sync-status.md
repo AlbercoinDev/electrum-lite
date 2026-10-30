@@ -1,5 +1,7 @@
 # Sincronizador LSM, 2026-10-30
 
+Continuación: [servidor LSM integrado, formato v3 y pruebas TCP](lsm-server-status.md).
+
 [CONFIRMADO] `src/experimental_lsm/sync.rs` conecta RPC autenticado a las
 generaciones y consultas del nuevo motor LSM. Feature `experimental-lsm`.
 El ensayo nuevo NO usa SQLite ni continúa el banco comparativo aparcado.

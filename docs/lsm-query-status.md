@@ -1,5 +1,8 @@
 # LSM: consultas de generación, 2026-10-30
 
+Continuación: [servidor LSM integrado](lsm-server-status.md). El formato actual
+experimental es v3; v2 y los pendientes de integración siguientes son históricos.
+
 [DECIDIDO] Continuar la nueva implementación LSM; el banco comparativo con el
 backend anterior queda aparcado a petición del usuario. La ejecución grande
 interrumpida no produjo informe y NO cuenta como evidencia de rendimiento.

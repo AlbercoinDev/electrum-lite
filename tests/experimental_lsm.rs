@@ -291,7 +291,7 @@ fn semantic_audit_rejects_index_only_corruption() -> Result<()> {
     lsm.commit(0, &blocks[0])?;
     lsm.commit(1, &blocks[1])?;
     drop(lsm);
-    let identity = format!("lite-bitcoin-lsm-v2:regtest:{}", Chain::Regtest.genesis());
+    let identity = format!("lite-bitcoin-lsm-v3:regtest:{}", Chain::Regtest.genesis());
     let mut db = electrum_lite::experimental_lsm::kv::Prototype::open(
         &root.join("regtest/lsm"),
         identity.as_bytes(),
@@ -563,5 +563,84 @@ fn lsm_old_experimental_format_is_rejected_without_adaptation() -> Result<()> {
     let untouched =
         electrum_lite::experimental_lsm::kv::Prototype::open(&path, old_identity.as_bytes())?;
     assert_eq!(untouched.generation()?, 0);
+    Ok(())
+}
+
+#[test]
+fn lsm_cumulative_caps_are_atomic_and_recovery_honors_configured_limits() -> Result<()> {
+    use electrum_lite::experimental_lsm::{Counts, IndexLimits};
+    let temporary = tempfile::tempdir()?;
+    let blocks = fixtures();
+    let root = temporary.path().join("limited");
+    let mut store = BitcoinStore::create_with_limits(
+        &root,
+        Chain::Regtest,
+        IndexLimits {
+            transactions: 1,
+            entries: 100,
+        },
+    )?;
+    store.commit(0, &blocks[0])?;
+    assert_eq!(
+        store.snapshot()?.counts()?,
+        Counts {
+            transactions: 1,
+            utxos: 0,
+            history: 1
+        }
+    );
+    let segment = root.join("regtest/blocks-00000000.elb");
+    let size = fs::metadata(&segment)?.len();
+    assert!(store.commit(1, &blocks[1]).is_err());
+    assert_eq!(fs::metadata(segment)?.len(), size);
+    drop(store);
+    let root = temporary.path().join("tail");
+    let mut store = BitcoinStore::create(&root, Chain::Regtest)?;
+    store.commit(0, &blocks[0])?;
+    assert!(store
+        .commit_with_hook(1, &blocks[1], |stage| {
+            if stage == Stage::ArchiveSynced {
+                anyhow::bail!("injected crash");
+            }
+            Ok(())
+        })
+        .is_err());
+    drop(store);
+    assert!(BitcoinStore::open_with_limits(
+        &root,
+        Chain::Regtest,
+        IndexLimits {
+            transactions: 1,
+            entries: 100
+        }
+    )
+    .is_err());
+    let mut store = BitcoinStore::open(&root, Chain::Regtest)?;
+    assert_eq!(
+        store.snapshot()?.counts()?,
+        Counts {
+            transactions: 2,
+            utxos: 1,
+            history: 2
+        }
+    );
+    store.commit(2, &blocks[2])?;
+    assert_eq!(
+        store.snapshot()?.counts()?,
+        Counts {
+            transactions: 4,
+            utxos: 3,
+            history: 5
+        }
+    );
+    store.rewind(1)?;
+    assert_eq!(
+        store.snapshot()?.counts()?,
+        Counts {
+            transactions: 2,
+            utxos: 1,
+            history: 2
+        }
+    );
     Ok(())
 }

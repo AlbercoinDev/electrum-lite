@@ -3,6 +3,8 @@
 pub mod kv;
 pub mod mempool;
 pub mod query;
+#[cfg(target_os = "linux")]
+pub mod server;
 pub mod sync;
 
 use crate::{
@@ -25,8 +27,38 @@ use std::{
 };
 
 const STATE: &[u8] = b"Mstate";
+const COUNTS: &[u8] = b"Ncounts";
 const WINDOW: u32 = 288;
 type Delta = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counts {
+    pub transactions: u64,
+    pub utxos: u64,
+    pub history: u64,
+}
+#[derive(Clone, Copy)]
+pub struct IndexLimits {
+    pub transactions: u64,
+    pub entries: u64,
+}
+impl Default for IndexLimits {
+    fn default() -> Self {
+        Self {
+            transactions: 10_000_000_000,
+            entries: 100_000_000_000,
+        }
+    }
+}
+fn counts(db: &Prototype) -> Result<Counts> {
+    match db.get(COUNTS)? {
+        Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        None => {
+            ensure!(db.generation()? == 0, "missing durable counts");
+            Ok(Counts::default())
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coin {
@@ -68,10 +100,11 @@ pub struct BitcoinStore {
     db: Prototype,
     chain: Chain,
     ready: bool,
+    limits: IndexLimits,
 }
 
 fn identity(chain: Chain) -> Vec<u8> {
-    format!("lite-bitcoin-lsm-v2:{}:{}", chain.name(), chain.genesis()).into_bytes()
+    format!("lite-bitcoin-lsm-v3:{}:{}", chain.name(), chain.genesis()).into_bytes()
 }
 fn numbered(prefix: u8, height: u32) -> Vec<u8> {
     let mut key = vec![prefix];
@@ -112,7 +145,13 @@ fn coin(db: &Prototype, delta: &Delta, outpoint: OutPoint) -> Result<Option<Coin
         .transpose()
 }
 
-fn prepare(db: &Prototype, chain: Chain, height: u32, block: &Block) -> Result<Delta> {
+fn prepare(
+    db: &Prototype,
+    chain: Chain,
+    limits: IndexLimits,
+    height: u32,
+    block: &Block,
+) -> Result<Delta> {
     validate_block(block)?;
     let current = state(db)?;
     match current.tip {
@@ -189,6 +228,32 @@ fn prepare(db: &Prototype, chain: Chain, height: u32, block: &Block) -> Result<D
         }
     }
     delta.insert(numbered(b'A', height), Some(serialize(&block.header)));
+    let mut next = counts(db)?;
+    next.transactions = next
+        .transactions
+        .checked_add(block.txdata.len().try_into()?)
+        .context("transaction count overflow")?;
+    for (key, value) in &delta {
+        let counter = match key[0] {
+            b'C' => &mut next.utxos,
+            b'H' => &mut next.history,
+            _ => continue,
+        };
+        match (db.get(key)?.is_some(), value.is_some()) {
+            (false, true) => *counter = counter.checked_add(1).context("entry count overflow")?,
+            (true, false) => *counter = counter.checked_sub(1).context("entry count underflow")?,
+            _ => {}
+        }
+    }
+    ensure!(
+        next.transactions <= limits.transactions
+            && next
+                .utxos
+                .checked_add(next.history)
+                .is_some_and(|entries| entries <= limits.entries),
+        "LSM cumulative index count limit exceeded"
+    );
+    delta.insert(COUNTS.to_vec(), Some(serde_json::to_vec(&next)?));
     Ok(delta)
 }
 
@@ -300,6 +365,13 @@ impl BitcoinStore {
         query::Snapshot::new(self.db.snapshot()?, &self.archive)
     }
     pub fn create(root: &Path, chain: Chain) -> Result<Self> {
+        Self::create_with_limits(root, chain, IndexLimits::default())
+    }
+    pub fn create_with_limits(root: &Path, chain: Chain, limits: IndexLimits) -> Result<Self> {
+        ensure!(
+            limits.transactions > 0 && limits.entries > 0,
+            "positive LSM index limits required"
+        );
         ensure!(!root.exists() && !root.is_symlink(), "new root required");
         let mut archive = Archive::open(root, chain, true)?;
         archive.enable_branches();
@@ -310,10 +382,18 @@ impl BitcoinStore {
             db,
             chain,
             ready: true,
+            limits,
         })
     }
 
     pub fn open(root: &Path, chain: Chain) -> Result<Self> {
+        Self::open_with_limits(root, chain, IndexLimits::default())
+    }
+    pub fn open_with_limits(root: &Path, chain: Chain, limits: IndexLimits) -> Result<Self> {
+        ensure!(
+            limits.transactions > 0 && limits.entries > 0,
+            "positive LSM index limits required"
+        );
         let mut archive = Archive::open(root, chain, false)?;
         archive.enable_branches();
         let db = Prototype::open(&archive.directory().join("lsm"), &identity(chain))?;
@@ -322,6 +402,7 @@ impl BitcoinStore {
             db,
             chain,
             ready: false,
+            limits,
         };
         result.recover()?;
         Ok(result)
@@ -368,7 +449,7 @@ impl BitcoinStore {
         mut hook: impl FnMut(Stage) -> Result<()>,
     ) -> Result<()> {
         ensure!(self.ready, "recovery required");
-        let delta = prepare(&self.db, self.chain, height, block)?;
+        let delta = prepare(&self.db, self.chain, self.limits, height, block)?;
         // Location has bounded encoding size. Preflight BEFORE appending so an
         // unsupported large block cannot poison the durable archive on purpose.
         let provisional = finish_delta(
@@ -451,6 +532,7 @@ impl BitcoinStore {
         })?;
         let db = &mut self.db;
         let chain = self.chain;
+        let limits = self.limits;
         let mut seen = saved.cursor.is_none();
         self.archive.scan_records(|height, block, location| {
             if !seen {
@@ -469,7 +551,7 @@ impl BitcoinStore {
             } else {
                 finish_delta(
                     db,
-                    prepare(db, chain, height, block)?,
+                    prepare(db, chain, limits, height, block)?,
                     height,
                     block.block_hash(),
                     location,
@@ -501,7 +583,16 @@ impl BitcoinStore {
             } else {
                 finish_delta(
                     &rebuilt,
-                    prepare(&rebuilt, self.chain, height, block)?,
+                    prepare(
+                        &rebuilt,
+                        self.chain,
+                        IndexLimits {
+                            transactions: u64::MAX,
+                            entries: u64::MAX,
+                        },
+                        height,
+                        block,
+                    )?,
                     height,
                     block.block_hash(),
                     location,
@@ -513,7 +604,7 @@ impl BitcoinStore {
             self.db.generation()? == rebuilt.generation()?,
             "durable generation does not match physical archive log"
         );
-        for prefix in [b"A", b"B", b"C", b"S", b"H", b"O", b"U", b"V", b"M"] {
+        for prefix in [b"A", b"B", b"C", b"S", b"H", b"O", b"U", b"V", b"M", b"N"] {
             for (left, right) in [(&self.db, &rebuilt), (&rebuilt, &self.db)] {
                 left.visit_prefix(prefix, |key, value| {
                     ensure!(
@@ -717,6 +808,14 @@ mod tests {
             0,
             &[
                 (STATE.to_vec(), Some(serde_json::to_vec(&seed)?)),
+                (
+                    COUNTS.to_vec(),
+                    Some(serde_json::to_vec(&Counts {
+                        transactions: 1,
+                        utxos: 1,
+                        history: 0,
+                    })?),
+                ),
                 (coin_key(outpoint), Some(serde_json::to_vec(&old)?)),
                 (balance_key, Some(old.value.to_be_bytes().to_vec())),
                 (
@@ -725,7 +824,7 @@ mod tests {
                 ),
             ],
         )?;
-        let delta = prepare(&db, Chain::Mainnet, 91842, &block)?;
+        let delta = prepare(&db, Chain::Mainnet, IndexLimits::default(), 91842, &block)?;
         assert_eq!(
             delta.get(&script_coin_key(old.script, outpoint)),
             Some(&None)
@@ -741,7 +840,7 @@ mod tests {
         assert!(undo
             .before
             .contains(&(coin_key(outpoint), Some(serde_json::to_vec(&old)?))));
-        assert!(prepare(&db, Chain::Signet, 91842, &block).is_err());
+        assert!(prepare(&db, Chain::Signet, IndexLimits::default(), 91842, &block).is_err());
         Ok(())
     }
 }

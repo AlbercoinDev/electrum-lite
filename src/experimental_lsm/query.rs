@@ -1,6 +1,6 @@
 //! Confirmed-only LSM queries from one published generation.
 //! Script hashes are raw internally; reversal belongs to the protocol boundary.
-use super::{coin_key, kv::ReadSnapshot, numbered, Coin, Record, State, STATE};
+use super::{coin_key, kv::ReadSnapshot, numbered, Coin, Counts, Record, State, COUNTS, STATE};
 use crate::{archive::Archive, MAX_BLOCK_BYTES};
 use anyhow::{ensure, Context, Result};
 use bitcoin::{
@@ -48,6 +48,25 @@ fn pair(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
     sha256d::Hash::hash(&bytes).to_byte_array()
 }
 
+pub fn merkle(mut hashes: Vec<[u8; 32]>, mut position: usize) -> Result<(Vec<[u8; 32]>, [u8; 32])> {
+    ensure!(position < hashes.len(), "Merkle position out of range");
+    let mut branch = Vec::new();
+    while hashes.len() > 1 {
+        if !hashes.len().is_multiple_of(2) {
+            hashes.push(*hashes.last().context("empty Merkle layer")?);
+        }
+        branch.push(hashes[position ^ 1]);
+        hashes = hashes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|layer| pair(layer[0], layer[1]))
+            .collect();
+        position /= 2;
+    }
+    Ok((branch, hashes[0]))
+}
+
 impl Proof {
     pub fn verify(&self) -> bool {
         if self.branch.len() > 32 || self.header.block_hash() != self.occurrence.block_hash {
@@ -85,6 +104,22 @@ impl<'a> Snapshot<'a> {
     }
     pub fn state(&self) -> &State {
         &self.state
+    }
+    pub fn counts(&self) -> Result<Counts> {
+        match self.read.get(COUNTS)? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            None => {
+                ensure!(self.generation() == 0, "missing durable counts");
+                Ok(Counts::default())
+            }
+        }
+    }
+    pub fn header_hashes(&self, height: u32) -> Result<Vec<[u8; 32]>> {
+        ensure!(height <= 2_000_000, "checkpoint exceeds limit");
+        self.record(height)?;
+        (0..=height)
+            .map(|height| Ok(self.record(height)?.hash.to_byte_array()))
+            .collect()
     }
     fn record(&self, height: u32) -> Result<Record> {
         ensure!(
@@ -303,7 +338,7 @@ impl<'a> Snapshot<'a> {
         let mut position = occurrence.position as usize;
         let mut branch = Vec::new();
         while hashes.len() > 1 {
-            if hashes.len() % 2 != 0 {
+            if !hashes.len().is_multiple_of(2) {
                 hashes.push(*hashes.last().context("empty Merkle layer")?);
             }
             branch.push(hashes[position ^ 1]);

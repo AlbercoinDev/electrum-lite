@@ -1,5 +1,8 @@
 # Mempool separada para LSM, 2026-10-30
 
+Continuación: [servidor LSM integrado y pruebas TCP Core 31.0/32.1](lsm-server-status.md).
+Los pendientes de servidor descritos abajo corresponden a esta entrega histórica.
+
 [CONFIRMADO] `src/experimental_lsm/mempool.rs` añade reconciliación y vistas
 de cartera no confirmadas sobre snapshots LSM. No escribe archivo, undo ni
 índices confirmados. No está todavía conectado al servidor público.

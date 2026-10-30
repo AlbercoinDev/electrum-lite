@@ -10,6 +10,10 @@ La rama **`main` contiene la beta funcional actual**. La etiqueta `v0.0.1-beta.1
 
 ## Qué funciona
 
+**Nuevo motor LSM experimental:** servidor Electrum 1.4 integrado y probado con
+Core aislado 31.0/32.1; todavía no seleccionado por el instalador. Faltan supervisor,
+poda y co-sync sostenida: [estado y evidencia](docs/lsm-server-status.md).
+
 - Servicio Electrum TCP privado, negociación 1.4, cabeceras y checkpoints, historial, saldo, UTXO, transacciones con witness, pruebas Merkle, fees y difusión.
 - Mempool reconciliada por RPC: padres/hijos, alturas 0/-1, RBF, gastos pendientes, suscripciones y notificaciones.
 - Sincronización continua, un escritor lógico y respuestas de una generación consistente. No devuelve balances/historiales vacíos cuando el índice no está listo.

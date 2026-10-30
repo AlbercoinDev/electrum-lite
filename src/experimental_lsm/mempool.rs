@@ -102,7 +102,7 @@ impl Default for Budget {
     }
 }
 impl Budget {
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         ensure!(
             self.transactions <= 100_000
                 && self.bytes > 0
@@ -160,6 +160,7 @@ struct Overlay {
     spent: BTreeSet<OutPoint>,
     validated_at: Instant,
     max_age: Duration,
+    fees: BTreeMap<Txid, u64>,
 }
 #[derive(Default)]
 pub struct Mempool {
@@ -226,6 +227,31 @@ impl Mempool {
         script: [u8; 32],
         limit: usize,
     ) -> Result<WalletView> {
+        let (history, pending) = self.history(snapshot, script, limit)?;
+        let utxos = self.list_unspent(snapshot, script, limit)?;
+        let (confirmed_sats, unconfirmed_sats) = self.balance(snapshot, script)?;
+        Ok(WalletView {
+            generation: snapshot.generation(),
+            confirmed_sats,
+            unconfirmed_sats,
+            history,
+            pending,
+            utxos,
+        })
+    }
+    pub fn balance(&self, snapshot: &Snapshot<'_>, script: [u8; 32]) -> Result<(u64, i64)> {
+        let overlay = self.overlay(snapshot)?;
+        Ok((
+            snapshot.balance(script)?,
+            *overlay.delta.get(&script).unwrap_or(&0),
+        ))
+    }
+    pub fn history(
+        &self,
+        snapshot: &Snapshot<'_>,
+        script: [u8; 32],
+        limit: usize,
+    ) -> Result<(Vec<super::query::Occurrence>, Vec<Pending>)> {
         let overlay = self.overlay(snapshot)?;
         let history = snapshot.history(script, limit)?;
         let pending = overlay.history.get(&script);
@@ -237,6 +263,15 @@ impl Mempool {
             "combined history response limit"
         );
         let pending = pending.cloned().unwrap_or_default();
+        Ok((history, pending))
+    }
+    pub fn list_unspent(
+        &self,
+        snapshot: &Snapshot<'_>,
+        script: [u8; 32],
+        limit: usize,
+    ) -> Result<Vec<(OutPoint, Coin)>> {
+        let overlay = self.overlay(snapshot)?;
         let mut utxos = snapshot.list_unspent(script, limit)?;
         utxos.retain(|(outpoint, _)| !overlay.spent.contains(outpoint));
         for (outpoint, coin) in &overlay.outputs {
@@ -245,15 +280,40 @@ impl Mempool {
                 utxos.push((*outpoint, coin.clone()));
             }
         }
-        utxos.sort_by_key(|(outpoint, coin)| (coin.height, *outpoint));
-        Ok(WalletView {
-            generation: snapshot.generation(),
-            confirmed_sats: snapshot.balance(script)?,
-            unconfirmed_sats: *overlay.delta.get(&script).unwrap_or(&0),
-            history,
-            pending,
-            utxos,
-        })
+        utxos.sort_by_key(|(outpoint, coin)| {
+            (
+                coin.height == 0,
+                coin.height,
+                outpoint.txid.to_string(),
+                outpoint.vout,
+            )
+        });
+        Ok(utxos)
+    }
+    pub fn fee_histogram(&self, snapshot: &Snapshot<'_>) -> Result<Vec<(u64, u64)>> {
+        let overlay = self.overlay(snapshot)?;
+        let mut groups = BTreeMap::<u64, u64>::new();
+        for (id, cached) in &self.cached {
+            let size = u64::try_from(cached.tx.vsize())?;
+            ensure!(size > 0, "zero transaction vsize");
+            let fee = *overlay.fees.get(id).context("missing mempool fee")?;
+            let value = groups.entry(fee / size).or_default();
+            *value = value.checked_add(size).context("histogram size overflow")?;
+        }
+        let mut bins = Vec::<(u64, u64)>::new();
+        for (rate, size) in groups.into_iter().rev() {
+            if bins.len() < 100 {
+                bins.push((rate, size));
+            } else {
+                let last = bins.last_mut().context("missing histogram bin")?;
+                last.0 = rate;
+                last.1 = last
+                    .1
+                    .checked_add(size)
+                    .context("histogram size overflow")?;
+            }
+        }
+        Ok(bins)
     }
     pub fn transaction(
         &self,
@@ -426,6 +486,7 @@ impl Mempool {
             spent: BTreeSet::new(),
             validated_at: Instant::now(),
             max_age: budget.max_age,
+            fees: BTreeMap::new(),
         };
         let mut processed = 0;
         while let Some(id) = ready.pop_first() {
@@ -499,6 +560,7 @@ impl Mempool {
             let fee = input_value
                 .checked_sub(output_value)
                 .context("negative mempool fee")?;
+            overlay.fees.insert(id, fee);
             for script in affected {
                 overlay.history.entry(script).or_default().push(Pending {
                     txid: id,

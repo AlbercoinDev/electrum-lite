@@ -37,6 +37,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Experimental new LSM Electrum 1.4 server; requires a dedicated Core.
+    #[cfg(all(feature = "experimental-lsm", target_os = "linux"))]
+    LsmServe {
+        #[arg(long)]
+        rpc_url: Option<String>,
+        #[arg(long)]
+        cookie_file: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:60601")]
+        listen: SocketAddr,
+        #[arg(long, default_value_t = 1000)]
+        poll_milliseconds: u64,
+        #[arg(long, default_value_t = 512)]
+        min_free_mib: u64,
+        #[arg(long, default_value_t = 16)]
+        max_connections: usize,
+        #[arg(long, default_value_t = 64)]
+        max_subscriptions: usize,
+        #[arg(long, default_value_t = 20_000)]
+        max_mempool_transactions: usize,
+        #[arg(long, default_value_t = 64)]
+        max_mempool_mib: usize,
+        #[arg(long, default_value_t = 500_000)]
+        max_mempool_entries: usize,
+        #[arg(long, default_value_t = 128)]
+        mempool_fetch_per_pass: usize,
+        #[arg(long, default_value_t = 10)]
+        mempool_max_age_seconds: u64,
+    },
     /// Supervise a dedicated test Core; optional coordinated automatic pruning.
     #[cfg(target_os = "linux")]
     ManagedServe {
@@ -201,6 +229,54 @@ fn main() -> Result<()> {
         entries: cli.max_index_entries,
     };
     match cli.command {
+        #[cfg(all(feature = "experimental-lsm", target_os = "linux"))]
+        Command::LsmServe {
+            rpc_url,
+            cookie_file,
+            listen,
+            poll_milliseconds,
+            min_free_mib,
+            max_connections,
+            max_subscriptions,
+            max_mempool_transactions,
+            max_mempool_mib,
+            max_mempool_entries,
+            mempool_fetch_per_pass,
+            mempool_max_age_seconds,
+        } => {
+            let options = electrum_lite::experimental_lsm::server::Options {
+                chain: cli.network,
+                root: cli.data_dir,
+                core: core(cli.network, rpc_url, cookie_file)?,
+                listen,
+                connections: max_connections,
+                subscriptions: max_subscriptions,
+                query_limit: cli.max_query_results,
+                index_limits: electrum_lite::experimental_lsm::IndexLimits {
+                    transactions: cli.max_index_transactions.try_into()?,
+                    entries: cli.max_index_entries.try_into()?,
+                },
+                mempool_budget: electrum_lite::experimental_lsm::mempool::Budget {
+                    transactions: max_mempool_transactions,
+                    bytes: max_mempool_mib
+                        .checked_mul(1024 * 1024)
+                        .context("mempool byte limit overflow")?,
+                    entries: max_mempool_entries,
+                    fetch_per_pass: mempool_fetch_per_pass,
+                    max_age: std::time::Duration::from_secs(mempool_max_age_seconds),
+                    ..Default::default()
+                },
+                poll: std::time::Duration::from_millis(poll_milliseconds),
+                min_free_bytes: min_free_mib
+                    .checked_mul(1024 * 1024)
+                    .context("free-space threshold overflow")?,
+            };
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?
+                .block_on(electrum_lite::experimental_lsm::server::run(options))?;
+        }
         #[cfg(target_os = "linux")]
         Command::ManagedServe {
             bitcoind,
