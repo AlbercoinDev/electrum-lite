@@ -50,7 +50,9 @@ def launch(root, network, offline=False):
         core_root = network_root / "core"
         if core_root.is_symlink() or (core_root.exists() and not core_root.is_dir()):
             raise RuntimeError("Core root must be a real managed directory")
-        lite_root = real_directory(root, f"data/{network}/lsm-v3/lite")
+        lite_root = network_root / "lite"
+        if lite_root.is_symlink() or (lite_root.exists() and not lite_root.is_dir()):
+            raise RuntimeError("Lite root must be a real managed directory")
         backup = real_directory(root, f"backups/{network}")
         # Separate per-network ownership excludes duplicate launches, while the
         # shared bundle lock permits independent networks and excludes updates.

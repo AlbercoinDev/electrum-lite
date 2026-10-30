@@ -8,10 +8,10 @@ import re
 
 CORE_RELEASE_API = "https://api.github.com/repos/bitcoin/bitcoin/releases/latest"
 CORE_KEY_URL = "https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/fanquake.gpg"
-# Evidence: docs/core-32.1-validation.md. Scope is the exact published artifact,
+# Evidence: docs/lsm-install-status.md. Scope is the exact published artifact,
 # not every future binary sharing the unchanged beta version string.
 VALIDATED_PAIRS = {
-    "32.1": frozenset({"452439e6fe62cd8bb5e43cfb1b0cdb08def3c24b1217fd94a77bf163febeb3e6"}),
+    "32.1": frozenset({"0e17ba331be0cc674bc540ae5cdbc0855b04fbc6b8f459c2286ab91977ee5ade"}),
 }
 VALIDATED_CORE_VERSIONS = frozenset(VALIDATED_PAIRS)
 
