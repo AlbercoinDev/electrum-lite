@@ -1,6 +1,7 @@
 //! Experimental Bitcoin/LSM generation coordinator, deliberately not wired to CLI.
 //! Mainnet pruning and runtime backend selection are NOT enabled by this module.
 pub mod kv;
+pub mod query;
 
 use crate::{
     archive::{Archive, Location},
@@ -68,7 +69,7 @@ pub struct BitcoinStore {
 }
 
 fn identity(chain: Chain) -> Vec<u8> {
-    format!("lite-bitcoin-lsm-v1:{}:{}", chain.name(), chain.genesis()).into_bytes()
+    format!("lite-bitcoin-lsm-v2:{}:{}", chain.name(), chain.genesis()).into_bytes()
 }
 fn numbered(prefix: u8, height: u32) -> Vec<u8> {
     let mut key = vec![prefix];
@@ -131,6 +132,7 @@ fn prepare(db: &Prototype, chain: Chain, height: u32, block: &Block) -> Result<D
                 let spent =
                     coin(db, &delta, input.previous_output)?.context("missing or spent prevout")?;
                 scripts.insert(spent.script);
+                adjust_balance(db, &mut delta, spent.script, spent.value, false)?;
                 delta.insert(coin_key(input.previous_output), None);
                 delta.insert(script_coin_key(spent.script, input.previous_output), None);
             }
@@ -156,6 +158,7 @@ fn prepare(db: &Prototype, chain: Chain, height: u32, block: &Block) -> Result<D
                     "BIP30 duplicate outpoint"
                 );
                 delta.insert(script_coin_key(previous.script, outpoint), None);
+                adjust_balance(db, &mut delta, previous.script, previous.value, false)?;
             }
             let created = Coin {
                 value: output.value.to_sat(),
@@ -164,6 +167,7 @@ fn prepare(db: &Prototype, chain: Chain, height: u32, block: &Block) -> Result<D
                 script,
             };
             let bytes = serde_json::to_vec(&created)?;
+            adjust_balance(db, &mut delta, created.script, created.value, true)?;
             delta.insert(coin_key(outpoint), Some(bytes.clone()));
             delta.insert(script_coin_key(script, outpoint), Some(bytes));
         }
@@ -182,7 +186,41 @@ fn prepare(db: &Prototype, chain: Chain, height: u32, block: &Block) -> Result<D
             delta.insert(key, Some(txid.to_byte_array().to_vec()));
         }
     }
+    delta.insert(numbered(b'A', height), Some(serialize(&block.header)));
     Ok(delta)
+}
+
+fn adjust_balance(
+    db: &Prototype,
+    delta: &mut Delta,
+    script: [u8; 32],
+    value: u64,
+    add: bool,
+) -> Result<()> {
+    let mut key = vec![b'V'];
+    key.extend(script);
+    let previous = lookup(db, delta, &key)?
+        .map(|bytes| Ok::<_, anyhow::Error>(u64::from_be_bytes(bytes.as_slice().try_into()?)))
+        .transpose()?
+        .unwrap_or(0);
+    let next = if add {
+        previous
+            .checked_add(value)
+            .context("script balance overflow")?
+    } else {
+        previous
+            .checked_sub(value)
+            .context("script balance underflow")?
+    };
+    delta.insert(
+        key,
+        if next == 0 {
+            None
+        } else {
+            Some(next.to_be_bytes().to_vec())
+        },
+    );
+    Ok(())
 }
 
 fn finish_delta(
@@ -255,6 +293,10 @@ fn rewind_delta(db: &Prototype, height: u32, block: &Block, cursor: Location) ->
 }
 
 impl BitcoinStore {
+    pub fn snapshot(&self) -> Result<query::Snapshot<'_>> {
+        ensure!(self.ready, "recovery required");
+        query::Snapshot::new(self.db.snapshot()?, &self.archive)
+    }
     pub fn create(root: &Path, chain: Chain) -> Result<Self> {
         ensure!(!root.exists() && !root.is_symlink(), "new root required");
         let mut archive = Archive::open(root, chain, true)?;
@@ -284,48 +326,33 @@ impl BitcoinStore {
     }
 
     pub fn state(&self) -> Result<State> {
-        ensure!(self.ready, "recovery required");
-        state(&self.db)
+        Ok(self.snapshot()?.state().clone())
     }
 
     pub fn coin(&self, outpoint: OutPoint) -> Result<Option<Coin>> {
-        ensure!(self.ready, "recovery required");
-        coin(&self.db, &Delta::new(), outpoint)
+        self.snapshot()?.coin(outpoint)
     }
 
     pub fn history(&self, script: [u8; 32], limit: usize) -> Result<Vec<(u32, u32, Txid)>> {
-        ensure!(self.ready, "recovery required");
-        let mut prefix = vec![b'H'];
-        prefix.extend(script);
-        let mut result = Vec::new();
-        self.db.visit_prefix(&prefix, |key, value| {
-            ensure!(
-                key.len() == 73 && value.len() == 32,
-                "invalid history entry"
-            );
-            let height = u32::from_be_bytes(key[33..37].try_into()?);
-            if height != 0 {
-                ensure!(result.len() < limit, "history response limit");
-                result.push((
-                    height,
-                    u32::from_be_bytes(key[37..41].try_into()?),
-                    Txid::from_slice(value)?,
-                ));
-            }
-            Ok(())
-        })?;
-        Ok(result)
+        Ok(self
+            .snapshot()?
+            .history(script, limit)?
+            .into_iter()
+            .map(|occurrence| (occurrence.height, occurrence.position, occurrence.txid))
+            .collect())
     }
 
     pub fn block(&self, height: u32) -> Result<Block> {
+        self.snapshot()?.block(height)
+    }
+
+    /// Finish pending memtable flush and explicit compaction under writer ownership.
+    pub fn settle(&mut self) -> Result<()> {
         ensure!(self.ready, "recovery required");
-        let stored = record(&self.db, height)?;
-        let (actual_height, block) = self.archive.read(stored.location)?;
-        ensure!(
-            height == actual_height && block.block_hash() == stored.hash,
-            "archive reference mismatch"
-        );
-        Ok(block)
+        self.ready = false;
+        self.db.settle()?;
+        self.ready = true;
+        Ok(())
     }
 
     pub fn commit(&mut self, height: u32, block: &Block) -> Result<()> {
@@ -484,7 +511,7 @@ impl BitcoinStore {
             self.db.generation()? == rebuilt.generation()?,
             "durable generation does not match physical archive log"
         );
-        for prefix in [b"B", b"C", b"S", b"H", b"O", b"U", b"M"] {
+        for prefix in [b"A", b"B", b"C", b"S", b"H", b"O", b"U", b"V", b"M"] {
             for (left, right) in [(&self.db, &rebuilt), (&rebuilt, &self.db)] {
                 left.visit_prefix(prefix, |key, value| {
                     ensure!(
@@ -682,11 +709,14 @@ mod tests {
             }),
             cursor: Some(location),
         };
+        let mut balance_key = vec![b'V'];
+        balance_key.extend(old.script);
         db.commit(
             0,
             &[
                 (STATE.to_vec(), Some(serde_json::to_vec(&seed)?)),
                 (coin_key(outpoint), Some(serde_json::to_vec(&old)?)),
+                (balance_key, Some(old.value.to_be_bytes().to_vec())),
                 (
                     script_coin_key(old.script, outpoint),
                     Some(serde_json::to_vec(&old)?),

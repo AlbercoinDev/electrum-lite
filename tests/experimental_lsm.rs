@@ -291,7 +291,7 @@ fn semantic_audit_rejects_index_only_corruption() -> Result<()> {
     lsm.commit(0, &blocks[0])?;
     lsm.commit(1, &blocks[1])?;
     drop(lsm);
-    let identity = format!("lite-bitcoin-lsm-v1:regtest:{}", Chain::Regtest.genesis());
+    let identity = format!("lite-bitcoin-lsm-v2:regtest:{}", Chain::Regtest.genesis());
     let mut db = electrum_lite::experimental_lsm::kv::Prototype::open(
         &root.join("regtest/lsm"),
         identity.as_bytes(),
@@ -386,5 +386,182 @@ fn intrablock_spend_order_and_undo_restore_exact_prior_coins() -> Result<()> {
     assert!(lsm.coin(intermediate)?.is_none());
     assert!(lsm.coin(descendant_output)?.is_none());
     assert_eq!(lsm.history(script(), 100)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn lsm_snapshot_serves_complete_wallet_history_and_witness_proofs() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("data");
+    let blocks = fixtures();
+    let mut lsm = BitcoinStore::create(&root, Chain::Regtest)?;
+    for (height, block) in blocks.iter().enumerate() {
+        lsm.commit(height as u32, block)?;
+    }
+    let snapshot = lsm.snapshot()?;
+    let genesis_script =
+        sha256::Hash::hash(blocks[0].txdata[0].output[0].script_pubkey.as_bytes()).to_byte_array();
+    let genesis_view = snapshot.view(genesis_script, 0, 0)?;
+    assert_eq!(genesis_view.confirmed_sats, 0);
+    assert!(genesis_view.history.is_empty());
+    assert!(genesis_view.utxos.is_empty());
+    let view = snapshot.view(script(), 100, 100)?;
+    assert_eq!(view.generation, 3);
+    assert_eq!(view.tip, Some((2, blocks[2].block_hash())));
+    assert_eq!(view.confirmed_sats, 5_002_000_000);
+    assert_eq!(view.history.len(), 3);
+    assert_eq!(view.utxos.len(), 3);
+    assert_eq!(
+        view.utxos.iter().map(|(_, coin)| coin.value).sum::<u64>(),
+        view.confirmed_sats
+    );
+    assert_eq!(
+        snapshot.headers(0, 3)?,
+        blocks
+            .iter()
+            .flat_map(|block| serialize(&block.header))
+            .collect::<Vec<_>>()
+    );
+    let payment = &blocks[2].txdata[1];
+    let (occurrence, bytes) = snapshot.transaction(payment.compute_txid(), Some(2), 4_000_000)?;
+    assert_eq!(occurrence.position, 1);
+    assert_eq!(occurrence.block_hash, blocks[2].block_hash());
+    assert_eq!(bytes, serialize(payment));
+    assert!(snapshot.proof(payment.compute_txid(), 2)?.verify());
+    assert!(snapshot
+        .proof(blocks[0].txdata[0].compute_txid(), 0)?
+        .verify());
+    assert!(snapshot.view(script(), 2, 100).is_err());
+    assert!(snapshot.view(script(), 100, 2).is_err());
+    assert!(snapshot
+        .transaction(payment.compute_txid(), Some(2), bytes.len() - 1)
+        .is_err());
+    assert!(snapshot.headers(0, 2017).is_err());
+    assert!(snapshot.headers(2, 2).is_err());
+    assert!(snapshot
+        .occurrences(payment.compute_txid(), None, 0)
+        .is_err());
+    let unknown = [255u8; 32];
+    assert_eq!(snapshot.balance(unknown)?, 0);
+    assert!(snapshot.list_unspent(unknown, 0)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn lsm_balances_headers_occurrences_and_queries_follow_durable_rewind() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("data");
+    let blocks = fixtures();
+    let mut lsm = BitcoinStore::create(&root, Chain::Regtest)?;
+    for (height, block) in blocks.iter().enumerate() {
+        lsm.commit(height as u32, block)?;
+    }
+    let old_txid = blocks[2].txdata[1].compute_txid();
+    lsm.rewind(1)?;
+    {
+        let snapshot = lsm.snapshot()?;
+        assert_eq!(snapshot.generation(), 4);
+        assert_eq!(snapshot.balance(script())?, 5_000_000_000);
+        assert_eq!(snapshot.list_unspent(script(), 100)?.len(), 1);
+        assert!(snapshot.header(2).is_err());
+        assert!(snapshot.transaction(old_txid, None, 4_000_000).is_err());
+    }
+    let replacement = next(&blocks[1], vec![coinbase(200)]);
+    lsm.commit(2, &replacement)?;
+    let backup = temporary.path().join("backup");
+    lsm.backup(&backup)?;
+    let restored =
+        BitcoinStore::restore(&backup, &temporary.path().join("restored"), Chain::Regtest)?;
+    let snapshot = restored.snapshot()?;
+    assert_eq!(snapshot.generation(), 5);
+    assert_eq!(
+        snapshot.view(script(), 100, 100)?.confirmed_sats,
+        10_000_000_000
+    );
+    assert_eq!(snapshot.header(2)?, replacement.header);
+    assert!(snapshot.occurrences(old_txid, None, 16)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn lsm_merkle_queries_handle_odd_layers_and_reject_tampered_proofs() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("data");
+    let blocks = fixtures();
+    let mut lsm = BitcoinStore::create(&root, Chain::Regtest)?;
+    for (height, block) in blocks.iter().enumerate() {
+        lsm.commit(height as u32, block)?;
+    }
+    let mut left = blocks[2].txdata[1].clone();
+    left.input[0].witness = Witness::new();
+    left.input[0].previous_output = OutPoint {
+        txid: blocks[2].txdata[1].compute_txid(),
+        vout: 0,
+    };
+    let mut right = left.clone();
+    right.input[0].previous_output.vout = 1;
+    let third = next(&blocks[2], vec![coinbase(3), left, right]);
+    lsm.commit(3, &third)?;
+    let snapshot = lsm.snapshot()?;
+    for transaction in &third.txdata {
+        let mut proof = snapshot.proof(transaction.compute_txid(), 3)?;
+        assert!(proof.verify());
+        proof.branch[0][0] ^= 1;
+        assert!(!proof.verify());
+    }
+    Ok(())
+}
+
+#[test]
+fn lsm_query_occurrences_remain_distinct_after_repeated_txid_and_rewind() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("data");
+    let blocks = fixtures();
+    let mut lsm = BitcoinStore::create(&root, Chain::Regtest)?;
+    for (height, block) in blocks.iter().enumerate() {
+        lsm.commit(height as u32, block)?;
+    }
+    // Synthetic occurrence test: original coin was spent at height 2, so the
+    // repeated TXID does not overwrite an unspent coin. Core owns BIP34 rules.
+    let repeated = next(&blocks[2], vec![blocks[1].txdata[0].clone()]);
+    lsm.commit(3, &repeated)?;
+    let txid = blocks[1].txdata[0].compute_txid();
+    {
+        let snapshot = lsm.snapshot()?;
+        let found = snapshot.occurrences(txid, None, 16)?;
+        assert_eq!(
+            found.iter().map(|entry| entry.height).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_ne!(found[0].block_hash, found[1].block_hash);
+        assert_eq!(snapshot.transaction(txid, None, 4_000_000)?.0.height, 3);
+        assert_eq!(snapshot.transaction(txid, Some(1), 4_000_000)?.0.height, 1);
+        assert!(snapshot.proof(txid, 1)?.verify());
+        assert!(snapshot.proof(txid, 3)?.verify());
+        assert!(snapshot.occurrences(txid, None, 1).is_err());
+    }
+    lsm.rewind(2)?;
+    let snapshot = lsm.snapshot()?;
+    assert_eq!(snapshot.transaction(txid, None, 4_000_000)?.0.height, 1);
+    assert_eq!(snapshot.balance(script())?, 5_002_000_000);
+    Ok(())
+}
+
+#[test]
+fn lsm_old_experimental_format_is_rejected_without_adaptation() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("data");
+    let archive = Archive::open(&root, Chain::Regtest, true)?;
+    let path = archive.directory().join("lsm");
+    let old_identity = format!("lite-bitcoin-lsm-v1:regtest:{}", Chain::Regtest.genesis());
+    drop(electrum_lite::experimental_lsm::kv::Prototype::create(
+        &path,
+        old_identity.as_bytes(),
+    )?);
+    drop(archive);
+    assert!(BitcoinStore::open(&root, Chain::Regtest).is_err());
+    let untouched =
+        electrum_lite::experimental_lsm::kv::Prototype::open(&path, old_identity.as_bytes())?;
+    assert_eq!(untouched.generation()?, 0);
     Ok(())
 }

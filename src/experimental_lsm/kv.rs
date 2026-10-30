@@ -21,6 +21,40 @@ pub struct Prototype {
     failed: bool,
 }
 
+/// Values and generation are read from the same engine snapshot.
+pub struct ReadSnapshot<'a> {
+    snapshot: rocksdb::Snapshot<'a>,
+    generation: u64,
+}
+
+impl ReadSnapshot<'_> {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        ensure!(!key.is_empty() && key[0] != 0, "reserved key");
+        Ok(self.snapshot.get(key)?)
+    }
+    pub fn visit_prefix(
+        &self,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(!prefix.is_empty() && prefix[0] != 0, "invalid prefix");
+        for row in self.snapshot.iterator(rocksdb::IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        )) {
+            let (key, value) = row?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            visit(&key, &value)?;
+        }
+        Ok(())
+    }
+}
+
 fn options(create: bool) -> Options {
     let mut options = Options::default();
     options.create_if_missing(create);
@@ -46,6 +80,16 @@ fn durable() -> WriteOptions {
 }
 
 impl Prototype {
+    pub fn snapshot(&self) -> Result<ReadSnapshot<'_>> {
+        ensure!(!self.failed, "reopen required after write failure");
+        let snapshot = self.db.snapshot();
+        let bytes = snapshot.get(GENERATION)?.context("missing generation")?;
+        let generation = u64::from_be_bytes(bytes.as_slice().try_into()?);
+        Ok(ReadSnapshot {
+            snapshot,
+            generation,
+        })
+    }
     pub fn create(path: &Path, identity: &[u8]) -> Result<Self> {
         ensure!(
             !path.exists() && !path.is_symlink(),
@@ -322,15 +366,21 @@ mod tests {
         let root = tempfile::tempdir()?;
         let mut db = Prototype::create(&root.path().join("db"), b"snapshot-test")?;
         db.commit(0, &[(b"coin".to_vec(), Some(b"old".to_vec()))])?;
-        let snapshot = db.db.snapshot();
+        let snapshot = db.snapshot()?;
         let mut batch = WriteBatch::default();
         batch.put(b"coin", b"new");
         batch.put(GENERATION, 2u64.to_be_bytes());
-        // Direct access here only to test the generic library snapshot. Normal
+        // Direct access here only to exercise our snapshot wrapper. Normal
         // writers must exclusively use Prototype::commit.
         db.db.write_opt(batch, &durable())?;
         assert_eq!(snapshot.get(b"coin")?, Some(b"old".to_vec()));
-        assert_eq!(snapshot.get(GENERATION)?, Some(1u64.to_be_bytes().to_vec()));
+        assert_eq!(snapshot.generation(), 1);
+        let mut rows = Vec::new();
+        snapshot.visit_prefix(b"coin", |key, value| {
+            rows.push((key.to_vec(), value.to_vec()));
+            Ok(())
+        })?;
+        assert_eq!(rows, vec![(b"coin".to_vec(), b"old".to_vec())]);
         assert_eq!(db.generation()?, 2);
         Ok(())
     }
