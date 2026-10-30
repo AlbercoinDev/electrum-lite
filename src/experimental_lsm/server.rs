@@ -87,7 +87,7 @@ struct Worker {
 }
 impl Worker {
     fn new(options: Options, health: Arc<RwLock<Health>>, stop: Arc<AtomicBool>) -> Result<Self> {
-        let store = if options.root.exists() {
+        let store = if options.root.join(options.chain.name()).exists() {
             BitcoinStore::open_with_limits(&options.root, options.chain, options.index_limits)?
         } else {
             BitcoinStore::create_with_limits(&options.root, options.chain, options.index_limits)?

@@ -327,7 +327,7 @@ pub async fn run(options: Options) -> Result<()> {
         );
         #[cfg(feature = "experimental-lsm")]
         if options.lsm {
-            let store = if app_root.exists() {
+            let store = if app_root.join(options.chain.name()).exists() {
                 crate::experimental_lsm::BitcoinStore::open(&app_root, options.chain)?
             } else {
                 crate::experimental_lsm::BitcoinStore::create(&app_root, options.chain)?
