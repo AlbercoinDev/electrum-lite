@@ -54,10 +54,13 @@ struct Args {
     confirm_dedicated: bool,
     #[arg(long)]
     auto_prune: bool,
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 2000)]
     pause_lag: u32,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 200)]
     resume_lag: u32,
+    /// Pause Core networking below this free-space reserve on either filesystem (MiB).
+    #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(256..=1048576))]
+    min_free_mib: u32,
     #[arg(long, default_value_t = 1)]
     prune_interval: u32,
     /// Private supervisor control socket; never exposed over Electrum TCP.
@@ -177,6 +180,7 @@ fn main() -> Result<()> {
                 core_dbcache_mib: a.core_dbcache_mib,
                 high: a.pause_lag,
                 low: a.resume_lag,
+                min_free_mib: a.min_free_mib,
                 auto_prune: a.auto_prune,
                 prune_interval: a.prune_interval,
                 peers: a.block_peer,

@@ -14,6 +14,36 @@ fn no_deletion_retry_due(same_file: bool, tip: u32, attempted_tip: u32, elapsed:
         || tip - attempted_tip >= NO_DELETION_RETRY_BLOCKS
         || elapsed >= NO_DELETION_RETRY_TIME
 }
+
+// GNU df reports space available to the current user, including filesystem
+// reservations. Errors are fatal: continuing without the guard is unsafe.
+fn available_bytes(path: &Path) -> Result<u64> {
+    let output = Command::new("df")
+        .env("LC_ALL", "C")
+        .args(["-B1", "--output=avail", "--"])
+        .arg(path)
+        .output()
+        .context("cannot query free disk space")?;
+    ensure!(output.status.success(), "cannot query free disk space");
+    let text = std::str::from_utf8(&output.stdout)?;
+    let mut lines = text.lines();
+    ensure!(lines.next().is_some(), "missing disk space header");
+    let free = lines
+        .next()
+        .context("missing disk space value")?
+        .trim()
+        .parse()?;
+    ensure!(lines.next().is_none(), "unexpected disk space output");
+    Ok(free)
+}
+
+fn pause_needed(paused: bool, lag: u64, high: u32, low: u32, free: u64, minimum: u64) -> bool {
+    if paused {
+        lag > u64::from(low) || free < minimum.saturating_add(512 * 1024 * 1024)
+    } else {
+        lag >= u64::from(high) || free < minimum
+    }
+}
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -40,6 +70,7 @@ pub struct Config {
     pub core_dbcache_mib: u32,
     pub high: u32,
     pub low: u32,
+    pub min_free_mib: u32,
     pub auto_prune: bool,
     pub prune_interval: u32,
     pub peers: Vec<String>,
@@ -202,6 +233,10 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         "invalid supervisor thresholds"
     );
     ensure!(
+        (256..=1048576).contains(&c.min_free_mib),
+        "invalid free-space reserve"
+    );
+    ensure!(
         (64..=1024).contains(&c.core_dbcache_mib),
         "Core database cache must be 64..=1024 MiB"
     );
@@ -343,6 +378,9 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let mut daemon = c.server(&cookie)?;
     let mut started = Instant::now();
     let mut paused = false;
+    let minimum_free = u64::from(c.min_free_mib) * 1024 * 1024;
+    let mut free_bytes = available_bytes(&core_dir)?.min(available_bytes(&root)?);
+    let mut free_checked = Instant::now();
     let mut last_maintenance = 0u32;
     for entry in fs::read_dir(&root)? {
         let name = entry?.file_name();
@@ -417,16 +455,21 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         }
         let indexed = state["indexed_height"].as_u64();
         let lag = (u64::from(tip) + 1).saturating_sub(indexed.map_or(0, |n| n + 1));
-        if !paused && lag >= u64::from(c.high) {
+        if free_checked.elapsed() >= Duration::from_secs(5) {
+            free_bytes = available_bytes(&core_dir)?.min(available_bytes(&root)?);
+            free_checked = Instant::now();
+        }
+        let should_pause = pause_needed(paused, lag, c.high, c.low, free_bytes, minimum_free);
+        if !paused && should_pause {
             core.call("setnetworkactive", json!([false]))?;
             paused = true;
             event(
                 &events,
                 "backpressure_pause",
-                json!({"lag":lag,"core_height":tip,"indexed_height":indexed}),
+                json!({"lag":lag,"core_height":tip,"indexed_height":indexed,"free_bytes":free_bytes,"minimum_free_bytes":minimum_free,"reason":if free_bytes < minimum_free {"disk"} else {"lag"}}),
             )?;
         }
-        if paused && lag <= u64::from(c.low) {
+        if paused && !should_pause {
             core.call("setnetworkactive", json!([true]))?;
             paused = false;
             event(&events, "backpressure_resume", json!({"lag":lag}))?;
@@ -616,8 +659,10 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 )?,
             }
             daemon.live()?;
-            core.call("setnetworkactive", json!([true]))?;
-            paused = false;
+            // Refresh the reserve before deciding whether networking may resume.
+            free_bytes = available_bytes(&core_dir)?.min(available_bytes(&root)?);
+            free_checked = Instant::now();
+            paused = true;
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -670,6 +715,7 @@ mod tests {
             core_dbcache_mib: 64,
             high: 200,
             low: 20,
+            min_free_mib: 2048,
             auto_prune: false,
             prune_interval: 1,
             peers: Vec::new(),
@@ -715,6 +761,32 @@ mod tests {
             assert!(error.to_string().contains("Core database cache"));
             assert!(!root.exists());
         }
+    }
+
+    #[test]
+    fn backpressure_hysteresis_protects_both_resources() {
+        let mib = 1024 * 1024;
+        let minimum = 2048 * mib;
+        assert!(!pause_needed(false, 1999, 2000, 200, minimum, minimum));
+        assert!(pause_needed(false, 2000, 2000, 200, minimum, minimum));
+        assert!(pause_needed(false, 0, 2000, 200, minimum - 1, minimum));
+        assert!(pause_needed(true, 0, 2000, 200, minimum, minimum));
+        assert!(pause_needed(
+            true,
+            201,
+            2000,
+            200,
+            minimum + 512 * mib,
+            minimum
+        ));
+        assert!(!pause_needed(
+            true,
+            200,
+            2000,
+            200,
+            minimum + 512 * mib,
+            minimum
+        ));
     }
 
     #[test]

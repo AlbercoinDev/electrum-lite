@@ -74,11 +74,11 @@ def main():
             def do_POST(self):
                 data = self.rfile.read(int(self.headers["Content-Length"]))
                 message = json.loads(data)
-                if hold_audit.is_set() and message["method"] == "getblock":
+                if hold_audit.is_set() and isinstance(message, dict) and message["method"] == "getblock":
                     audit_waiting.set()
                     if not release_audit.wait(timeout=20):
                         raise RuntimeError("audit test gate timed out")
-                if hide_blocks and message["method"] == "getblock":
+                if hide_blocks and isinstance(message, dict) and message["method"] == "getblock":
                     result = json.dumps({"id": 1, "result": None, "error": {"code": -1, "message": "simulated pruned block"}}).encode()
                 else:
                     request = urllib.request.Request(f"http://127.0.0.1:{rpcport}", data, {"Authorization": self.headers["Authorization"]})

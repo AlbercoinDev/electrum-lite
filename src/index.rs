@@ -605,25 +605,76 @@ impl Index {
         let end = info["blocks"].as_u64().context("missing height")? as u32;
         let start = self.tip()?.map_or(0, |h| h + 1);
         let end = end.min(start.saturating_add(limit.saturating_sub(1)));
-        for h in start..=end {
-            ensure!(
-                !cancel.load(std::sync::atomic::Ordering::Relaxed),
-                "synchronization interrupted"
-            );
-            let hash = core.call("getblockhash", json!([h]))?;
-            let hash = hash.as_str().context("invalid hash")?;
-            let block = core.block(hash).context(
-                "Core pruned required history: stop and recover missing blocks; never skip heights",
-            )?;
-            ensure!(
-                block.block_hash().to_string() == hash,
-                "RPC block hash mismatch"
-            );
-            self.commit_with_sync(h, &block, h == end || (h - start + 1) % 64 == 0)?;
-            if h % 1000 == 0 {
-                eprintln!("{} {h}/{end}", crate::i18n::text("indexed", "indexados"));
-            }
+        if start > end {
+            return Ok(());
         }
+        // A rendezvous channel allows exactly one prepared block to overlap
+        // the writer. There is no unbounded queue and no second DB writer.
+        // Core::call bounds each RPC response to 32 MiB. The producer exits
+        // when the receiver is dropped on any writer error or cancellation.
+        std::thread::scope(|scope| -> Result<()> {
+            let (tx, rx) = std::sync::mpsc::sync_channel(0);
+            let producer = scope.spawn(move || {
+                let mut hashes = std::collections::VecDeque::new();
+                for h in start..=end {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let begun = std::time::Instant::now();
+                    let mut hash_time = std::time::Duration::ZERO;
+                    let result = (|| -> Result<Block> {
+                        if hashes.is_empty() {
+                            hashes.extend(core.block_hashes(h, (end - h).min(15) + 1)?);
+                            hash_time = begun.elapsed();
+                        }
+                        let hash = hashes.pop_front().context("missing prefetched hash")?;
+                        let block = core.block(&hash.to_string()).context(
+                            "Core pruned required history: stop and recover missing blocks; never skip heights",
+                        )?;
+                        ensure!(block.block_hash() == hash, "RPC block hash mismatch");
+                        Ok(block)
+                    })();
+                    let failed = result.is_err();
+                    if tx.send((h, result, begun.elapsed(), hash_time)).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+            let mut fetch_time = std::time::Duration::ZERO;
+            let mut hash_time = std::time::Duration::ZERO;
+            let mut write_time = std::time::Duration::ZERO;
+            let begun = std::time::Instant::now();
+            let result = (|| -> Result<()> {
+                for expected in start..=end {
+                    ensure!(
+                        !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                        "synchronization interrupted"
+                    );
+                    let (h, block, elapsed, hash_elapsed) =
+                        rx.recv().context("block reader stopped unexpectedly")?;
+                    ensure!(h == expected, "block reader returned unexpected height");
+                    let block = block?;
+                    fetch_time += elapsed;
+                    hash_time += hash_elapsed;
+                    let writing = std::time::Instant::now();
+                    self.commit_with_sync(h, &block, h == end || (h - start + 1) % 64 == 0)?;
+                    write_time += writing.elapsed();
+                    if h % 1000 == 0 {
+                        eprintln!("{} {h}/{end}", crate::i18n::text("indexed", "indexados"));
+                    }
+                }
+                Ok(())
+            })();
+            drop(rx);
+            producer
+                .join()
+                .map_err(|_| anyhow::anyhow!("block reader panicked"))?;
+            result?;
+            if start / 1000 != end / 1000 || start == 0 {
+                eprintln!("sync_metrics blocks={} elapsed_ms={} fetch_ms={} hash_rpc_ms={} block_rpc_decode_ms={} index_ms={} (fetch and index overlap)", end - start + 1, begun.elapsed().as_millis(), fetch_time.as_millis(), hash_time.as_millis(), fetch_time.saturating_sub(hash_time).as_millis(), write_time.as_millis());
+            }
+            Ok(())
+        })?;
         Ok(())
     }
     pub fn history(&self, script: &[u8; 32]) -> Result<Value> {

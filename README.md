@@ -226,8 +226,16 @@ Si la máquina tiene RAM suficiente, se puede añadir antes de `managed-serve`
 Core, no un límite de memoria total: Lite, Core y el sistema usan RAM adicional.
 No se ha medido si acelera esta carga de trabajo ni garantiza eliminar pausas.
 
-**Coordinación:** si el índice se retrasa 200 bloques, pausa P2P de su propio Core;
-lo reanuda al bajar a 20 (`--pause-lag` / `--resume-lag`). Core siempre usa
+**Coordinación:** si el índice se retrasa 2000 bloques, pausa P2P de su propio Core;
+lo reanuda al bajar a 200 (`--pause-lag` / `--resume-lag`). Además, pausa si el
+espacio disponible para el usuario baja de 2048 MiB en cualquiera de los sistemas
+de archivos de Core o Lite (`--min-free-mib`); para reanudar necesita 512 MiB
+adicionales y cumplir el umbral de retraso. Se comprueba aproximadamente cada
+5 segundos mediante GNU `df`; un error de medición detiene el supervisor y su
+Core dedicado. Es un margen de seguridad, no una garantía de espacio: Core,
+Lite, las auditorías y otros procesos pueden consumir espacio entre mediciones.
+El umbral mayor puede aumentar considerablemente el uso temporal de disco; los
+bloques no tienen un tamaño fijo. Core siempre usa
 `prune=1`, nunca poda por su cuenta. Con `--auto-prune`, por defecto comprueba
 tras cada bloque nuevo (`--prune-interval`, valor predeterminado 1) y, estando
 al día y con un archivo candidato, detiene Electrum, desactiva P2P, ejecuta la

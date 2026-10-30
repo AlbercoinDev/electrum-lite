@@ -55,6 +55,46 @@ Un regtest dedicado desechable arrancó con `--core-dbcache-mib 256`; se verific
 en los argumentos del proceso Core `-dbcache=256` y se detuvo limpiamente. Este
 ajuste limita esa caché de Core, no la RAM total, y no es una medición de velocidad.
 
+La preparación anticipada local se comparó en el mismo Core regtest aislado con
+301 bloques pequeños, alternando versiones y usando índices nuevos. Tiempos de
+un ensayo: anterior 1,157 y 1,153 s; nueva 1,158 y 1,160 s. No se observa una
+mejora en esta carga; no representa Signet ni mide RAM o disco bajo presión.
+`scripts/prefetch_smoke.py` también inyectó un error RPC en altura 20: no pidió
+una altura posterior, falló sin colgarse y, al reanudar, alcanzó altura 300.
+Una segunda inyección devolvió un bloque de otra rama en altura 20: el escritor
+lo rechazó, el lector no pasó de la altura 21 y el reinicio alcanzó altura 300.
+La equivalencia completa del índice y los límites de memoria bajo presión no se
+han medido en esta comparación.
+
+Una carga adicional de regtest con 301 bloques y 500 transferencias de cartera
+produjo 1,168/1,164 s en la versión anterior y 1,150/1,154 s con lectura
+anticipada; no es una mejora concluyente. En la versión nueva, los tiempos
+acumulados fueron aproximadamente 503–505 ms en RPC de hashes, 570–577 ms en
+RPC de bloques más decodificación y 52–56 ms indexando. La lectura y escritura se
+solapan, por lo que no deben sumarse como tiempo transcurrido. Es una carga
+pequeña y sintética, no una medición de Signet o de un índice grande. Sugiere
+examinar RPC agrupado antes de optimizar RocksDB, sin establecer el cuello de
+botella de la VM del usuario. El freno de seguridad no se ha modificado.
+
+Después se agruparon consultas de hasta 16 hashes por RPC, comprobando todas las
+respuestas antes de utilizarlas. En otra ejecución aislada de la misma carga de
+301 bloques y 500 transferencias: versión anterior 1,173/1,172 s; versión nueva
+0,698/0,690 s; tiempo agregado de RPC de hashes 42/41 ms. Es una comparación
+pequeña local, no una garantía de velocidad ni una medición Signet. La prueba
+inyectó un error en un lote y un hash de otra rama, verificando que se rechazan
+y que se puede reiniciar; también comprobó el límite de hashes solicitados y de
+bloques adelantados. Los tests unitarios rechazan respuestas ausentes, repetidas,
+erróneas y malformadas. El smoke regtest incluye una reorganización real. Los
+resultados previos de límite de altura se refieren al lector sin lotes.
+
+`scripts/disk_guard_smoke.py` arrancó un Core regtest dedicado con una reserva
+superior al espacio realmente disponible y confirmó el evento de pausa por disco
+y `networkactive=false`; tras detenerlo, lo reanudó con reserva inferior y
+confirmó `networkactive=true`. Los tests unitarios cubren los dos umbrales de
+retraso y la histéresis de 512 MiB. No se ha probado un agotamiento real de disco,
+ni una poda física con la nueva política. La comprobación periódica no garantiza
+evitar ENOSPC si el espacio cae rápidamente o se necesita para auditoría/backup.
+
 ## Build
 
 Se ejecutó sobre el árbol nuevo:
