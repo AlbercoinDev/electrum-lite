@@ -58,6 +58,18 @@ PASS both children stopped; idempotent update preserved existing data
 PASS disposable installation and all test data removed
 ```
 
+También se repitió esa comprobación con la **línea curl publicada exacta**,
+HOME temporal y bootstrap remoto fijado automáticamente al commit
+`b9cad4eec1930577a573f1348baddc7e9722de90`, tanto instalación como actualización:
+
+```text
+PASS exact published one-line bootstrap, Signet offline start/stop and repeat update
+```
+
+Se confirmó backend LSM, Core hijo dedicado y ausencia de índices SQLite en la
+raíz nueva. Los dos procesos se cerraron; HOME, datos y artefactos temporales de
+compilación/empaquetado se eliminaron tras conservar esta evidencia.
+
 Se corrigió durante esa prueba la inicialización de una raíz nueva: crear la
 carpeta contenedora no equivale a tener un índice existente. El paquete fallido
 `ecbf37e` fue retirado. La prueba usa `--offline`: no demuestra co-sync pública.
