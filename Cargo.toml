@@ -22,6 +22,10 @@ required-features = ["experimental-lsm"]
 name = "lsm_sync_check"
 required-features = ["experimental-lsm"]
 
+[[example]]
+name = "lsm_mempool_check"
+required-features = ["experimental-lsm"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

@@ -81,7 +81,7 @@ y herramientas temporales propios se eliminan también al cerrar este bloque.
 
 ## Pendiente para el servicio nuevo
 
-[PENDIENTE] Mempool LSM separada, readiness y protocolo/transportes del servidor,
+[PENDIENTE] Integrar readiness y protocolo/transportes del servidor,
 integración del supervisor/poda con este motor, capacidad y ensayo sostenido
 Signet/Testnet4. La comprobación de ancla por bloque y la auditoría semántica
 completa de startup son conservadoras: su coste todavía no está optimizado.
@@ -92,3 +92,5 @@ Mainnet sigue siendo objetivo de producto y su poda continúa bloqueada.
 No se modifica el tag ni la pareja binaria pública: el lanzador Signet publicado
 todavía no selecciona LSM. No se empaqueta el árbol con cambios pendientes de
 catch-up y no se cambia la versión `0.0.1-beta.1`.
+
+Continuación: [mempool separada LSM, readiness por generación y pruebas Core](lsm-mempool-status.md).

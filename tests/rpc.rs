@@ -10,6 +10,21 @@ use electrum_lite::{rpc::Core, Chain};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+#[test]
+fn cookie_instance_token_detects_rotation_and_rejects_oversized_cookie() {
+    let root = tempdir().unwrap();
+    let cookie = root.path().join("cookie");
+    fs::write(&cookie, "__cookie__:secret-a").unwrap();
+    let core = Core::new("http://127.0.0.1:1/", &cookie).unwrap();
+    let first = core.cookie_instance_token().unwrap();
+    fs::write(&cookie, "__cookie__:secret-b").unwrap();
+    assert_ne!(core.cookie_instance_token().unwrap(), first);
+    fs::write(&cookie, vec![b'x'; 4097]).unwrap();
+    assert!(core.cookie_instance_token().is_err());
+    fs::write(&cookie, []).unwrap();
+    assert!(core.cookie_instance_token().is_err());
+}
+
 fn serve(body: String, status: &str) -> (String, thread::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());

@@ -1,6 +1,7 @@
 //! Experimental Bitcoin/LSM generation coordinator, deliberately not wired to CLI.
 //! Mainnet pruning and runtime backend selection are NOT enabled by this module.
 pub mod kv;
+pub mod mempool;
 pub mod query;
 pub mod sync;
 

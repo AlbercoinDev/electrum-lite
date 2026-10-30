@@ -49,6 +49,20 @@ pub struct Core {
 }
 
 impl Core {
+    /// Default Core cookies change on restart. A bounded, opaque token prevents
+    /// reusing a mempool warm-up cache across dedicated Core instances.
+    pub fn cookie_instance_token(&self) -> Result<[u8; 32]> {
+        use bitcoin::hashes::{sha256, Hash};
+        let mut bytes = Vec::new();
+        fs::File::open(&self.cookie)?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= 4096,
+            "invalid RPC cookie size"
+        );
+        Ok(sha256::Hash::hash(&bytes).to_byte_array())
+    }
     pub fn new(endpoint: &str, cookie: &Path) -> Result<Self> {
         let url = Url::parse(endpoint).context("invalid RPC URL")?;
         ensure!(

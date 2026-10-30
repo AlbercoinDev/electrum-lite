@@ -73,12 +73,15 @@ pendientes de catch-up, ni se cambia la pareja Lite/Core instalada públicamente
 
 ## Sigue pendiente
 
-[PENDIENTE] Conectar este API a la mempool separada y servidor Electrum;
+[PENDIENTE] Conectar este API al servidor Electrum;
 readiness requiere alcanzar Core observado y mempool completa.
 
 Continuación: [sincronizador LSM con RPC, reorg y prueba Core aislada](lsm-sync-status.md).
 La integración del servidor/mempool sigue pendiente; no confundir ese avance
 con un servicio Electrum LSM ya publicado.
+
+La [mempool LSM](lsm-mempool-status.md) ya usa estos snapshots para reconciliar
+sin mutar el estado confirmado; resta integrar el worker/servidor.
 El préstamo del snapshot impide mutar el coordinador hasta soltarlo: todavía no
 se ha implementado un lector de archivo concurrente independiente. Las consultas
 se usarán primero desde un worker serializado y acotado, fuera de tareas async.
