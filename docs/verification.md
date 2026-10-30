@@ -1,0 +1,208 @@
+# Evidencia local — reescritura thin
+
+Fecha: 2026-10-30. Linux x86-64, Rust 1.99.1, Bitcoin Core 31.0.0.
+Pruebas de laboratorio offline, no sincronización pública ni GUI.
+
+## Build
+
+Se ejecutó sobre el árbol nuevo:
+
+```text
+cargo fmt --check                                      OK
+cargo clippy --locked --all-targets -- -D warnings      OK
+cargo test --locked                                    5 passed; 0 failed
+cargo build --release --locked                         OK
+```
+
+Los cinco tests cubren restricción de RPC a loopback sin userinfo, rechazo de
+hash erróneo, rechazo de witness completamente eliminado aunque el TXID/Merkle
+coincidan, ausencia de conexión directa tras un fallo SOCKS y persistencia/undo
+con ocurrencias duplicadas de TXID.
+
+## Prueba TCP extremo a extremo
+
+```sh
+python3 scripts/smoke_regtest.py \
+  --bitcoind /tmp/opencode/bitcoin-31.0/bin/bitcoind \
+  --bitcoin-cli /tmp/opencode/bitcoin-31.0/bin/bitcoin-cli \
+  --electrum-lite target/release/electrum-lite
+```
+
+Resultado real:
+
+```text
+Verified checkpoint: .../backup (historical cache is replaceable and not included)
+Semantic replay verified at height 103: .../audit
+PASS: initial sync, JSON batch, mempool/RBF, raw/verbose tx, subscriptions, balance, UTXO, Merkle proof
+PASS: simulated missing Core block -> witness-block P2P -> persistent cache; corrupt witness rejected
+PASS: reorg, restart, verified backup, semantic replay audit
+PASS: offline disposable regtest smoke (no existing node touched)
+```
+
+La primera ejecución encontró un problema del generador de prueba: al invalidar
+un bloque y minar inmediatamente podía recrearse el mismo bloque marcado inválido.
+Se corrigió avanzando el mocktime para la nueva rama; la ejecución posterior pasó.
+No se disfrazó este caso de prueba como un error del índice.
+
+La ausencia histórica fue **simulada** mediante un proxy RPC loopback. El bloque
+se descargó realmente por Bitcoin P2P de un Core local aislado. Se modificó un
+byte witness de la caché y fue rechazado. No se borraron bloques físicamente.
+
+## Instalación comprobada
+
+`sh install.sh` terminó correctamente y dejó el ejecutable en:
+
+```text
+/home/albit/.local/bin/electrum-lite
+electrum-lite 0.0.1-beta.1
+```
+
+SHA256 idéntico para `target/release/electrum-lite` y el ejecutable instalado:
+
+```text
+8b8a78a6a9eb41ea3d4bcd3c7fe652db5d479cb6e55ab757aaec7f37c60a2733
+```
+
+`ldd` solo requiere el loader GNU, libc, libm, libgcc_s y libstdc++; libclang no es
+dependencia de ejecución. Eso no demuestra compatibilidad con cualquier Linux.
+Se ejecutó también `scripts/devnet.py` con una raíz nueva: creó 101 bloques e
+imprimió los comandos manuales; después se detuvo su Core dedicado.
+
+## Historial preservado
+
+Se recuperó `.git` desde el remoto, no el código anterior. HEAD histórico:
+`a971a2d1077b5a6805c94e6541f8004095ae1389`.
+Tag original intacto:
+`v0.0.1-beta.1 -> accc8cd00c061fa2a1cff9455826d89d76584351`.
+En el momento de esa comprobación, la reescritura seguía sin publicar; esta
+sección registra el estado histórico, no el estado actual de GitHub.
+
+## Ampliación: supervisor y Tor opcional
+
+La compilación ampliada supera nuevamente fmt, Clippy y release. Ahora son
+**7 tests unitarios**: añade rechazo de directorios Core ajenos y el bloqueo
+duro de poda automática mainnet, antes de iniciar procesos.
+
+SHA256 del ejecutable ampliado:
+
+```text
+5fed1a39f75abb926cfd2a137cd6e4c8cdd880a3ada743ec61cc002ca6b8e150
+```
+
+Se volvió a ejecutar el smoke TCP completo sobre esa compilación: todos los
+PASS anteriores, incluyendo audit/restart/reorg/RBF, siguen pasando.
+
+### Tor real sin fallback
+
+Se utilizó el ejecutable real Tor 0.4.9.15 del paquete Debian, sin instalar un
+servicio global ni reutilizar torrc/datos del usuario:
+
+```sh
+python3 scripts/tor_smoke.py \
+  --bitcoind /tmp/opencode/bitcoin-31.0/bin/bitcoind \
+  --tor-bin /tmp/opencode/tor-runtime/usr/bin/tor
+```
+
+Resultado observado:
+
+```text
+PASS: actual private Tor process started and identified over cookie-authenticated control
+PASS: rejected Tor request and stopped Tor both fail closed; sentinel observed zero direct connections
+PASS: explicit direct mode retrieves byte-exact witness transaction from local P2P; Tor remains optional
+```
+
+El caso offline desactiva la red de Tor de forma deliberada. Se encontró que
+`DisableNetwork=1` cierra también SOCKS; por eso la app autentica y comprueba el
+PID por el control privado, sin exigir que SOCKS/bootstrap estén disponibles para
+servir consultas locales. Ante la falta de Tor, el histórico remoto falla.
+
+### Tor público + P2P real (solo génesis)
+
+```sh
+python3 scripts/tor_public_smoke.py \
+  --bitcoind /tmp/opencode/bitcoin-31.0/bin/bitcoind \
+  --tor-bin /tmp/opencode/tor-runtime/usr/bin/tor --allow-public
+```
+
+Resultado observado:
+
+```text
+PASS: real Tor public bootstrap and Bitcoin P2P witness-block retrieval; byte-exact mainnet genesis transaction verified
+PASS: Core stayed offline at height 0; only genesis requested; no wallet or public API used; not full mainnet sync
+```
+
+Tor alcanzó bootstrap 100%. La transacción génesis descargada por el transporte
+P2P real de la app coincidió byte a byte con Core. Ninguna cartera ni consulta
+de scripthash fue enviada fuera. Esto **no demuestra anonimato**, rendimiento,
+disponibilidad de cualquier histórico ni sincronización completa de mainnet.
+
+### Supervisor: IBD P2P, poda física y recuperación
+
+```sh
+python3 scripts/managed_prune_smoke.py \
+  --bitcoind /tmp/opencode/bitcoin-31.0/bin/bitcoind \
+  --electrum-lite target/release/electrum-lite \
+  --temp-dir target/regtest-smoke-tmp
+```
+
+Dos nodos regtest dedicados offline. El archivador minó **601 bloques pequeños
+y 450 de unos 950 kB** (cerca del peso máximo por su tamaño sin witness).
+El Core del supervisor hizo IBD **por P2P**, no por copia de archivos ni submitblock.
+Se verificaron pausa/reanudación por lag, rechazo de un segundo gestor intentando
+adoptar el mismo Core y cierre limpio de los hijos propios.
+
+Resultado real de la compilación ampliada:
+
+```text
+PASS: owned startup, lag pause/resume and clean managed shutdown
+PASS: physical deletion ['blk00000.dat'], pruneheight=743, blk bytes 435757598 -> 301586402
+PASS: original witness transaction recovered over P2P after deletion; repeat served from cache with archival P2P disabled; local Merkle proof valid
+PASS: second semantic audit streamed the pruned prefix over P2P without growing the wallet cache
+PASS: pending prune blocks automatic restart; no existing node used
+```
+
+No es únicamente un RPC exitoso: se comprobó la desaparición del archivo y el
+rechazo `getblock` para el bloque histórico, antes de recuperar la transacción
+original desde el otro Core por P2P. Después se apagó P2P del archivador y se
+repitió la consulta desde caché, con prueba Merkle calculada localmente.
+Una segunda operación auditó el prefijo ya podado sin añadirlo a la caché.
+Finalmente se inyectó un intento inconcluso y se comprobó que el modo automático
+no arrancaba otro Core. Todos los nodos se detuvieron; la raíz temporal se eliminó.
+
+Hallazgos corregidos durante la prueba:
+
+- La salud compartía la cola del indexador y un lote grande podía bloquear al
+  supervisor más de 10 segundos. Ahora es una instantánea publicada independiente;
+  la cancelación entre bloques permite cerrar el worker y sincronizar WAL.
+- El primer volumen de 551 bloques no era podable con Core normal: exige al menos
+  1000 en estas redes. Se añadió preflight y se llevó la prueba a altura 1051,
+  sin `fastprune`. El rechazo previo dejó el intento incierto protegido, sin
+  reanudación automática ni borrado de marcadores para eludir el bloqueo.
+
+Las cifras de bytes corresponden **solo a los archivos blk del Core podado**,
+no al total de Core + archivador + índice + backups ni al pico temporal completo.
+No son una medición de capacidad/rendimiento mainnet.
+
+### Instalación ampliada comprobada
+
+Se ejecutó nuevamente `sh install.sh` tras las pruebas y se verificó SHA256
+idéntico entre `target/release/electrum-lite` y
+`/home/albit/.local/bin/electrum-lite`:
+`5fed1a39f75abb926cfd2a137cd6e4c8cdd880a3ada743ec61cc002ca6b8e150`.
+El `--help` instalado incluye `managed-serve`, backpressure, `--auto-prune` y Tor
+opcional. La versión sigue siendo `0.0.1-beta.1`; el binario anterior queda en
+`electrum-lite.previous`. La instalación no inicia servicios ni nodos.
+
+El paquete actual se denomina
+`dist/electrum-lite-thin-managed-experimental-linux-x86_64.tar.gz`; el paquete
+básico anterior no se sobrescribe. Son artefactos locales sin firma y no son
+construcciones del tag inicial.
+
+## No demostrado
+
+Interoperabilidad GUI, IBD público sostenido, recuperación profunda, fuentes
+públicas sostenidas, tamaño mainnet, presupuestos RSS y cortes físicos de energía.
+La prueba física anterior es regtest; no acredita poda segura en mainnet ni
+co-sincronización sostenida en Signet/Testnet4. La poda mainnet sigue bloqueada.
+La evidencia acredita una **versión para probar**, no la finalización de todas
+las optimizaciones ni aptitud para fondos reales.

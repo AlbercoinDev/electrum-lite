@@ -1,3 +1,23 @@
+# Rewrite status (2026-10-30)
+
+The user explicitly requested a from-scratch thin-server rewrite in this directory,
+deleted the previous tree, and authorized implementation. Historical instructions
+below describe the archived engine at commit a971a2d, NOT the new implementation.
+Where architecture differs, the rewrite scope in docs/rewrite.md and the current
+README take precedence: RocksDB, disposable historical block cache, direct P2P or
+optional Tor, no mandatory permanent archive. Do not restore the old implementation
+or claim that its tests validate the new code. Preserve its safety requirements
+where applicable: version/tag, isolated test nodes, fail-closed behavior, network
+identity, witness verification, BIP30 occurrences, bounded resources, no mainnet
+pruning, explicit backups/new destinations and no unrequested data deletion.
+
+Run cargo fmt --check, cargo clippy --locked --all-targets -- -D warnings,
+cargo test --locked, cargo build --release --locked, and the disposable regtest
+smoke. Keep documented limitations explicit. No claims of production readiness,
+full network sync, privacy guarantees, measured mainnet capacity or GUI testing.
+
+# Historical engine instructions (reference only)
+
 # Repository status and source of truth
 
 - Keep app version `0.0.1-beta.1` unchanged and do not move the original tag. Current main has the private Electrum daemon, mempool, reorgs, maintenance pruning and recovery CLI. Do not claim production readiness, full public-network sync or tested Sparrow GUI interoperability.

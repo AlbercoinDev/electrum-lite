@@ -1,249 +1,188 @@
 use crate::{
-    index::{script_hash, Coin},
-    rpc::Core,
-    store::Store,
-    MAX_BLOCK_BYTES,
+    core::Core,
+    index::{key, script_hash, Index},
 };
 use anyhow::{ensure, Context, Result};
 use bitcoin::{
     consensus::{deserialize, serialize},
     OutPoint, Transaction, Txid,
 };
-use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
-
-#[derive(Clone, Serialize)]
-pub struct Pending {
-    pub tx_hash: Txid,
-    pub height: i32,
-    pub fee: u64,
-}
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct Mempool {
-    pub raw: HashMap<Txid, Transaction>,
-    pub history: HashMap<String, Vec<Pending>>,
-    pub delta: HashMap<String, i64>,
-    pub outputs: HashMap<OutPoint, Coin>,
-    pub spent: HashSet<OutPoint>,
-    fees: HashMap<Txid, u64>,
+    pub raw: BTreeMap<Txid, Transaction>,
+    pub history: BTreeMap<[u8; 32], Vec<Value>>,
+    pub delta: BTreeMap<[u8; 32], i64>,
+    pub outputs: BTreeMap<OutPoint, ([u8; 32], u64, i32)>,
+    pub spent: BTreeSet<OutPoint>,
 }
-
-#[derive(Clone, Copy, Serialize)]
-pub struct Budget {
-    pub transactions: usize,
-    pub bytes: usize,
-    pub entries: usize,
-}
-
 impl Mempool {
-    pub fn reconcile(
-        &mut self,
-        core: &Core,
-        store: &Store,
-        budget: Budget,
-        stop: Option<&std::sync::atomic::AtomicBool>,
-    ) -> Result<()> {
-        let tip = store.stats()?.tip.context("empty confirmed index")?.1;
-        let max_transactions = budget.transactions;
-        let max_bytes = budget.bytes;
-        let response_limit = max_transactions
-            .saturating_mul(68)
-            .saturating_add(65536)
-            .min(64 * 1024 * 1024);
-        let ids: Vec<Txid> =
-            core.call_with_limit("getrawmempool", json!([false]), response_limit)?;
-        ensure!(
-            ids.len() <= max_transactions,
-            "mempool transaction budget exceeded; refusing incomplete history"
-        );
-        let set: HashSet<_> = ids.iter().copied().collect();
-        self.raw.retain(|id, _| set.contains(id));
-        let mut bytes: usize = self.raw.values().map(|tx| serialize(tx).len()).sum();
-        let mut fetched = 0;
-        for id in &ids {
-            ensure!(
-                !stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Relaxed)),
-                "shutdown requested"
-            );
-            if self.raw.contains_key(id) {
-                continue;
-            }
-            ensure!(fetched < 500, "mempool snapshot warming; retry next cycle");
-            let hex: String = core.call("getrawtransaction", json!([id.to_string(), false]))?;
-            ensure!(
-                hex.len() <= MAX_BLOCK_BYTES * 2,
-                "mempool transaction too large"
-            );
-            let raw = hex::decode(hex)?;
-            bytes = bytes
-                .checked_add(raw.len())
-                .context("mempool bytes overflow")?;
-            ensure!(
-                bytes <= max_bytes,
-                "mempool byte budget exceeded; refusing incomplete history"
-            );
-            let transaction: Transaction = deserialize(&raw)?;
-            ensure!(transaction.compute_txid() == *id, "mempool TXID mismatch");
-            self.raw.insert(*id, transaction);
-            fetched += 1;
-        }
-        ensure!(bytes <= max_bytes, "mempool byte budget exceeded");
-        let entries: usize = self
-            .raw
-            .values()
-            .map(|tx| tx.input.len() + tx.output.len())
-            .sum();
-        ensure!(
-            entries <= budget.entries,
-            "mempool input/output entry budget exceeded; refusing incomplete history"
-        );
-        let mut history: HashMap<String, Vec<Pending>> = HashMap::new();
-        let mut delta = HashMap::new();
-        let mut outputs = HashMap::new();
-        let mut spent = HashSet::new();
-        let mut fees = HashMap::new();
-        for (id, tx) in &self.raw {
-            let mut affected = HashSet::new();
-            let mut input_value = 0u64;
-            let mut output_value = 0u64;
-            let mut parents = false;
-            for input in &tx.input {
-                ensure!(
-                    spent.insert(input.previous_output),
-                    "conflicting mempool snapshot"
-                );
-                let coin = if let Some(parent) = self.raw.get(&input.previous_output.txid) {
-                    parents = true;
-                    let output = parent
-                        .output
-                        .get(input.previous_output.vout as usize)
-                        .context("invalid mempool prevout")?;
-                    Coin {
-                        value: output.value.to_sat(),
-                        height: 0,
-                        coinbase: false,
-                        scripthash: script_hash(&output.script_pubkey),
-                    }
-                } else {
-                    store
-                        .coin(input.previous_output)?
-                        .context("mempool/confirmed snapshot changed")?
-                };
-                input_value = input_value
-                    .checked_add(coin.value)
-                    .context("mempool value overflow")?;
-                affected.insert(coin.scripthash.clone());
-                add(&mut delta, &coin.scripthash, -i64::try_from(coin.value)?)?;
-            }
-            for (vout, output) in tx.output.iter().enumerate() {
-                let hash = script_hash(&output.script_pubkey);
-                affected.insert(hash.clone());
-                output_value = output_value
-                    .checked_add(output.value.to_sat())
-                    .context("mempool value overflow")?;
-                if output.script_pubkey.is_op_return() || output.script_pubkey.len() > 10_000 {
-                    continue;
-                }
-                let value = output.value.to_sat();
-                add(&mut delta, &hash, i64::try_from(value)?)?;
-                outputs.insert(
-                    OutPoint {
-                        txid: *id,
-                        vout: vout.try_into()?,
-                    },
-                    Coin {
-                        value,
-                        height: 0,
-                        coinbase: false,
-                        scripthash: hash,
-                    },
+    pub fn fee_histogram(&self) -> Result<Value> {
+        let mut fees = BTreeMap::new();
+        for rows in self.history.values() {
+            for row in rows {
+                fees.insert(
+                    row["tx_hash"].as_str().context("mempool txid")?.to_owned(),
+                    row["fee"].as_u64().context("mempool fee")?,
                 );
             }
-            let fee = input_value
-                .checked_sub(output_value)
-                .context("negative mempool fee")?;
-            fees.insert(*id, fee);
-            for hash in affected {
-                history.entry(hash).or_default().push(Pending {
-                    tx_hash: *id,
-                    height: if parents { -1 } else { 0 },
-                    fee,
-                });
-            }
         }
-        let after: Vec<Txid> =
-            core.call_with_limit("getrawmempool", json!([false]), response_limit)?;
-        let active: String = core.call("getbestblockhash", json!([]))?;
-        ensure!(
-            active == tip.to_string() && after.into_iter().collect::<HashSet<_>>() == set,
-            "mempool/chain changed during reconciliation"
-        );
-        for list in history.values_mut() {
-            list.sort_by_key(|p| (-p.height, p.tx_hash.to_string()));
-        }
-        self.history = history;
-        self.delta = delta;
-        self.outputs = outputs;
-        self.spent = spent;
-        self.fees = fees;
-        Ok(())
-    }
-
-    pub fn fee_histogram(&self) -> Value {
-        let mut bins: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut buckets = BTreeMap::<u64, u64>::new();
         for (id, tx) in &self.raw {
-            let fee = self.fees.get(id).copied().unwrap_or(0);
             let size = tx.vsize() as u64;
-            let rate = fee / size.max(1);
-            let bin = if rate == 0 {
-                0
-            } else {
-                1u64 << (63 - rate.leading_zeros())
-            };
-            *bins.entry(bin).or_default() += size;
+            let fee = fees.get(&id.to_string()).context("missing mempool fee")?;
+            *buckets.entry(fee / size.max(1)).or_default() += size;
         }
-        json!(bins
+        Ok(json!(buckets
             .into_iter()
             .rev()
             .map(|(fee, size)| json!([fee, size]))
-            .collect::<Vec<_>>())
+            .collect::<Vec<_>>()))
     }
-}
-
-fn add(map: &mut HashMap<String, i64>, hash: &str, value: i64) -> Result<()> {
-    let entry = map.entry(hash.to_owned()).or_default();
-    *entry = entry
-        .checked_add(value)
-        .context("pending balance overflow")?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn fee_histogram_is_bounded_and_accounts_for_all_vbytes() {
-        let mut pool = Mempool::default();
-        let base = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).txdata
-            [0]
-        .clone();
-        let mut expected = 0;
-        for i in 0..100 {
-            let mut tx = base.clone();
-            tx.lock_time = bitcoin::absolute::LockTime::from_consensus(i);
-            let id = tx.compute_txid();
-            expected += tx.vsize() as u64;
-            pool.fees.insert(id, u64::from(i) * 1000);
-            pool.raw.insert(id, tx);
-        }
-        let histogram = pool.fee_histogram();
-        let bins = histogram.as_array().unwrap();
-        assert!(bins.len() <= 64);
-        assert_eq!(
-            bins.iter().map(|b| b[1].as_u64().unwrap()).sum::<u64>(),
-            expected
+    pub fn load(index: &Index, core: &Core) -> Result<Self> {
+        let ids = core.call("getrawmempool", json!([]))?;
+        let ids = ids.as_array().context("mempool list")?;
+        ensure!(
+            ids.len() <= 10_000,
+            "mempool exceeds experimental 10000 transaction limit"
         );
+        let mut m = Self::default();
+        let mut total = 0;
+        for id in ids {
+            let id: Txid = id.as_str().context("txid")?.parse()?;
+            let bytes = core.call("getrawtransaction", json!([id.to_string(), false]))?;
+            let bytes = hex::decode(bytes.as_str().context("raw transaction")?)?;
+            total += bytes.len();
+            ensure!(total <= 32 * 1024 * 1024, "mempool byte limit");
+            let tx: Transaction = deserialize(&bytes)?;
+            ensure!(tx.compute_txid() == id, "mempool txid mismatch");
+            m.raw.insert(id, tx);
+        }
+        let mut pending: BTreeSet<Txid> = m.raw.keys().copied().collect();
+        while !pending.is_empty() {
+            let before = pending.len();
+            for id in pending.clone() {
+                let tx = &m.raw[&id];
+                if tx
+                    .input
+                    .iter()
+                    .any(|i| pending.contains(&i.previous_output.txid))
+                {
+                    continue;
+                }
+                let height = if tx
+                    .input
+                    .iter()
+                    .any(|i| m.raw.contains_key(&i.previous_output.txid))
+                {
+                    -1
+                } else {
+                    0
+                };
+                let mut scripts = BTreeSet::new();
+                let mut input_value = 0u64;
+                let mut output_value = 0u64;
+                for input in &tx.input {
+                    let op = input.previous_output;
+                    ensure!(m.spent.insert(op), "mempool conflicting spends");
+                    let (s, v) = if let Some((s, v, _)) = m.outputs.get(&op) {
+                        (*s, *v)
+                    } else {
+                        let coin = index
+                            .db
+                            .get(key(b'C', &serialize(&op)))?
+                            .context("mempool prevout unavailable")?;
+                        ensure!(coin.len() == 48, "corrupt confirmed coin");
+                        (
+                            coin[..32].try_into()?,
+                            u64::from_le_bytes(coin[32..40].try_into()?),
+                        )
+                    };
+                    scripts.insert(s);
+                    *m.delta.entry(s).or_default() -= i64::try_from(v)?;
+                    input_value = input_value
+                        .checked_add(v)
+                        .context("input amount overflow")?;
+                }
+                for (n, o) in tx.output.iter().enumerate() {
+                    let s = script_hash(o.script_pubkey.as_bytes());
+                    let v = o.value.to_sat();
+                    scripts.insert(s);
+                    output_value = output_value.checked_add(v).context("output overflow")?;
+                    if !o.script_pubkey.is_op_return() {
+                        *m.delta.entry(s).or_default() += i64::try_from(v)?;
+                        m.outputs
+                            .insert(OutPoint::new(id, n as u32), (s, v, height));
+                    }
+                }
+                let fee = input_value
+                    .checked_sub(output_value)
+                    .context("negative mempool fee")?;
+                for s in scripts {
+                    m.history
+                        .entry(s)
+                        .or_default()
+                        .push(json!({"tx_hash":id.to_string(),"height":height,"fee":fee}));
+                }
+                pending.remove(&id);
+            }
+            ensure!(pending.len() < before, "mempool dependency cycle");
+        }
+        // A changing snapshot is unavailable, never silently incomplete.
+        let after = core.call("getrawmempool", json!([]))?;
+        let after: BTreeSet<String> = after
+            .as_array()
+            .context("mempool")?
+            .iter()
+            .map(|x| x.as_str().unwrap_or("").to_owned())
+            .collect();
+        let before: BTreeSet<String> = m.raw.keys().map(ToString::to_string).collect();
+        ensure!(after == before, "mempool changed while reconciling; retry");
+        for history in m.history.values_mut() {
+            history.sort_by(|a, b| {
+                b["height"]
+                    .as_i64()
+                    .cmp(&a["height"].as_i64())
+                    .then_with(|| a["tx_hash"].as_str().cmp(&b["tx_hash"].as_str()))
+            });
+        }
+        Ok(m)
+    }
+    pub fn history(&self, index: &Index, s: &[u8; 32]) -> Result<Value> {
+        let mut h = index.history(s)?.as_array().context("history")?.clone();
+        if let Some(rows) = self.history.get(s) {
+            for row in rows {
+                h.push(json!({"tx_hash":row["tx_hash"],"height":row["height"]}));
+            }
+        }
+        ensure!(
+            h.len() <= 100_000,
+            "history limit exceeded; no partial response"
+        );
+        Ok(json!(h))
+    }
+    pub fn unspent(&self, index: &Index, s: &[u8; 32]) -> Result<Value> {
+        let mut out = Vec::new();
+        for row in index.unspent(s)?.as_array().context("unspent")? {
+            let id: Txid = row["tx_hash"].as_str().context("txid")?.parse()?;
+            let op = OutPoint::new(id, row["tx_pos"].as_u64().context("vout")? as u32);
+            if !self.spent.contains(&op) {
+                out.push(row.clone());
+            }
+        }
+        for (op, (script, v, _)) in &self.outputs {
+            if script == s && !self.spent.contains(op) {
+                out.push(
+                    json!({"tx_hash":op.txid.to_string(),"tx_pos":op.vout,"value":v,"height":0}),
+                );
+            }
+        }
+        ensure!(
+            out.len() <= 100_000,
+            "unspent limit exceeded; no partial response"
+        );
+        Ok(json!(out))
     }
 }

@@ -1,584 +1,510 @@
-//! Experimental Linux supervisor for an explicitly dedicated test Core.
-//! Never targets an existing RPC endpoint: it signals only children it started.
-use crate::Chain;
-use anyhow::{ensure, Context, Result};
+//! Supervisor for an explicitly dedicated Core. Never adopts an existing process.
+use crate::core::Core;
+use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
-    fs::{self, OpenOptions},
-    io::{BufRead, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt, process::CommandExt},
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
-pub struct Options {
-    pub lsm: bool,
-    pub chain: Chain,
+pub struct Config {
+    pub network: String,
     pub data_dir: PathBuf,
     pub core_dir: PathBuf,
     pub bitcoind: PathBuf,
-    pub rpc_port: u16,
+    pub core_rpc: String,
     pub listen: SocketAddr,
-    pub offline: bool,
-    pub auto_prune: Option<AutoPrune>,
+    pub p2p_port: u16,
+    pub high: u32,
+    pub low: u32,
+    pub auto_prune: bool,
+    pub prune_interval: u32,
+    pub peers: Vec<String>,
+    pub proxy: Option<String>,
 }
-
-pub struct AutoPrune {
-    pub backup_root: PathBuf,
-    pub interval_blocks: u32,
-}
-
-fn prune_due(height: u64, checkpoint: u32, interval: u32) -> bool {
-    height
-        .checked_sub(288)
-        .is_some_and(|eligible| eligible >= u64::from(checkpoint) + u64::from(interval))
-}
-
-/// Runs only after the owned daemon stopped, with its exclusive archive lock.
-/// Any failure leaves networking disabled; the caller stops the owned Core.
-fn automatic_maintenance(
-    data: &Path,
-    cookie: PathBuf,
-    endpoint: String,
-    chain: Chain,
-    backup_root: &Path,
-    lsm: bool,
-) -> Result<Value> {
-    let core = crate::rpc::Core::new(&endpoint, &cookie)?;
-    #[cfg(feature = "experimental-lsm")]
-    if lsm {
-        let mut store = crate::experimental_lsm::BitcoinStore::open(data, chain)?;
-        store.prune_checkpoint()?;
-        let active = core.call::<Value>("getnetworkinfo", json!([]))?["networkactive"]
-            .as_bool()
-            .context("missing network state")?;
-        let _: Value = core.call("setnetworkactive", json!([false]))?;
-        let parent = tempfile::Builder::new()
-            .prefix("lsm-prune-")
-            .tempdir_in(backup_root)?
-            .keep();
-        let result = store.prune_offline(
-            &core,
-            &parent.join("backup"),
-            &parent.join("verified"),
-            512 * 1024 * 1024,
-            true,
-        )?;
-        if active {
-            let _: Value = core.call("setnetworkactive", json!([true]))?;
-        }
-        return Ok(result);
-    }
-    ensure!(!lsm, "LSM feature required");
-    let mut archive = crate::archive::Archive::open(data, chain, true)?;
-    let mut store = crate::store::Store::open(
-        &archive.directory().join("index.sqlite"),
-        chain,
-        crate::store::Limits {
-            transactions: 10_000_000_000,
-            entries: 100_000_000_000,
-        },
-    )?;
-    store.recover(&mut archive)?;
-    store.prune_checkpoint()?;
-    let network: Value = core.call("getnetworkinfo", json!([]))?;
-    let active = network["networkactive"]
-        .as_bool()
-        .context("missing Core network state")?;
-    let _: Value = core.call("setnetworkactive", json!([false]))?;
-    // Random NEW destination; retained on every failure, never reused/deleted.
-    let backup = tempfile::Builder::new()
-        .prefix("auto-prune-")
-        .tempdir_in(backup_root)?;
-    let parent = backup.keep();
-    let result = crate::operations::prune(
-        &store,
-        &mut archive,
-        &core,
-        chain,
-        &parent.join("backup"),
-        512 * 1024 * 1024,
-    )?;
-    if active {
-        let _: Value = core.call("setnetworkactive", json!([true]))?;
-    }
-    Ok(result)
-}
-
 struct OwnedChild(Child);
-impl std::ops::Deref for OwnedChild {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.0
+impl OwnedChild {
+    fn spawn(c: &mut Command) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
+        Ok(Self(c.stdin(Stdio::null()).spawn()?))
     }
-}
-impl std::ops::DerefMut for OwnedChild {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.0
+    fn live(&mut self) -> Result<()> {
+        ensure!(
+            self.0.try_wait()?.is_none(),
+            "owned child exited unexpectedly"
+        );
+        Ok(())
+    }
+    fn stop(&mut self) -> Result<()> {
+        if let Some(status) = self.0.try_wait()? {
+            ensure!(status.success(), "child failed: {status}");
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            ensure!(
+                Command::new("kill")
+                    .args(["-TERM", &self.0.id().to_string()])
+                    .status()?
+                    .success(),
+                "cannot signal owned child"
+            );
+        }
+        #[cfg(not(unix))]
+        self.0.kill()?;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(45) {
+            if let Some(status) = self.0.try_wait()? {
+                ensure!(
+                    status.success(),
+                    "child did not shut down cleanly: {status}"
+                );
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        bail!("owned child shutdown timed out; maintenance aborted")
     }
 }
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            // Best effort on every error path, without signalling any unrelated process.
-            if let Ok(pid) = libc::pid_t::try_from(self.0.id()) {
-                eprintln!("Supervisor: salida inesperada; solicitando parada del proceso dedicado {pid} (sin confirmación)");
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-            }
+        if self.0.try_wait().ok().flatten().is_none() && self.stop().is_err() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 }
-
-fn signal_on_parent_death(cmd: &mut Command) {
-    let parent = std::process::id() as libc::pid_t;
-    // Only async-signal-safe libc calls are made between fork and exec.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent {
-                libc::_exit(125);
-            }
-            Ok(())
-        });
-    }
-}
-
-fn check_executable(path: &Path) -> Result<()> {
-    let metadata = fs::metadata(path)?;
-    ensure!(
-        metadata.is_file() && metadata.permissions().mode() & 0o6000 == 0,
-        "executable must be regular and not setuid/setgid"
-    );
-    let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    let attribute = c"security.capability";
-    // Capabilities on exec clear the Linux parent-death signal. Do not assume
-    // protection if their absence cannot be verified.
-    let count =
-        unsafe { libc::getxattr(name.as_ptr(), attribute.as_ptr(), std::ptr::null_mut(), 0) };
-    if count >= 0 {
-        anyhow::bail!("executable has file capabilities; parent-death protection is unavailable");
-    }
-    let error = std::io::Error::last_os_error();
-    ensure!(
-        matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)),
-        "cannot verify executable capabilities: {error}"
-    );
+fn durable_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::File::open(path.parent().context("parent")?)?.sync_all()?;
     Ok(())
 }
-
-fn stop_owned(child: &mut Child, label: &str) -> Result<()> {
-    if child.try_wait()?.is_some() {
-        eprintln!("{label}: proceso ya detenido");
-        return Ok(());
-    }
-    let pid: libc::pid_t = child.id().try_into()?;
-    eprintln!("{label}: solicitando parada ordenada del proceso dedicado {pid}");
-    // The Child remains unreaped: its pid cannot have been recycled.
-    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-    ensure!(
-        result == 0,
-        "could not signal owned child: {}",
-        std::io::Error::last_os_error()
-    );
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            eprintln!("{label}: parada confirmada ({status})");
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "{label}: parada no confirmada; revise el proceso dedicado"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+fn event(path: &Path, name: &str, extra: Value) -> Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    writeln!(f, "{}", json!({"event":name,"details":extra}))?;
+    f.sync_all()?;
+    fs::File::open(path.parent().context("event parent")?)?.sync_all()?;
+    eprintln!("supervisor: {name} {extra}");
+    Ok(())
 }
-
-fn probe(address: SocketAddr, chain: Chain) -> Result<Value> {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(4)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(
-        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.health\",\"params\":[]}\n",
-    )?;
+fn health(listen: SocketAddr) -> Result<Value> {
+    let mut s = TcpStream::connect_timeout(&listen, Duration::from_secs(3))?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    s.set_write_timeout(Some(Duration::from_secs(3)))?;
+    s.write_all(b"{\"id\":1,\"method\":\"server.health\",\"params\":[]}\n")?;
     let mut line = String::new();
-    std::io::BufReader::new(stream)
-        .take(65536)
-        .read_line(&mut line)?;
-    let response: Value = serde_json::from_str(&line)?;
-    ensure!(
-        response["id"] == 1 && response.get("error").is_none(),
-        "invalid health response"
-    );
-    ensure!(
-        response["result"]["network"] == chain.name(),
-        "health network mismatch"
-    );
-    Ok(response["result"].clone())
+    BufReader::new(s).take(65537).read_line(&mut line)?;
+    ensure!(line.len() < 65536, "health response limit");
+    let r: Value = serde_json::from_str(&line)?;
+    ensure!(r["error"].is_null(), "health request failed");
+    Ok(r["result"].clone())
 }
-
-fn prepare_core_root(path: &Path, chain: Chain) -> Result<PathBuf> {
-    // Never adopt an existing directory or node. A marker from this command is
-    // required on restart, and the configuration must remain exactly ours.
-    let marker = path.join("electrum-lite-dedicated.json");
-    let conf = path.join("electrum-lite-core.conf");
-    let identity = json!({"owner":"electrum-lite-dedicated-v1","network":chain.name()}).to_string();
-    if !path.exists() {
-        fs::create_dir(path)
-            .context("dedicated Core root must be new and its parent must exist")?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)?;
-        file.write_all(identity.as_bytes())?;
-        file.sync_all()?;
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&conf)?;
-        file.sync_all()?;
-        std::fs::File::open(path)?.sync_all()?;
-        std::fs::File::open(
-            path.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new(".")),
-        )?
-        .sync_all()?;
+impl Config {
+    fn base_command(&self, cookie: &Path) -> Result<Command> {
+        let mut c = Command::new(std::env::current_exe()?);
+        c.args(["--network", &self.network, "--data-dir"])
+            .arg(&self.data_dir)
+            .arg("--core-cookie")
+            .arg(cookie)
+            .args([
+                "--core-rpc",
+                &self.core_rpc,
+                "--listen",
+                &self.listen.to_string(),
+            ]);
+        for peer in &self.peers {
+            c.args(["--block-peer", peer]);
+        }
+        if let Some(proxy) = &self.proxy {
+            c.args(["--socks-proxy", proxy]);
+        }
+        Ok(c)
     }
-    ensure!(
-        fs::symlink_metadata(path)?.file_type().is_dir(),
-        "dedicated Core root must be a real directory"
-    );
-    ensure!(
-        fs::symlink_metadata(&marker)?.file_type().is_file()
-            && fs::metadata(&marker)?.len() <= 256
-            && fs::read_to_string(&marker)? == identity,
-        "Core root is not this supervisor's dedicated directory"
-    );
-    ensure!(
-        fs::symlink_metadata(&conf)?.file_type().is_file() && fs::metadata(&conf)?.len() == 0,
-        "dedicated Core configuration changed; refusing startup"
-    );
-    Ok(path.canonicalize()?)
+    fn server(&self, cookie: &Path) -> Result<OwnedChild> {
+        OwnedChild::spawn(self.base_command(cookie)?.arg("serve"))
+    }
 }
-
-pub async fn run(options: Options) -> Result<()> {
+pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     ensure!(
-        !options.lsm || cfg!(feature = "experimental-lsm"),
-        "LSM feature required"
+        c.listen.ip().is_loopback(),
+        "managed listener must be loopback; tunnel for remote access"
     );
     ensure!(
-        options.chain != Chain::Mainnet,
-        "managed Core is experimental and limited to test networks"
+        c.high > c.low && c.high > 0 && c.prune_interval > 0,
+        "invalid supervisor thresholds"
     );
     ensure!(
-        options.listen.ip().is_loopback() && options.listen.port() != 0 && options.rpc_port != 0,
-        "explicit nonzero loopback ports are required"
+        !c.auto_prune || c.network != "mainnet",
+        "mainnet automatic pruning is blocked"
     );
-    let executable = options
-        .bitcoind
-        .canonicalize()
-        .context("bitcoind executable missing")?;
-    check_executable(&executable)?;
-    let app_executable = std::env::current_exe()?.canonicalize()?;
-    check_executable(&app_executable)?;
-    let root = prepare_core_root(&options.core_dir, options.chain)?;
-    let app_root = if options.data_dir.exists() {
-        options.data_dir.canonicalize()?
+    ensure!(
+        !c.core_dir.is_symlink(),
+        "dedicated Core root symlink refused"
+    );
+    let core_dir = if c.core_dir.exists() {
+        fs::canonicalize(&c.core_dir)?
     } else {
-        let parent = options
-            .data_dir
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        parent.canonicalize()?.join(
-            options
-                .data_dir
-                .file_name()
-                .context("data root requires a filename")?,
-        )
+        fs::create_dir_all(&c.core_dir)?;
+        fs::canonicalize(&c.core_dir)?
     };
+    let rpc_address: SocketAddr = c
+        .core_rpc
+        .strip_prefix("http://")
+        .context("loopback RPC URL required")?
+        .trim_end_matches('/')
+        .parse()?;
     ensure!(
-        !root.starts_with(&app_root) && !app_root.starts_with(&root),
-        "Core and Electrum data roots must be separate"
+        rpc_address.ip().is_loopback(),
+        "Core RPC must bind loopback"
     );
-    let mut prune_checkpoint = 0;
-    if let Some(policy) = &options.auto_prune {
+    let root = c.data_dir.join(&c.network);
+    ensure!(!root.is_symlink(), "data root symlink refused");
+    fs::create_dir_all(&root)?;
+    let absolute_root = fs::canonicalize(&root)?;
+    ensure!(
+        !absolute_root.starts_with(&core_dir) && !core_dir.starts_with(&absolute_root),
+        "Core and Lite roots must be separate, not nested"
+    );
+    let identity = format!(
+        "ELTHIN-DEDICATED-1\nnetwork={}\nrpc={}\np2p={}\nindex={}\n",
+        c.network,
+        rpc_address.port(),
+        c.p2p_port,
+        absolute_root.display()
+    );
+    let marker = core_dir.join("electrum-lite.owner");
+    if marker.exists() {
         ensure!(
-            policy.interval_blocks >= 288,
-            "automatic prune interval must be >=288 blocks"
+            fs::read_to_string(&marker)? == identity,
+            "dedicated Core configuration mismatch"
         );
-        let backup = policy
-            .backup_root
-            .canonicalize()
-            .context("backup root must already exist")?;
+    } else {
         ensure!(
-            backup.is_dir() && !backup.starts_with(&app_root) && !backup.starts_with(&root),
-            "backup root must be a directory outside Core and application data"
+            fs::read_dir(&core_dir)?.next().is_none(),
+            "refusing existing Core data without ownership marker"
         );
-        #[cfg(feature = "experimental-lsm")]
-        if options.lsm {
-            let store = if app_root.join(options.chain.name()).exists() {
-                crate::experimental_lsm::BitcoinStore::open(&app_root, options.chain)?
-            } else {
-                crate::experimental_lsm::BitcoinStore::create(&app_root, options.chain)?
-            };
-            prune_checkpoint = store.prune_checkpoint()?.map_or(0, |audit| audit.requested);
-        }
-        if !options.lsm {
-            let mut archive = crate::archive::Archive::open(&app_root, options.chain, true)?;
-            let mut store = crate::store::Store::open(
-                &archive.directory().join("index.sqlite"),
-                options.chain,
-                crate::store::Limits {
-                    transactions: 10_000_000_000,
-                    entries: 100_000_000_000,
-                },
-            )?;
-            store.recover(&mut archive)?;
-            prune_checkpoint = store.prune_checkpoint()?;
-        }
+        durable_new(&marker, identity.as_bytes())?;
     }
-    // Refuse occupied ports before launching either child; the applications also
-    // independently bind them, and failures stop the owned Core.
-    drop(TcpListener::bind(options.listen).context("Electrum listen port already in use")?);
-    drop(
-        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, options.rpc_port))
-            .context("Core RPC port already in use")?,
-    );
-    let cookie = root.join(options.chain.name()).join(".cookie");
-    let endpoint = format!("http://127.0.0.1:{}/", options.rpc_port);
-    let mut app_command = Command::new(app_executable);
-    let app = &mut app_command;
-    app.arg("--network")
-        .arg(options.chain.name())
-        .arg("--data-dir")
-        .arg(&options.data_dir)
-        .arg(if options.lsm { "lsm-serve" } else { "serve" })
-        .arg("--cookie-file")
-        .arg(&cookie)
-        .arg("--rpc-url")
-        .arg(&endpoint)
-        .arg("--listen")
-        .arg(options.listen.to_string());
-    signal_on_parent_death(app);
-    let mut app = OwnedChild(
-        app_command
-            .spawn()
-            .context("failed to start Electrum Lite")?,
-    );
-    eprintln!("Supervisor: esperando verificación de Electrum Lite; Core aún no se ha iniciado.");
-    let startup = Instant::now();
-    let ctrl = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl);
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    loop {
-        if let Some(status) = app.try_wait()? {
-            anyhow::bail!("Electrum Lite stopped before Core startup: {status}");
-        }
-        let address = options.listen;
-        let chain = options.chain;
-        if let Ok(Ok(health)) = tokio::task::spawn_blocking(move || probe(address, chain)).await {
-            if !options.lsm || (health["backend"] == "lsm" && health["generation"].is_number()) {
-                break;
-            }
-        }
+    let conf = core_dir.join("electrum-lite.conf");
+    let conf_bytes = b"# Dedicated Core owned by Electrum Lite; settings supplied on CLI.\n";
+    if conf.exists() {
         ensure!(
-            startup.elapsed() < Duration::from_secs(600),
-            "index verification did not complete; Core was not started"
+            fs::read(&conf)? == conf_bytes,
+            "managed Core configuration was modified"
         );
-        tokio::select! { _=&mut ctrl=>{stop_owned(&mut app,"Electrum Lite")?;return Ok(());}, _=terminate.recv()=>{stop_owned(&mut app,"Electrum Lite")?;return Ok(());}, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
+    } else {
+        durable_new(&conf, conf_bytes)?;
     }
-    let flag = match options.chain {
-        Chain::Signet => "-signet",
-        Chain::Testnet4 => "-testnet4",
-        Chain::Regtest => "-regtest",
-        Chain::Mainnet => unreachable!(),
+    if c.auto_prune {
+        ensure!(
+            !root.join("prune-pending").exists(),
+            "unfinished prune blocks automatic startup; preserve audit and recover"
+        );
+    }
+    let maintenance = root.join("supervisor");
+    ensure!(!maintenance.is_symlink(), "maintenance symlink refused");
+    fs::create_dir_all(&maintenance)?;
+    let events = maintenance.join("events.jsonl");
+    let network_dir = match c.network.as_str() {
+        "mainnet" => core_dir.clone(),
+        name => core_dir.join(name),
     };
-    let mut command = Command::new(executable);
+    let cookie = network_dir.join(".cookie");
+    let core = Core::new(c.core_rpc.clone(), cookie.clone())?;
+    let pid = core_dir.join("electrum-lite.pid");
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(maintenance.join("core.log"))?;
+    let mut command = Command::new(&c.bitcoind);
     command
-        .arg(flag)
-        .arg(format!("-datadir={}", root.display()))
-        .arg(format!(
-            "-conf={}",
-            root.join("electrum-lite-core.conf").display()
-        ))
-        .arg(format!("-rpcport={}", options.rpc_port))
+        .arg(format!("-datadir={}", core_dir.display()))
+        .arg(format!("-conf={}", conf.display()))
+        .arg(format!("-pid={}", pid.display()))
         .args([
             "-server=1",
+            "-listen=1",
             "-daemon=0",
+            "-nosettings",
             "-prune=1",
             "-txindex=0",
-            "-rpcbind=127.0.0.1",
-            "-rpcallowip=127.0.0.1",
-        ]);
-    if options.offline {
-        command.args(["-listen=0", "-networkactive=0", "-dnsseed=0", "-connect=0"]);
+            "-dbcache=64",
+            "-listenonion=0",
+            "-discover=0",
+        ])
+        .arg(format!("-rpcport={}", rpc_address.port()))
+        .arg(format!("-port={}", c.p2p_port))
+        .arg(format!("-bind=127.0.0.1:{}", c.p2p_port))
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    if c.network != "mainnet" {
+        command.arg(format!("-{}", c.network));
     }
-    signal_on_parent_death(&mut command);
-    let mut core = match command.spawn() {
-        Ok(child) => OwnedChild(child),
-        Err(error) => {
-            let _ = stop_owned(&mut app, "Electrum Lite");
-            return Err(error.into());
-        }
-    };
-    eprintln!(
-        "Supervisor: Core dedicado iniciado en poda manual (prune=1); prune=550 no está validado."
-    );
-    if let Some(policy) = &options.auto_prune {
-        eprintln!("Supervisor: poda automática coordinada habilitada; intervalo={} alturas elegibles, margen=288; auditoría y backup completo antes de borrar. No es una garantía de espacio ni velocidad.", policy.interval_blocks);
+    if c.network == "regtest" {
+        command.args(["-connect=0", "-dnsseed=0", "-fallbackfee=0.00001"]);
     }
-    let mut last_health = Instant::now();
-    let core_started = Instant::now();
-    let mut core_seen = false;
-    let mut errors = 0u32;
-    let (reason, failed) = loop {
-        if let Some(status) = app.try_wait()? {
-            break (format!("Electrum Lite terminó: {status}; causa detallada no disponible si terminó abruptamente"), true);
+    let mut node = OwnedChild::spawn(&mut command)?;
+    let startup = Instant::now();
+    loop {
+        node.live()?;
+        ensure!(!stop.load(Ordering::Relaxed), "startup interrupted");
+        ensure!(
+            startup.elapsed() < Duration::from_secs(60),
+            "dedicated Core startup timed out"
+        );
+        // Do not authenticate to or stop an old Core using the same port/root.
+        if fs::read_to_string(&pid)
+            .ok()
+            .is_some_and(|p| p.trim() == node.0.id().to_string())
+            && core.call("getblockchaininfo", json!([])).is_ok()
+        {
+            break;
         }
-        if let Some(status) = core.try_wait()? {
-            break (format!("Core dedicado terminó: {status}"), true);
+        thread::sleep(Duration::from_millis(100));
+    }
+    event(
+        &events,
+        "core_owned",
+        json!({"pid":node.0.id(),"manual_pruning":true}),
+    )?;
+    let mut daemon = c.server(&cookie)?;
+    let mut started = Instant::now();
+    let mut paused = false;
+    let mut last_maintenance = 0u32;
+    for entry in fs::read_dir(&root)? {
+        let name = entry?.file_name();
+        if let Some(height) = name.to_string_lossy().strip_prefix("prune-complete-") {
+            last_maintenance = last_maintenance.max(
+                height
+                    .parse::<u32>()
+                    .context("invalid prune record filename")?,
+            );
         }
-        let address = options.listen;
-        let chain = options.chain;
-        match tokio::task::spawn_blocking(move || probe(address, chain)).await {
-            Ok(Ok(health)) => {
-                last_health = Instant::now();
-                if health["core_height"].is_number() {
-                    core_seen = true;
-                }
-                if let Some(policy) = &options.auto_prune {
-                    if health["last_error"].is_null()
-                        && health["indexed_tip"]["height"]
-                            .as_u64()
-                            .is_some_and(|height| {
-                                prune_due(height, prune_checkpoint, policy.interval_blocks)
-                            })
-                    {
-                        eprintln!("Poda automática: ventana de mantenimiento; deteniendo el escritor antes de auditar y respaldar.");
-                        if let Err(error) = stop_owned(&mut app, "Electrum Lite") {
-                            break (
-                                format!("automatic prune could not stop writer: {error}"),
-                                true,
-                            );
-                        }
-                        let data = app_root.clone();
-                        let cookie = cookie.clone();
-                        let endpoint = endpoint.clone();
-                        let backup_root = policy.backup_root.clone();
-                        let lsm = options.lsm;
-                        let result = tokio::task::spawn_blocking(move || {
-                            automatic_maintenance(&data, cookie, endpoint, chain, &backup_root, lsm)
-                        })
-                        .await;
-                        match result {
-                            Ok(Ok(report)) => {
-                                prune_checkpoint = report["requested"]
-                                    .as_u64()
-                                    .context("automatic prune report missing cursor")?
-                                    .try_into()?;
-                                eprintln!("Poda automática completada: {report}");
-                                match app_command.spawn() {
-                                    Ok(child) => app = OwnedChild(child),
-                                    Err(error) => {
-                                        break (
-                                            format!(
-                                                "failed to restart after automatic prune: {error}"
-                                            ),
-                                            true,
-                                        )
-                                    }
-                                }
-                                last_health = Instant::now();
-                                errors = 0;
-                                continue;
-                            }
-                            error => {
-                                break (format!("automatic prune failed closed: {error:?}"), true)
-                            }
-                        }
-                    }
-                }
-                if core_seen || core_started.elapsed() > Duration::from_secs(120) {
-                    if let Some(error) = health["last_error"].as_str() {
-                        if !error.contains("mempool snapshot warming")
-                            && !(options.lsm && error == "confirmed index catching up")
-                        {
-                            errors += 1;
-                        } else {
-                            errors = 0;
-                        }
-                        if errors >= 3 {
-                            break (format!("Electrum Lite no puede continuar: {error}"), true);
-                        }
-                    } else {
-                        errors = 0;
-                    }
-                }
+    }
+    let mut health_seen = false;
+    let discover_sources = c.peers.is_empty();
+    while !stop.load(Ordering::Relaxed) {
+        node.live()?;
+        daemon.live()?;
+        let state = match health(c.listen) {
+            Ok(v) => {
+                health_seen = true;
+                v
             }
-            _ => {
-                if last_health.elapsed() > Duration::from_secs(45) {
-                    break (
-                        "Electrum Lite no responde al control de salud; causa desconocida"
-                            .to_owned(),
-                        true,
-                    );
+            Err(e) => {
+                ensure!(
+                    !health_seen && started.elapsed() < Duration::from_secs(60),
+                    "Electrum health unavailable: {e}"
+                );
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        ensure!(
+            state["pid"].as_u64() == Some(u64::from(daemon.0.id())),
+            "Electrum listener belongs to another process; refusing adoption"
+        );
+        let info = core.call("getblockchaininfo", json!([]))?;
+        ensure!(
+            info["pruned"] == true && info["automatic_pruning"] == false,
+            "dedicated Core must stay in manual pruning mode"
+        );
+        let tip: u32 = info["blocks"].as_u64().context("Core height")?.try_into()?;
+        if discover_sources {
+            let peers = core.call("getpeerinfo", json!([]))?;
+            for peer in peers.as_array().context("Core peer list")? {
+                let services = peer["services"]
+                    .as_str()
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    .unwrap_or(0);
+                let Some(address) = peer["addr"].as_str() else {
+                    continue;
+                };
+                if services & 9 == 9 && c.peers.len() < 8 && !c.peers.iter().any(|p| p == address) {
+                    c.peers.push(address.to_owned());
                 }
             }
         }
-        tokio::select! { _=&mut ctrl=>break ("parada solicitada por usuario".to_owned(), false), _=terminate.recv()=>break ("parada solicitada por SIGTERM".to_owned(), false), _=tokio::time::sleep(Duration::from_secs(2))=>{} }
-    };
-    eprintln!("Supervisor: {reason}");
-    let core_result = stop_owned(&mut core, "Bitcoin Core dedicado");
-    let app_result = stop_owned(&mut app, "Electrum Lite");
-    core_result?;
-    app_result?;
-    ensure!(
-        !failed,
-        "supervised service failed; Core stop was confirmed"
-    );
+        let indexed = state["indexed_height"].as_u64();
+        let lag = (u64::from(tip) + 1).saturating_sub(indexed.map_or(0, |n| n + 1));
+        if !paused && lag >= u64::from(c.high) {
+            core.call("setnetworkactive", json!([false]))?;
+            paused = true;
+            event(
+                &events,
+                "backpressure_pause",
+                json!({"lag":lag,"core_height":tip,"indexed_height":indexed}),
+            )?;
+        }
+        if paused && lag <= u64::from(c.low) {
+            core.call("setnetworkactive", json!([true]))?;
+            paused = false;
+            event(&events, "backpressure_resume", json!({"lag":lag}))?;
+        }
+        if c.auto_prune
+            && tip >= crate::TESTNET_PRUNE_MIN_HEIGHT
+            && tip.saturating_sub(last_maintenance) >= c.prune_interval
+            && lag == 0
+            && state["ready"] == true
+            && state["mempool_transactions"] == 0
+        {
+            daemon.stop()?;
+            let block_dir = network_dir.join("blocks");
+            let before = block_files(&block_dir)?;
+            core.call("setnetworkactive", json!([false]))?;
+            event(
+                &events,
+                "maintenance_offline",
+                json!({"height":tip,"electrum_stopped":true,"networkactive":false}),
+            )?;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let audit = maintenance.join(format!("audit-{tip}-{stamp}"));
+            let backup = maintenance.join(format!("backup-{tip}-{stamp}"));
+            let mut pruning = OwnedChild::spawn(
+                c.base_command(&cookie)?
+                    .args(["--confirm-prune", "--audit-dir"])
+                    .arg(audit)
+                    .arg("--backup-dir")
+                    .arg(backup)
+                    .arg("prune"),
+            )?;
+            let status = loop {
+                if let Some(status) = pruning.0.try_wait()? {
+                    break status;
+                }
+                ensure!(
+                    !stop.load(Ordering::Relaxed),
+                    "maintenance interrupted; owned Core will stop without resuming"
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            ensure!(
+                status.success(),
+                "coordinated prune failed; Core will stop, no automatic resume"
+            );
+            last_maintenance = tip;
+            let after = block_files(&block_dir)?;
+            let deleted: Vec<_> = before
+                .keys()
+                .filter(|name| !after.contains_key(*name))
+                .cloned()
+                .collect();
+            event(
+                &events,
+                "maintenance_complete",
+                json!({"height":tip,"pruneheight":core.call("getblockchaininfo",json!([]))?["pruneheight"],"deleted_block_files":deleted,"block_file_bytes_before":before.values().sum::<u64>(),"block_file_bytes_after":after.values().sum::<u64>()}),
+            )?;
+            daemon = c.server(&cookie)?;
+            started = Instant::now();
+            health_seen = false;
+            core.call("setnetworkactive", json!([true]))?;
+            paused = false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    daemon.stop()?;
+    // Stop only the dedicated child whose PID we verified, never an adopted node.
+    core.call("stop", json!([]))?;
+    let deadline = Instant::now();
+    loop {
+        if let Some(status) = node.0.try_wait()? {
+            ensure!(status.success(), "Core shutdown failed: {status}");
+            break;
+        }
+        ensure!(
+            deadline.elapsed() < Duration::from_secs(45),
+            "Core shutdown timed out"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    event(&events, "shutdown", json!({"clean":true}))?;
     Ok(())
+}
+fn block_files(path: &Path) -> Result<std::collections::BTreeMap<String, u64>> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("blk") && name.ends_with(".dat") {
+            ensure!(
+                entry.file_type()?.is_file(),
+                "unexpected non-file in owned Core block directory"
+            );
+            files.insert(name, entry.metadata()?.len());
+        }
+    }
+    Ok(files)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn rejects_unowned_or_changed_core_directory_without_modifying_it() {
-        let root = tempfile::tempdir().unwrap();
-        let existing = root.path().join("existing");
-        fs::create_dir(&existing).unwrap();
-        fs::write(existing.join("user-data"), b"preserve").unwrap();
-        assert!(prepare_core_root(&existing, Chain::Regtest).is_err());
-        assert_eq!(fs::read(existing.join("user-data")).unwrap(), b"preserve");
-        let own = root.path().join("owned");
-        prepare_core_root(&own, Chain::Regtest).unwrap();
-        assert!(prepare_core_root(&own, Chain::Signet).is_err());
-        fs::write(own.join("electrum-lite-core.conf"), b"prune=550").unwrap();
-        assert!(prepare_core_root(&own, Chain::Regtest).is_err());
-        assert_eq!(
-            fs::read(own.join("electrum-lite-core.conf")).unwrap(),
-            b"prune=550"
-        );
+    fn config(root: &Path) -> Config {
+        Config {
+            network: "regtest".to_owned(),
+            data_dir: root.join("lite"),
+            core_dir: root.join("core"),
+            bitcoind: PathBuf::from("must-not-be-launched"),
+            core_rpc: "http://127.0.0.1:18443".to_owned(),
+            listen: "127.0.0.1:50001".parse().expect("address"),
+            p2p_port: 18444,
+            high: 200,
+            low: 20,
+            auto_prune: false,
+            prune_interval: 2016,
+            peers: Vec::new(),
+            proxy: None,
+        }
     }
-
     #[test]
-    fn automatic_prune_schedule_keeps_margin_and_uses_persistent_cursor() {
-        assert!(!prune_due(287, 0, 288));
-        assert!(!prune_due(575, 0, 288));
-        assert!(prune_due(576, 0, 288));
-        assert!(!prune_due(863, 288, 288));
-        assert!(prune_due(864, 288, 288));
-        assert!(!prune_due(100, 1000, 288)); // Reorg must not reset the cursor.
+    fn never_adopts_unowned_core() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("el-supervisor-unowned-{}", std::process::id()));
+        fs::create_dir_all(root.join("core"))?;
+        fs::write(root.join("core/wallet.dat"), b"preserve")?;
+        let result = run(config(&root), Arc::new(AtomicBool::new(false)));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refusing existing Core data"));
+        assert_eq!(fs::read(root.join("core/wallet.dat"))?, b"preserve");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn mainnet_auto_prune_hard_gate() {
+        let root =
+            std::env::temp_dir().join(format!("el-mainnet-prune-gate-{}", std::process::id()));
+        let mut c = config(&root);
+        c.network = "mainnet".to_owned();
+        c.auto_prune = true;
+        let e = run(c, Arc::new(AtomicBool::new(false))).unwrap_err();
+        assert!(e
+            .to_string()
+            .contains("mainnet automatic pruning is blocked"));
+        assert!(!root.exists());
     }
 }

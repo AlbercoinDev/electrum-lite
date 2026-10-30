@@ -1,15 +1,5 @@
-# Rust build artifacts (when implementation starts).
 /target/
 /dist/
 __pycache__/
 *.pyc
-
-# Local configuration, secrets and node/index data.
-.env
-.env.*
-!.env.example
-*.cookie
-.cookie
 /data/
-/bitcoin-data/
-/config/local*.toml

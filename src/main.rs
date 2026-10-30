@@ -1,695 +1,277 @@
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
-
-use anyhow::{ensure, Context, Result};
-use bitcoin::{consensus::serialize, Txid};
-use clap::{Parser, Subcommand};
-use electrum_lite::{
-    archive::Archive,
-    rpc::Core,
-    store::{Limits, Store},
-    Chain,
-};
-use serde_json::{json, Value};
+use anyhow::{ensure, Result};
+use bitcoin::Network;
+use clap::Parser;
+use electrum_lite::{core::Core, index::Index};
+use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Electrum Lite beta: private Electrum server, durable Bitcoin archive and indexes."
+    about = "Experimental thin Electrum server — not production ready"
 )]
-struct Cli {
-    #[arg(long, value_enum)]
-    network: Chain,
-    /// Root directory; a network-specific subdirectory is always added.
-    #[arg(long, default_value = "./data", global = true)]
+struct Args {
+    #[arg(long, default_value="regtest", value_parser=["mainnet","signet","testnet4","regtest"])]
+    network: String,
+    #[arg(long)]
     data_dir: PathBuf,
-    /// Cumulative transaction safety cap during new indexing/import (not an RSS limit).
-    #[arg(long, default_value_t = 10_000_000_000usize, global = true)]
-    max_index_transactions: usize,
-    /// Combined persistent UTXO + history occurrence cap during new indexing/import.
-    #[arg(long, default_value_t = 100_000_000_000usize, global = true)]
-    max_index_entries: usize,
-    /// Maximum history or UTXO entries returned for one script. Never silently truncates.
-    #[arg(long, default_value_t = 10_000, global = true)]
-    max_query_results: usize,
-    #[command(subcommand)]
-    command: Command,
+    #[arg(long)]
+    core_cookie: Option<PathBuf>,
+    #[arg(long, default_value = "http://127.0.0.1:18443")]
+    core_rpc: String,
+    #[arg(long, default_value = "127.0.0.1:50001")]
+    listen: SocketAddr,
+    #[arg(long)]
+    allow_lan: bool,
+    /// Explicit historical P2P sources (host:port); otherwise reuse Core peer addresses.
+    #[arg(long)]
+    block_peer: Vec<String>,
+    /// Start a private Tor subprocess; requires the tor executable. No direct fallback.
+    #[arg(long, conflicts_with = "socks_proxy")]
+    tor: bool,
+    /// Use an existing SOCKS5 proxy for historical P2P, with remote name resolution.
+    #[arg(long)]
+    socks_proxy: Option<String>,
+    #[arg(long, default_value = "127.0.0.1:19050")]
+    tor_socks: String,
+    /// NEW destination for a verified RocksDB checkpoint before test-network pruning.
+    #[arg(long)]
+    backup_dir: Option<PathBuf>,
+    #[arg(long)]
+    confirm_prune: bool,
+    /// NEW semantic replay destination; retained for inspection.
+    #[arg(long)]
+    audit_dir: Option<PathBuf>,
+    #[arg(long)]
+    core_dir: Option<PathBuf>,
+    #[arg(long, default_value = "bitcoind")]
+    bitcoind: PathBuf,
+    #[arg(long, default_value_t = 18444)]
+    core_p2p_port: u16,
+    #[arg(long)]
+    confirm_dedicated: bool,
+    #[arg(long)]
+    auto_prune: bool,
+    #[arg(long, default_value_t = 200)]
+    pause_lag: u32,
+    #[arg(long, default_value_t = 20)]
+    resume_lag: u32,
+    #[arg(long, default_value_t = 2016)]
+    prune_interval: u32,
+    #[arg(value_parser=["sync","serve","managed-serve","health","backup","audit","prune"], default_value="serve")]
+    command: String,
 }
-
-#[derive(Subcommand)]
-enum Command {
-    /// Experimental new LSM Electrum 1.4 server; requires a dedicated Core.
-    #[cfg(all(feature = "experimental-lsm", target_os = "linux"))]
-    LsmServe {
-        #[arg(long)]
-        rpc_url: Option<String>,
-        #[arg(long)]
-        cookie_file: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:60601")]
-        listen: SocketAddr,
-        #[arg(long, default_value_t = 1000)]
-        poll_milliseconds: u64,
-        #[arg(long, default_value_t = 512)]
-        min_free_mib: u64,
-        #[arg(long, default_value_t = 16)]
-        max_connections: usize,
-        #[arg(long, default_value_t = 64)]
-        max_subscriptions: usize,
-        #[arg(long, default_value_t = 20_000)]
-        max_mempool_transactions: usize,
-        #[arg(long, default_value_t = 64)]
-        max_mempool_mib: usize,
-        #[arg(long, default_value_t = 500_000)]
-        max_mempool_entries: usize,
-        #[arg(long, default_value_t = 128)]
-        mempool_fetch_per_pass: usize,
-        #[arg(long, default_value_t = 10)]
-        mempool_max_age_seconds: u64,
-    },
-    /// Supervise a dedicated test Core; optional coordinated automatic pruning.
-    #[cfg(target_os = "linux")]
-    ManagedServe {
-        /// Select the experimental LSM child and maintenance path (feature required).
-        #[arg(long)]
-        lsm: bool,
-        #[arg(long)]
-        bitcoind: PathBuf,
-        #[arg(long)]
-        core_dir: PathBuf,
-        #[arg(long)]
-        rpc_port: u16,
-        #[arg(long, default_value = "127.0.0.1:50001")]
-        listen: SocketAddr,
-        /// Confirm the supervisor may start and stop its dedicated child Core.
-        #[arg(long)]
-        confirm_dedicated: bool,
-        /// Disable P2P for isolated tests.
-        #[arg(long)]
-        offline: bool,
-        /// Automatically prune verified durable prefixes of the owned test Core.
-        #[arg(long, requires = "prune_backup_root")]
-        auto_prune: bool,
-        /// Existing parent for NEW backups per prune; never automatically deleted.
-        #[arg(long, requires = "auto_prune")]
-        prune_backup_root: Option<PathBuf>,
-        /// Minimum new eligible heights between automatic maintenance windows (>=288).
-        #[arg(long, default_value_t = 2016)]
-        auto_prune_interval_blocks: u32,
-    },
-    /// Recover a deep reorg into a NEW root using matching archived blocks and Core's new branch.
-    RecoverChain {
-        #[arg(long)]
-        rpc_url: Option<String>,
-        #[arg(long)]
-        cookie_file: PathBuf,
-        #[arg(long)]
-        output_root: PathBuf,
-        #[arg(long, default_value_t = 512)]
-        min_free_mib: u64,
-        /// Optional trusted historical Core via numeric loopback (e.g. an SSH tunnel).
-        #[arg(long, requires = "historical_cookie_file")]
-        historical_rpc_url: Option<String>,
-        #[arg(long, requires = "historical_rpc_url")]
-        historical_cookie_file: Option<PathBuf>,
-    },
-    /// Validate a backup manifest and checksums without modifying data.
-    VerifyBackup {
-        #[arg(long)]
-        directory: PathBuf,
-    },
-    /// Restore a verified backup into a NEW data root; never overwrite current data.
-    Restore {
-        #[arg(long)]
-        backup_dir: PathBuf,
-        #[arg(long)]
-        output_root: PathBuf,
-    },
-    /// Run the private Electrum server with continuous synchronization and mempool reconciliation.
-    Serve {
-        #[arg(long)]
-        rpc_url: Option<String>,
-        #[arg(long)]
-        cookie_file: PathBuf,
-        #[arg(long, default_value = "127.0.0.1:50001")]
-        listen: SocketAddr,
-        #[arg(long, default_value_t = 2)]
-        poll_seconds: u64,
-        #[arg(long, default_value_t = 512)]
-        min_free_mib: u64,
-        #[arg(long, default_value_t = 50_000)]
-        max_mempool_transactions: usize,
-        #[arg(long, default_value_t = 64)]
-        max_mempool_mib: usize,
-        #[arg(long, default_value_t = 500_000)]
-        max_mempool_entries: usize,
-        #[arg(long, default_value_t = 16)]
-        max_connections: usize,
-        #[arg(long, default_value_t = 1000)]
-        max_subscriptions: usize,
-    },
-    /// Ask a running local daemon for readiness and counters.
-    Health {
-        #[arg(long, default_value = "127.0.0.1:50001")]
-        address: SocketAddr,
-    },
-    /// Continuously display local synchronization and pruning status; Ctrl+C to stop.
-    Monitor {
-        #[arg(long, default_value = "127.0.0.1:50001")]
-        address: SocketAddr,
-        #[arg(long, default_value_t = 5)]
-        interval: u64,
-    },
-    /// Copy a closed matching archive/index generation into a NEW backup directory.
-    Backup {
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Reconstruct and compare all semantic index data against the archived intent log.
-    Audit,
-    /// Explicit schema-1 -> schema-2 migration, with a mandatory NEW backup directory.
-    MigrateIndex {
-        #[arg(long)]
-        backup_dir: PathBuf,
-    },
-    /// Audited manual Core pruning on test networks only; never enabled by the daemon.
-    Prune {
-        #[arg(long)]
-        rpc_url: Option<String>,
-        #[arg(long)]
-        cookie_file: PathBuf,
-        #[arg(long)]
-        backup_dir: PathBuf,
-        #[arg(long)]
-        confirm: bool,
-        #[arg(long, default_value_t = 512)]
-        min_free_mib: u64,
-    },
-    /// Check Core identity without downloading blocks.
-    CheckCore {
-        #[arg(long)]
-        rpc_url: Option<String>,
-        #[arg(long)]
-        cookie_file: PathBuf,
-    },
-    /// Recover durable indexes and fetch a bounded batch. Never calls pruning RPCs.
-    Sync {
-        #[arg(long)]
-        rpc_url: Option<String>,
-        #[arg(long)]
-        cookie_file: PathBuf,
-        #[arg(long, default_value_t = 100)]
-        max_blocks: u32,
-        #[arg(long)]
-        to_height: Option<u32>,
-    },
-    /// Verify the entire archive, SQLite consistency and committed references.
-    Inspect,
-    /// Build a separate new SQLite index from the archive, without replacing existing data.
-    RebuildIndex {
-        #[arg(long)]
-        output: PathBuf,
-    },
-    /// Confirmed history and UTXOs; no mempool, coinbase maturity or Electrum service.
-    History { scripthash: String },
-    /// Retrieve raw transaction hex from an archived block (offline).
-    Transaction {
-        txid: String,
-        /// Disambiguate historical duplicate TXIDs.
-        #[arg(long)]
-        height: Option<u32>,
-    },
-}
-
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    ensure!(
-        cli.max_index_transactions > 0,
-        "transaction limit must be positive"
-    );
-    ensure!(cli.max_index_entries > 0, "entry limit must be positive");
-    ensure!(cli.max_query_results > 0, "query limit must be positive");
-    let limits = Limits {
-        transactions: cli.max_index_transactions,
-        entries: cli.max_index_entries,
+    let a = Args::parse();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = stop.clone();
+    ctrlc::set_handler(move || signal.store(true, std::sync::atomic::Ordering::Relaxed))?;
+    let network = match a.network.as_str() {
+        "mainnet" => Network::Bitcoin,
+        "signet" => Network::Signet,
+        "testnet4" => Network::Testnet4,
+        _ => Network::Regtest,
     };
-    match cli.command {
-        #[cfg(all(feature = "experimental-lsm", target_os = "linux"))]
-        Command::LsmServe {
-            rpc_url,
-            cookie_file,
-            listen,
-            poll_milliseconds,
-            min_free_mib,
-            max_connections,
-            max_subscriptions,
-            max_mempool_transactions,
-            max_mempool_mib,
-            max_mempool_entries,
-            mempool_fetch_per_pass,
-            mempool_max_age_seconds,
-        } => {
-            let options = electrum_lite::experimental_lsm::server::Options {
-                chain: cli.network,
-                root: cli.data_dir,
-                core: core(cli.network, rpc_url, cookie_file)?,
-                listen,
-                connections: max_connections,
-                subscriptions: max_subscriptions,
-                query_limit: cli.max_query_results,
-                index_limits: electrum_lite::experimental_lsm::IndexLimits {
-                    transactions: cli.max_index_transactions.try_into()?,
-                    entries: cli.max_index_entries.try_into()?,
-                },
-                mempool_budget: electrum_lite::experimental_lsm::mempool::Budget {
-                    transactions: max_mempool_transactions,
-                    bytes: max_mempool_mib
-                        .checked_mul(1024 * 1024)
-                        .context("mempool byte limit overflow")?,
-                    entries: max_mempool_entries,
-                    fetch_per_pass: mempool_fetch_per_pass,
-                    max_age: std::time::Duration::from_secs(mempool_max_age_seconds),
-                    ..Default::default()
-                },
-                poll: std::time::Duration::from_millis(poll_milliseconds),
-                min_free_bytes: min_free_mib
-                    .checked_mul(1024 * 1024)
-                    .context("free-space threshold overflow")?,
-            };
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()?
-                .block_on(electrum_lite::experimental_lsm::server::run(options))?;
-        }
-        #[cfg(target_os = "linux")]
-        Command::ManagedServe {
-            lsm,
-            bitcoind,
-            core_dir,
-            rpc_port,
-            listen,
-            confirm_dedicated,
-            offline,
-            auto_prune,
-            prune_backup_root,
-            auto_prune_interval_blocks,
-        } => {
+    let root = a.data_dir.join(&a.network);
+    ensure!(!root.is_symlink(), "data root symlink refused");
+    if root.exists() {
+        for entry in std::fs::read_dir(&root)? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
             ensure!(
-                confirm_dedicated,
-                "explicit --confirm-dedicated is required; this supervises its own test Core only"
+                matches!(
+                    name.as_ref(),
+                    "index" | "cache" | "tor" | "prune-pending" | "supervisor"
+                ) || name.starts_with("prune-complete-"),
+                "unrecognized/legacy data root; choose a NEW root, no migration performed"
             );
-            let options = electrum_lite::supervisor::Options {
-                lsm,
-                chain: cli.network,
-                data_dir: cli.data_dir,
-                core_dir,
-                bitcoind,
-                rpc_port,
-                listen,
-                offline,
-                auto_prune: if auto_prune {
-                    Some(electrum_lite::supervisor::AutoPrune {
-                        backup_root: prune_backup_root.context("backup root required")?,
-                        interval_blocks: auto_prune_interval_blocks,
-                    })
-                } else {
-                    None
-                },
-            };
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(electrum_lite::supervisor::run(options))?;
-        }
-        Command::RecoverChain {
-            rpc_url,
-            cookie_file,
-            output_root,
-            min_free_mib,
-            historical_rpc_url,
-            historical_cookie_file,
-        } => {
-            let core = core(cli.network, rpc_url, cookie_file)?;
-            let historical = historical_rpc_url
-                .zip(historical_cookie_file)
-                .map(|(url, cookie)| Core::new(&url, &cookie))
-                .transpose()?;
-            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
-            let mut store = Store::open(
-                &archive.directory().join("index.sqlite"),
-                cli.network,
-                limits,
-            )?;
-            store.recover(&mut archive)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&electrum_lite::operations::recover_chain(
-                    &store,
-                    &archive,
-                    &core,
-                    electrum_lite::operations::RecoveryOptions {
-                        chain: cli.network,
-                        limits,
-                        output: &output_root,
-                        min_free: min_free_mib
-                            .checked_mul(1024 * 1024)
-                            .context("free-space limit overflow")?,
-                        historical: historical.as_ref(),
-                    },
-                    |height| {
-                        use std::io::{IsTerminal, Write};
-                        ensure!(std::io::stdin().is_terminal(), "historical source requires interactive terminal confirmation; no connection attempted");
-                        eprintln!("El Core local ha podado el bloque {height}. La recuperación usará el Core histórico configurado para bloques canónicos ausentes. Solo usa una fuente confiable; puede revelar qué bloques necesitas.");
-                        eprint!("¿Autorizar esta fuente para esta recuperación? Escribe SI: ");
-                        std::io::stderr().flush()?;
-                        let mut answer = String::new();
-                        std::io::stdin().read_line(&mut answer)?;
-                        Ok(answer.trim() == "SI")
-                    }
-                )?)?
-            );
-        }
-        Command::VerifyBackup { directory } => {
-            let files = electrum_lite::operations::verify_backup(&directory, cli.network)?;
-            println!(
-                "{}",
-                json!({"verified_files":files.len(),"network":cli.network})
-            );
-        }
-        Command::Restore {
-            backup_dir,
-            output_root,
-        } => {
-            electrum_lite::operations::restore(&backup_dir, &output_root, cli.network)?;
-            println!(
-                "{}",
-                json!({"restored":output_root,"next":"run inspect; schema-1 backups require migration or the previous binary"})
-            );
-        }
-        Command::Serve {
-            rpc_url,
-            cookie_file,
-            listen,
-            poll_seconds,
-            min_free_mib,
-            max_mempool_transactions,
-            max_mempool_mib,
-            max_mempool_entries,
-            max_connections,
-            max_subscriptions,
-        } => {
-            let options = electrum_lite::electrum::Options {
-                transport: electrum_lite::electrum::TransportLimits {
-                    connections: max_connections,
-                    subscriptions: max_subscriptions,
-                },
-                chain: cli.network,
-                data_dir: cli.data_dir,
-                core: core(cli.network, rpc_url, cookie_file)?,
-                limits,
-                query_limit: cli.max_query_results,
-                listen,
-                poll_seconds,
-                min_free_bytes: min_free_mib
-                    .checked_mul(1024 * 1024)
-                    .context("free-space limit overflow")?,
-                mempool_budget: electrum_lite::mempool::Budget {
-                    transactions: max_mempool_transactions,
-                    entries: max_mempool_entries,
-                    bytes: max_mempool_mib
-                        .checked_mul(1024 * 1024)
-                        .context("mempool size overflow")?,
-                },
-            };
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()?
-                .block_on(electrum_lite::electrum::serve(options))?;
-        }
-        Command::Health { address } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&health(address, cli.network)?)?
-            );
-        }
-        Command::Monitor { address, interval } => {
-            ensure!(
-                (1..=3600).contains(&interval),
-                "interval must be between 1 and 3600 seconds"
-            );
-            let mut previous: Option<(u64, std::time::Instant)> = None;
-            loop {
-                match health(address, cli.network) {
-                    Ok(value) => {
-                        let now = std::time::Instant::now();
-                        let height = value["indexed_tip"]["height"].as_u64();
-                        let speed = height.zip(previous).and_then(|(h, (old, time))| {
-                            h.checked_sub(old)
-                                .map(|delta| delta as f64 / now.duration_since(time).as_secs_f64())
-                        });
-                        if let Some(height) = height {
-                            previous = Some((height, now));
-                        }
-                        let lag = value["core_height"]
-                            .as_u64()
-                            .zip(height)
-                            .map(|(core, index)| core.saturating_sub(index));
-                        println!(
-                            "{}",
-                            json!({"observed_unix_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"status":value["status"],"ready":value["ready"],"indexed_tip":value["indexed_tip"],"core_height":value["core_height"],"core_tip":value["core_tip"],"core_observation_age_seconds":value["core_observation_age_seconds"],"blocks_behind_observed_core":lag,"blocks_per_second_since_last_sample":speed,"core_initialblockdownload":value["core_initialblockdownload"],"core_connections":value["core_connections"],"core_network_active":value["core_network_active"],"core_pruned":value["core_pruned"],"core_automatic_pruning":value["core_automatic_pruning"],"core_prune_height":value["core_prune_height"],"next_required_height":value["next_required_height"],"historical_blocks_missing":value["historical_blocks_missing"],"archive_bytes":value["archive_bytes"],"index_bytes":value["index_bytes"],"free_bytes":value["free_bytes"],"last_error":value["last_error"]})
-                        );
-                        if value["core_automatic_pruning"] == true {
-                            eprintln!("WARNING: Core automatic pruning can delete blocks before indexing; configure manual pruning and preserve history.");
-                        }
-                        if value["historical_blocks_missing"] == true {
-                            eprintln!("ERROR: required historical blocks are already pruned; restore trusted history. Do not delete index data.");
-                        }
-                    }
-                    Err(error) => {
-                        previous = None;
-                        eprintln!("Monitor: {error:#}; retrying");
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_secs(interval));
-            }
-        }
-        Command::MigrateIndex { backup_dir } => {
-            let archive = Archive::open(&cli.data_dir, cli.network, false)?;
-            electrum_lite::operations::migrate(&archive, cli.network, &backup_dir)?;
-            println!(
-                "{}",
-                json!({"schema":2,"backup":backup_dir,"next":"run inspect before serving"})
-            );
-        }
-        Command::Backup { output } => {
-            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
-            let mut store = Store::open(
-                &archive.directory().join("index.sqlite"),
-                cli.network,
-                limits,
-            )?;
-            store.recover(&mut archive)?;
-            electrum_lite::operations::backup(&archive, &output)?;
-            println!("{}", json!({"backup":output}));
-        }
-        Command::Audit => {
-            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
-            let mut store = Store::open(
-                &archive.directory().join("index.sqlite"),
-                cli.network,
-                limits,
-            )?;
-            store.recover(&mut archive)?;
-            store.audit(&mut archive)?;
-            println!("{}", json!({"audit":"ok"}));
-        }
-        Command::Prune {
-            rpc_url,
-            cookie_file,
-            backup_dir,
-            confirm,
-            min_free_mib,
-        } => {
-            ensure!(confirm,"pruning is destructive: explicit --confirm and a new backup directory are required");
-            ensure!(
-                cli.network != Chain::Mainnet,
-                "mainnet pruning remains gated on sustained validation; no unsafe override"
-            );
-            let core = core(cli.network, rpc_url, cookie_file)?;
-            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
-            let mut store = Store::open(
-                &archive.directory().join("index.sqlite"),
-                cli.network,
-                limits,
-            )?;
-            store.recover(&mut archive)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&electrum_lite::operations::prune(
-                    &store,
-                    &mut archive,
-                    &core,
-                    cli.network,
-                    &backup_dir,
-                    min_free_mib
-                        .checked_mul(1024 * 1024)
-                        .context("free-space limit overflow")?
-                )?)?
-            );
-        }
-        Command::CheckCore {
-            rpc_url,
-            cookie_file,
-        } => {
-            let core = core(cli.network, rpc_url, cookie_file)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&core.verify(cli.network)?)?
-            );
-        }
-        Command::Sync {
-            rpc_url,
-            cookie_file,
-            max_blocks,
-            to_height,
-        } => {
-            ensure!(max_blocks > 0, "max-blocks must be positive");
-            let core = core(cli.network, rpc_url, cookie_file)?;
-            let mut archive = Archive::open(&cli.data_dir, cli.network, true)?;
-            let mut index = Store::open(
-                &archive.directory().join("index.sqlite"),
-                cli.network,
-                limits,
-            )?;
-            index.recover(&mut archive)?;
-            let info = electrum_lite::sync::batch(
-                &mut index,
-                &mut archive,
-                &core,
-                cli.network,
-                max_blocks,
-                to_height,
-                None,
-            )?;
-            print_stats(
-                &index,
-                cli.network,
-                Some(info["electrum_sync_metrics"].clone()),
-            )?;
-        }
-        Command::RebuildIndex { output } => {
-            ensure!(
-                output
-                    .extension()
-                    .is_some_and(|extension| extension == "sqlite"),
-                "rebuild output must use .sqlite, never an archive segment or lock filename"
-            );
-            ensure!(
-                !output.exists(),
-                "rebuild output already exists; choose a new file, never overwrite a backup"
-            );
-            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
-            // Atomic refusal of an existing destination, not just an exists() check.
-            std::fs::File::create_new(&output)
-                .context("cannot create a new rebuild output file")?
-                .sync_all()?;
-            let mut store = Store::open(&output, cli.network, limits)?;
-            store.recover(&mut archive)?;
-            store.integrity_check()?;
-            print_stats(&store, cli.network, None)?;
-            eprintln!("Built separate index {}; existing index and archive unchanged. See recovery instructions before replacement.", output.display());
-        }
-        Command::Inspect | Command::History { .. } | Command::Transaction { .. } => {
-            let mut archive = Archive::open(&cli.data_dir, cli.network, false)?;
-            let mut index = Store::open(
-                &archive.directory().join("index.sqlite"),
-                cli.network,
-                limits,
-            )?;
-            index.recover(&mut archive)?;
-            match cli.command {
-                Command::History { scripthash } => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&index.view(&scripthash, cli.max_query_results)?)?
-                ),
-                Command::Transaction { txid, height } => {
-                    let txid = Txid::from_str(&txid)?;
-                    let mut found = Vec::new();
-                    for occurrence in index.occurrences(txid, height)? {
-                        let (hash, location) = index
-                            .record(occurrence.height)?
-                            .context("transaction block missing from index")?;
-                        let (height, block) = archive.read(location)?;
-                        ensure!(
-                            height == occurrence.height && block.block_hash() == hash,
-                            "transaction archive reference mismatch"
-                        );
-                        let tx = block
-                            .txdata
-                            .get(occurrence.position)
-                            .context("transaction position outside block")?;
-                        ensure!(tx.compute_txid() == txid, "indexed transaction ID mismatch");
-                        found.push(json!({"height":height,"position":occurrence.position,"hex":hex::encode(serialize(tx))}));
-                    }
-                    ensure!(
-                        !found.is_empty(),
-                        "transaction absent from this partial archive"
-                    );
-                    println!("{}", serde_json::to_string_pretty(&found)?);
-                }
-                _ => print_stats(&index, cli.network, None)?,
-            }
         }
     }
-    Ok(())
-}
-
-fn health(address: SocketAddr, chain: Chain) -> Result<serde_json::Value> {
-    use std::io::{BufRead, Read, Write};
-    ensure!(
-        address.ip().is_loopback(),
-        "health endpoint must be loopback"
-    );
-    let mut stream =
-        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(90)))?;
-    stream.write_all(
-        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server.health\",\"params\":[]}\n",
+    let _tor = if a.tor {
+        Some(electrum_lite::net::Tor::start(
+            &root.join("tor"),
+            &a.tor_socks,
+        )?)
+    } else {
+        None
+    };
+    let proxy = if a.tor {
+        Some(a.tor_socks)
+    } else {
+        a.socks_proxy
+    };
+    if a.command == "managed-serve" {
+        ensure!(
+            a.confirm_dedicated,
+            "managed-serve requires --confirm-dedicated; never adopts an existing Core"
+        );
+        ensure!(
+            a.core_cookie.is_none(),
+            "managed-serve derives its private cookie; omit --core-cookie"
+        );
+        return electrum_lite::supervisor::run(
+            electrum_lite::supervisor::Config {
+                network: a.network,
+                data_dir: a.data_dir,
+                core_dir: a
+                    .core_dir
+                    .ok_or_else(|| anyhow::anyhow!("--core-dir NEW dedicated root required"))?,
+                bitcoind: a.bitcoind,
+                core_rpc: a.core_rpc,
+                listen: a.listen,
+                p2p_port: a.core_p2p_port,
+                high: a.pause_lag,
+                low: a.resume_lag,
+                auto_prune: a.auto_prune,
+                prune_interval: a.prune_interval,
+                peers: a.block_peer,
+                proxy,
+            },
+            stop,
+        );
+    }
+    ensure!(!a.auto_prune, "--auto-prune only applies to managed-serve");
+    let mut index = Index::open(&root.join("index"), network)?;
+    index.fetcher.peers = a.block_peer;
+    index.fetcher.proxy = proxy;
+    let core = Core::new(
+        a.core_rpc,
+        a.core_cookie
+            .ok_or_else(|| anyhow::anyhow!("--core-cookie is required outside managed-serve"))?,
     )?;
-    let mut line = String::new();
-    std::io::BufReader::new(stream)
-        .take(65536)
-        .read_line(&mut line)?;
-    let result: serde_json::Value = serde_json::from_str(&line)?;
-    ensure!(result.get("error").is_none(), "health request failed");
-    ensure!(
-        result["result"]["network"] == chain.name(),
-        "health endpoint network mismatch"
-    );
-    Ok(result["result"].clone())
-}
-
-fn core(chain: Chain, endpoint: Option<String>, cookie: PathBuf) -> Result<Core> {
-    Core::new(
-        &endpoint.unwrap_or_else(|| format!("http://127.0.0.1:{}/", chain.port())),
-        &cookie,
-    )
-}
-
-fn print_stats(index: &Store, chain: Chain, metrics: Option<Value>) -> Result<()> {
-    let stats = index.stats()?;
-    let mut report = json!({
-            "version":env!("CARGO_PKG_VERSION"), "network":chain,
-            "indexed_tip": stats.tip.map(|(height, hash)| json!({"height":height,"hash":hash})),
-            "durable_tip":stats.tip.map(|(height,hash)| json!({"height":height,"hash":hash})),
-            "transactions":stats.transactions, "utxos":stats.utxos,"history_entries":stats.history,
-            "index_backend":"sqlite-schema-2",
-            "scope":"local archived prefix only; not necessarily synchronized with Core",
-            "electrum_server":false, "pruning_enabled":false
-    });
-    if let Some(metrics) = metrics {
-        report["sync_metrics"] = metrics;
+    match a.command.as_str() {
+        "health" => println!(
+            "{}",
+            serde_json::json!({"indexed_height":index.tip()?,"network":a.network,"engine":"thin-v1","experimental":true})
+        ),
+        "sync" => index.sync_batch_with_cancel(&core, u32::MAX, &stop)?,
+        "backup" => index.backup(
+            a.backup_dir
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--backup-dir NEW is required"))?,
+        )?,
+        "audit" => index.audit_with_cancel(
+            &core,
+            a.audit_dir
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--audit-dir NEW is required"))?,
+            &stop,
+        )?,
+        "prune" => {
+            ensure!(
+                a.confirm_prune,
+                "prune requires --confirm-prune and a dedicated offline Core"
+            );
+            ensure!(network != Network::Bitcoin, "mainnet pruning is blocked");
+            let info = core.call("getblockchaininfo", serde_json::json!([]))?;
+            ensure!(
+                info["pruned"] == true && info["automatic_pruning"] == false,
+                "Core must use manual prune=1"
+            );
+            ensure!(
+                core.call("getnetworkinfo", serde_json::json!([]))?["networkactive"] == false,
+                "disable Core P2P explicitly before pruning"
+            );
+            ensure!(
+                core.call("getrawmempool", serde_json::json!([]))?
+                    .as_array()
+                    .is_some_and(|m| m.is_empty()),
+                "mempool must be empty"
+            );
+            index.sync(&core)?;
+            let height = index.tip()?.ok_or_else(|| anyhow::anyhow!("empty index"))?;
+            ensure!(height >= electrum_lite::TESTNET_PRUNE_MIN_HEIGHT,"Core test-network pruning requires at least 1000 blocks with its normal parameters");
+            let audit = root.join("prune-pending");
+            let completed = root.join(format!("prune-complete-{height}"));
+            ensure!(
+                !audit.exists(),
+                "unfinished prune: inspect Core and preserve audit before recovery"
+            );
+            ensure!(
+                !completed.exists(),
+                "this height already has a completed prune record"
+            );
+            index.audit_with_cancel(
+                &core,
+                a.audit_dir
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--audit-dir NEW is required before pruning"))?,
+                &stop,
+            )?;
+            index.backup(
+                a.backup_dir
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--backup-dir NEW is required"))?,
+            )?;
+            ensure!(
+                !stop.load(std::sync::atomic::Ordering::Relaxed),
+                "maintenance interrupted before pruning"
+            );
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&audit)?;
+            use std::io::Write;
+            writeln!(file, "requested_height={}", height - 288)?;
+            writeln!(
+                file,
+                "backup={}",
+                a.backup_dir.as_deref().expect("checked backup").display()
+            )?;
+            writeln!(
+                file,
+                "audit={}",
+                a.audit_dir.as_deref().expect("checked audit").display()
+            )?;
+            file.sync_all()?;
+            std::fs::File::open(&root)?.sync_all()?;
+            ensure!(
+                !stop.load(std::sync::atomic::Ordering::Relaxed),
+                "maintenance interrupted; intent preserved"
+            );
+            let result = core.call("pruneblockchain", serde_json::json!([height - 288]))?;
+            let after = core.call("getblockchaininfo", serde_json::json!([]))?;
+            let pruneheight = after["pruneheight"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("Core pruneheight missing"))?;
+            let mut deleted = false;
+            if pruneheight > 0 {
+                let hash = index
+                    .header(u32::try_from(pruneheight - 1)?)?
+                    .block_hash()
+                    .to_string();
+                match core.block(&hash) {
+                    Err(e)
+                        if e.downcast_ref::<electrum_lite::core::RpcError>()
+                            .is_some_and(|e| e.code == -1) =>
+                    {
+                        deleted = true
+                    }
+                    Err(e) => return Err(e),
+                    Ok(_) => anyhow::bail!(
+                        "Core reports pruning but removed historical block remains available"
+                    ),
+                };
+                core.call("getblockchaininfo", serde_json::json!([]))?;
+            }
+            writeln!(
+                file,
+                "actual_pruneheight={pruneheight}\nmissing_block_verified={deleted}"
+            )?;
+            file.sync_all()?;
+            std::fs::rename(&audit, completed)?;
+            std::fs::File::open(&root)?.sync_all()?;
+            println!(
+                "{}",
+                serde_json::json!({"pruned_to":result,"pruneheight":pruneheight,"missing_block_verified":deleted})
+            );
+        }
+        _ => {
+            ensure!(
+                a.listen.ip().is_loopback() || a.allow_lan,
+                "LAN requires --allow-lan; prefer SSH/WireGuard"
+            );
+            electrum_lite::server::serve(index, core, a.listen, stop)?;
+        }
     }
-    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

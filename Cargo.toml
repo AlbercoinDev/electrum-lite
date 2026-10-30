@@ -2,52 +2,18 @@
 name = "electrum-lite"
 version = "0.0.1-beta.1"
 edition = "2021"
-rust-version = "1.99"
-description = "Experimental Bitcoin block archive and persistent indexer"
-repository = "https://github.com/AlbercoinDev/electrum-lite"
 publish = false
 
-[features]
-experimental-lsm = ["dep:rocksdb"]
-
-[[example]]
-name = "lsm_compare"
-required-features = ["experimental-lsm"]
-
-[[example]]
-name = "lsm_bitcoin_check"
-required-features = ["experimental-lsm"]
-
-[[example]]
-name = "lsm_sync_check"
-required-features = ["experimental-lsm"]
-
-[[example]]
-name = "lsm_mempool_check"
-required-features = ["experimental-lsm"]
-
 [dependencies]
-anyhow = "1.0"
-base64 = "0.22"
-bitcoin = { version = "=0.32.102", features = ["serde"] }
+anyhow = "=1.0.100"
+bitcoin = "=0.32.102"
 clap = { version = "4.5", features = ["derive"] }
-fs2 = "0.4"
 hex = "0.4"
-rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
-serde = { version = "1.0", features = ["derive"] }
+rocksdb = { version = "=0.24.0", default-features = false, features = ["bindgen-runtime"] }
 serde_json = "1.0"
 ureq = { version = "=2.12.1", default-features = false, features = ["json"] }
-url = "2.5"
-zstd = { version = "=0.13.3", default-features = false }
-tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
-tempfile = "3"
-rocksdb = { version = "=0.24.0", optional = true, default-features = false, features = ["bindgen-runtime"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "=0.2.191"
-
-[dev-dependencies]
-redb = "=4.4.0"
+base64 = "0.22"
+ctrlc = { version = "=3.4.5", features = ["termination"] }
 
 [profile.release]
 lto = "thin"

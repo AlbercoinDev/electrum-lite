@@ -1,15 +1,13 @@
 #!/bin/sh
-# One-line bootstrap. Trusts GitHub HTTPS and this repository's main branch.
 set -eu
-command -v python3 >/dev/null 2>&1 || { echo 'Se necesita Python 3.11+.' >&2; exit 1; }
-command -v curl >/dev/null 2>&1 || { echo 'Se necesita curl.' >&2; exit 1; }
-root="$HOME/electrum-lite"
-[ ! -L "$root" ] && [ ! -L "$root/tmp" ] || { echo 'Se rechazan directorios enlazados.' >&2; exit 1; }
-mkdir -p "$root/tmp"
-temporary=$(mktemp "$root/tmp/bootstrap.XXXXXXXX.py")
-trap 'rm -f "$temporary"' EXIT
-trap 'exit 1' HUP INT TERM
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/scripts/bootstrap_bundle.py \
-  -o "$temporary"
-python3 "$temporary" "$@"
+cd "$(dirname "$0")"
+command -v cargo >/dev/null || { echo 'Install Rust using https://rustup.rs first (see README.md).' >&2; exit 1; }
+cargo build --release --locked
+destination="${PREFIX:-$HOME/.local}/bin"
+mkdir -p "$destination"
+if [ -f "$destination/electrum-lite" ]; then
+    cp -p "$destination/electrum-lite" "$destination/electrum-lite.previous"
+fi
+install -m 755 target/release/electrum-lite "$destination/electrum-lite"
+"$destination/electrum-lite" --version
+echo "Installed in $destination; add this directory to PATH. No node or service was started."
