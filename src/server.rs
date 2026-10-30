@@ -261,7 +261,23 @@ pub fn serve(
                         true
                     }
                     Err(e) => {
-                        eprintln!("sync unavailable: {e:#}");
+                        if e.to_string() == "catching up" {
+                            eprintln!(
+                                "{}",
+                                crate::i18n::text(
+                                    "Sync unavailable: catching up",
+                                    "Sincronización no disponible: alcanzando a Bitcoin Core"
+                                )
+                            );
+                        } else {
+                            eprintln!(
+                                "{}: {e:#}",
+                                crate::i18n::text(
+                                    "Sync unavailable",
+                                    "Sincronización no disponible"
+                                )
+                            );
+                        }
                         false
                     }
                 };
@@ -325,7 +341,11 @@ pub fn serve(
         index.db.flush_wal(true)?;
         Ok(())
     });
-    eprintln!("Electrum listening on {listen}; experimental thin-v1");
+    eprintln!(
+        "{} {listen}; {}",
+        crate::i18n::text("Electrum listening on", "Electrum escuchando en"),
+        crate::i18n::text("experimental thin-v1", "thin-v1 experimental")
+    );
     let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         let stream = match listener.accept() {
@@ -346,7 +366,10 @@ pub fn serve(
         let health = health.clone();
         thread::spawn(move || {
             if let Err(e) = connection(stream, tx, health) {
-                eprintln!("connection closed: {e}");
+                eprintln!(
+                    "{}: {e}",
+                    crate::i18n::text("Connection closed", "Conexión cerrada")
+                );
             }
             active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });

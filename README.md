@@ -10,6 +10,12 @@ No usar `prune=550` automático: usar un **Core nuevo dedicado con `prune=1`**.
 No se ha probado una GUI de cartera; el smoke comprueba el protocolo TCP.
 Diseño, estado y límites: [docs/rewrite.md](docs/rewrite.md).
 
+Los mensajes de progreso y supervisor detectan `LC_ALL`, `LC_MESSAGES` y `LANG`,
+en ese orden: español para `es` e inglés para los demás idiomas. La traducción
+es parcial: algunos errores técnicos, secciones y diagnósticos de la biblioteca
+CLI, instaladores y mensajes de Core/Tor aún aparecen en inglés. Los eventos JSON
+y el protocolo Electrum conservan sus nombres y formato originales.
+
 ## 1. Instalar desde cero (Debian/Ubuntu, Linux x86-64)
 
 ### Binario listo para instalar o actualizar

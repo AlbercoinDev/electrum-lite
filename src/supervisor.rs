@@ -105,7 +105,24 @@ fn event(path: &Path, name: &str, extra: Value) -> Result<()> {
     writeln!(f, "{}", json!({"event":name,"details":extra}))?;
     f.sync_all()?;
     fs::File::open(path.parent().context("event parent")?)?.sync_all()?;
-    eprintln!("supervisor: {name} {extra}");
+    let human = match name {
+        "core_owned" => crate::i18n::text("dedicated Core started", "Core dedicado iniciado"),
+        "backpressure_pause" => crate::i18n::text(
+            "Core network paused while indexing catches up",
+            "red de Core pausada mientras el índice se pone al día",
+        ),
+        "backpressure_resume" => crate::i18n::text("Core network resumed", "red de Core reanudada"),
+        "maintenance_offline" => crate::i18n::text(
+            "offline maintenance started",
+            "mantenimiento sin red iniciado",
+        ),
+        "maintenance_complete" => {
+            crate::i18n::text("maintenance completed", "mantenimiento finalizado")
+        }
+        "shutdown" => crate::i18n::text("shutdown complete", "cierre completado"),
+        _ => name,
+    };
+    eprintln!("supervisor: {human} {extra}");
     Ok(())
 }
 fn health(listen: SocketAddr) -> Result<Value> {

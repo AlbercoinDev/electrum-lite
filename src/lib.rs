@@ -1,5 +1,6 @@
 //! Original thin Electrum indexer. Experimental; Core owns consensus.
 pub mod core;
+pub mod i18n;
 pub mod index;
 pub mod mempool;
 pub mod net;

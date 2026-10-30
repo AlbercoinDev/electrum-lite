@@ -89,7 +89,11 @@ impl Index {
             );
         }
         println!(
-            "Semantic replay verified at height {tip}: {}",
+            "{} {tip}: {}",
+            crate::i18n::text(
+                "Semantic replay verified at height",
+                "Reproducción semántica verificada en la altura"
+            ),
             path.display()
         );
         Ok(())
@@ -120,8 +124,13 @@ impl Index {
             .sync_all()?;
         }
         println!(
-            "Verified checkpoint: {} (historical cache is replaceable and not included)",
-            path.display()
+            "{}: {} ({})",
+            crate::i18n::text("Verified checkpoint", "Copia de seguridad verificada"),
+            path.display(),
+            crate::i18n::text(
+                "historical cache is replaceable and not included",
+                "la caché histórica es reemplazable y no está incluida"
+            )
         );
         Ok(())
     }
@@ -397,7 +406,7 @@ impl Index {
             );
             self.commit_with_sync(h, &block, h == end || (h - start + 1) % 64 == 0)?;
             if h % 1000 == 0 {
-                eprintln!("indexed {h}/{end}");
+                eprintln!("{} {h}/{end}", crate::i18n::text("indexed", "indexados"));
             }
         }
         Ok(())

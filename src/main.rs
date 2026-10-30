@@ -1,6 +1,6 @@
 use anyhow::{ensure, Result};
 use bitcoin::Network;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use electrum_lite::{core::Core, index::Index};
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -61,7 +61,49 @@ struct Args {
     command: String,
 }
 fn main() -> Result<()> {
-    let a = Args::parse();
+    let mut command = Args::command();
+    if electrum_lite::i18n::language() == electrum_lite::i18n::Language::Spanish {
+        command = command
+            .about("Servidor Electrum thin experimental: no preparado para producción")
+            .help_template("{about-with-newline}\nUso: {usage}\n\n{all-args}{after-help}")
+            .mut_arg("network", |a| a.help("Red Bitcoin"))
+            .mut_arg("data_dir", |a| {
+                a.help("Directorio de datos de Electrum Lite")
+            })
+            .mut_arg("core_cookie", |a| {
+                a.help("Archivo cookie RPC de Bitcoin Core")
+            })
+            .mut_arg("core_rpc", |a| a.help("Dirección RPC local de Core"))
+            .mut_arg("core_dir", |a| {
+                a.help("Directorio nuevo para Core dedicado")
+            })
+            .mut_arg("bitcoind", |a| a.help("Ruta al ejecutable de Bitcoin Core"))
+            .mut_arg("confirm_dedicated", |a| {
+                a.help("Confirmar uso de un Core dedicado")
+            })
+            .mut_arg("auto_prune", |a| {
+                a.help("Activar poda coordinada en redes de prueba")
+            })
+            .mut_arg("block_peer", |a| {
+                a.help("Fuente P2P de bloques históricos (host:puerto)")
+            })
+            .mut_arg("tor", |a| {
+                a.help(
+                    "Iniciar Tor privado para bloques históricos, sin conexión directa de respaldo",
+                )
+            })
+            .mut_arg("socks_proxy", |a| {
+                a.help("Proxy SOCKS5 existente para bloques históricos")
+            })
+            .mut_arg("backup_dir", |a| {
+                a.help("Destino NUEVO para una copia de seguridad verificada")
+            })
+            .mut_arg("audit_dir", |a| {
+                a.help("Destino NUEVO para auditoría semántica")
+            });
+    }
+    let matches = command.get_matches();
+    let a = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signal = stop.clone();
     ctrlc::set_handler(move || signal.store(true, std::sync::atomic::Ordering::Relaxed))?;
