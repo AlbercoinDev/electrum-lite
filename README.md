@@ -100,6 +100,40 @@ ni una release oficial. Guarda una copia del binario anterior antes de sustituir
 
 ## 2. Instalar Bitcoin Core para las pruebas
 
+### Debian/LMDE limpio: instalar o actualizar Core
+
+Ejecuta como usuario normal (pedirá contraseña de `sudo` para paquetes):
+
+```sh
+sudo apt-get update && sudo apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/scripts/install-bitcoin-core.sh -o /tmp/electrum-lite-core-install.sh && sh /tmp/electrum-lite-core-install.sh
+```
+
+Instala `python3`, `gnupg` y `procps` si faltan. Busca la versión estable que
+anuncia la página oficial, verifica SHA256 y exige firmas válidas de las claves
+fijadas de Ava Chow y Michael Ford. Si cambian las claves o faltan esas firmas,
+falla cerrado y habrá que revisar/actualizar el instalador: no se garantiza que
+toda versión futura esté firmada por ambos. Las claves se fijan por hash en el
+script; verifica sus huellas en `scripts/install-bitcoin-core.py` y en fuentes
+independientes. El script descargado desde GitHub no está firmado por nosotros.
+
+Instala en `~/.local/opt/electrum-lite-bitcoin-core/releases/` y crea enlaces en
+`~/.local/bin`. Repetir actualiza esa instalación y conserva versiones anteriores.
+No modifica datos ni arranca Core. Si `bitcoind` está ejecutándose, detén primero
+Core/Electrum Lite. Si detecta otro ejecutable Core en PATH o archivos ajenos en
+`~/.local/bin`, se detiene sin sobrescribirlos: esas instalaciones deben actualizarse
+por su propio método. No garantiza que otro usuario no arranque Core simultáneamente.
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+bitcoind --version
+```
+
+Para Signet gestionado, usa `--bitcoind "$HOME/.local/bin/bitcoind"` en el
+comando de la sección 5. En este entorno se verificó la instalación y repetición
+aisladas de Core 32.1; no se ha validado una IBD Signet completa con esa versión.
+
+### Instalación manual
+
 Descarga Bitcoin Core desde https://bitcoincore.org/en/download/ y verifica sus
 SHA256SUMS **y firmas** con las instrucciones oficiales. Extrae el paquete y añade
 su `bin` al PATH. El smoke se ejecuta con Core 31.0 en este entorno; no se descarga
