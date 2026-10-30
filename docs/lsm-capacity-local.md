@@ -101,3 +101,50 @@ presión máxima de undo/lotes, largos historiales y crecimiento sostenido. No s
 deducen ahorro de disco, picos de memoria, throughput público ni capacidad general.
 No se ejecutó la suite extensa ni se arrancó Signet. La prueba pública continúa
 reservada al usuario; sin su JSONL no puede validarse convergencia sostenida.
+
+## Tercer caso: transacciones e inputs, sin payload artificial
+
+[CONFIRMADO] Un único caso adicional sobre el mismo binario publicado y Core
+31.0 offline, mismo entorno. Se prepararon 1024 salidas distintas en altura 102
+y se gastaron TODAS en altura 103 mediante 128 transacciones witness firmadas,
+cada una con 8 inputs, sin OP_RETURN:
+
+```sh
+python3 scripts/lsm_electrum_smoke.py \
+  --bitcoind /ruta/bitcoin-31.0/bin/bitcoind \
+  --bitcoin-cli /ruta/bitcoin-31.0/bin/bitcoin-cli \
+  --electrum-lite /ruta/al/binario/publicado/electrum-lite \
+  --capacity-outputs 1024 --capacity-fanin 8
+```
+
+| Métrica | Valor |
+|---|---:|
+| Transacciones de gasto / inputs totales | 128 / 1024 |
+| Bytes serializados de los gastos, con witness | 157 051 |
+| Peso real del bloque de gastos | 299 635 WU |
+| Arranque + importación observada | 4,279 s |
+| Tiempo hasta acabar consultas | 90,880 s |
+| RSS Lite / Core, muestras tras consultas | 27 992 064 / 70 340 608 bytes |
+| Disco Core, lógico / asignado | 18 675 216 / 18 726 912 bytes |
+| Disco Lite, lógico / asignado | 4 299 585 / 4 317 184 bytes |
+
+Comprobado por TCP: las 1024 monedas originales desaparecen, sus saldos quedan
+a cero y cada historial contiene creación y gasto. Las 128 monedas nuevas tienen
+posición/valor/saldo correctos. Los bytes witness de todas las transacciones
+coinciden exactamente con los firmados por Core. Core valida el bloque generado.
+
+```text
+PASS bounded local LSM capacity: distinct UTXO/history and exact witness transaction
+PASS dense local test data and downloaded executable removed
+```
+
+RSS sigue siendo muestra, no pico. La medición temporal empieza tras generar
+los bloques; no incluye preparación/firma de fixtures. Incluye inicialización
+de índice nuevo, importación y sondeo. No hubo mantenimiento/pruning en este caso.
+La prueba agrega evidencia de trabajo sobre prevouts e índices frente al payload
+compresible anterior, pero este bloque pesa solo el 7,5 % del máximo: NO demuestra
+la peor densidad posible ni combina máximo peso y máximo coste de indexación.
+Faltan límites de muchos scripts/historial largo, undo y carga sostenida.
+
+No se lanzan más pruebas públicas automáticamente: el siguiente dato necesario
+para convergencia sostenida es el JSONL del usuario, todavía no recibido.

@@ -11,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import time
+from decimal import Decimal
 
 from lsm_observe import disk_bytes
 
@@ -114,11 +115,15 @@ def main():
                         help="Only run a bounded 1..1024 distinct-output regtest capacity case")
     parser.add_argument("--capacity-payload-bytes", type=int, default=0,
                         help="Add up to 900000 OP_RETURN bytes to the capacity transaction")
+    parser.add_argument("--capacity-fanin", type=int, default=0,
+                        help="Spend all capacity outputs in groups of 1..32 inputs in another block")
     args = parser.parse_args()
     if not 0 <= args.capacity_outputs <= 1024:
         parser.error("capacity outputs must be 0..1024")
     if not 0 <= args.capacity_payload_bytes <= 900000 or (args.capacity_payload_bytes and not args.capacity_outputs):
         parser.error("payload requires capacity mode and must be 0..900000 bytes")
+    if args.capacity_fanin and (not 1 <= args.capacity_fanin <= 32 or not args.capacity_outputs or args.capacity_outputs % args.capacity_fanin):
+        parser.error("fanin must be 1..32 and divide capacity outputs exactly")
     with tempfile.TemporaryDirectory(dir="/tmp/opencode", prefix="lsm-electrum-core-") as directory:
         root = Path(directory)
         data = root / "core"
@@ -209,7 +214,23 @@ def main():
                     rpc("generateblock", mining, json.dumps([signed_tx["hex"]]))
                     block_weight = rpc_json("getblock", rpc("getblockhash", 102))["weight"]
                     assert block_weight <= 4_000_000
-                    capacity = (scripts, signed_tx["hex"], transaction["txid"], block_weight)
+                    dense = []
+                    if args.capacity_fanin:
+                        for start in range(0, args.capacity_outputs, args.capacity_fanin):
+                            previous = [{"txid": transaction["txid"], "vout": index} for index in range(start, start + args.capacity_fanin)]
+                            value = sum((Decimal(str(transaction["vout"][index]["value"])) for index in range(start, start + args.capacity_fanin)), Decimal(0)) - Decimal("0.00001000")
+                            destination, script = address()
+                            unsigned = rpc("createrawtransaction", json.dumps(previous), json.dumps({destination: str(value)}))
+                            signed = rpc_json("signrawtransactionwithwallet", unsigned)
+                            assert signed["complete"]
+                            decoded = rpc_json("decoderawtransaction", signed["hex"])
+                            assert len(decoded["vin"]) == args.capacity_fanin
+                            assert all(entry.get("txinwitness") for entry in decoded["vin"])
+                            dense.append((signed["hex"], decoded["txid"], script, int(value * 100_000_000)))
+                        rpc("generateblock", mining, json.dumps([entry[0] for entry in dense]))
+                        block_weight = rpc_json("getblock", rpc("getblockhash", 103))["weight"]
+                        assert block_weight <= 4_000_000
+                    capacity = (scripts, signed_tx["hex"], transaction["txid"], block_weight, dense)
                     capacity_started = time.monotonic()
                 app = start_server(app_log)
                 for _ in range(240):
@@ -225,19 +246,31 @@ def main():
                 diagnostic = Client(("127.0.0.1", tcp_port))
                 clients.append(diagnostic)
                 if capacity:
-                    ready(diagnostic, 102)
+                    capacity_height = 103 if args.capacity_fanin else 102
+                    ready(diagnostic, capacity_height)
                     synced_seconds = time.monotonic() - capacity_started
-                    scripts, raw, txid, block_weight = capacity
+                    scripts, raw, txid, block_weight, dense = capacity
                     assert client.call("blockchain.transaction.get", [txid]) == raw
                     for index, script in enumerate(scripts):
                         coins = client.call("blockchain.scripthash.listunspent", [script])
-                        assert len(coins) == 1 and coins[0]["tx_hash"] == txid and coins[0]["tx_pos"] == index
-                        assert len(client.call("blockchain.scripthash.get_history", [script])) == 1
+                        if dense:
+                            assert coins == []
+                            assert client.call("blockchain.scripthash.get_balance", [script]) == {"confirmed": 0, "unconfirmed": 0}
+                        else:
+                            assert len(coins) == 1 and coins[0]["tx_hash"] == txid and coins[0]["tx_pos"] == index
+                        assert len(client.call("blockchain.scripthash.get_history", [script])) == (2 if dense else 1)
+                    for signed, identifier, script, value in dense:
+                        assert client.call("blockchain.transaction.get", [identifier]) == signed
+                        coins = client.call("blockchain.scripthash.listunspent", [script])
+                        assert len(coins) == 1 and coins[0]["tx_hash"] == identifier and coins[0]["value"] == value
+                        assert client.call("blockchain.scripthash.get_balance", [script])["confirmed"] == value
                     def rss(pid):
                         fields = Path(f"/proc/{pid}/statm").read_text().split()
                         return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
                     print(json.dumps({"case": "bounded-local-capacity", "outputs": len(scripts),
-                                      "height": 102, "transaction_bytes": len(raw) // 2,
+                                      "height": capacity_height, "transaction_bytes": len(raw) // 2,
+                                      "dense_transactions": len(dense), "dense_inputs": len(dense) * args.capacity_fanin,
+                                      "dense_transaction_bytes": sum(len(entry[0]) // 2 for entry in dense),
                                       "block_weight": block_weight, "op_return_payload_bytes": args.capacity_payload_bytes,
                                       "startup_and_sync_seconds": round(synced_seconds, 3),
                                       "queries_completed_seconds": round(time.monotonic() - capacity_started, 3),
