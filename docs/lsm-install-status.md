@@ -84,6 +84,9 @@ Mainnet gestionada continúa bloqueada. Esta entrega sigue siendo experimental.
 
 ## Tu prueba pública: observación sin controlar los nodos
 
+Prueba local mínima ya ejecutada: [256 salidas distintas, métricas y límites](lsm-capacity-local.md).
+Es evidencia de ese caso pequeño, no de capacidad general de la red pública.
+
 Con Signet ejecutándose, desde otra terminal puedes registrar 30 minutos:
 
 ```sh

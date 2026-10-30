@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 import time
 
+from lsm_observe import disk_bytes
+
 
 def port():
     with socket.socket() as sock:
@@ -108,7 +110,11 @@ def main():
     parser.add_argument("--bitcoind", type=Path, required=True)
     parser.add_argument("--bitcoin-cli", type=Path, required=True)
     parser.add_argument("--electrum-lite", type=Path, required=True)
+    parser.add_argument("--capacity-outputs", type=int, default=0,
+                        help="Only run a bounded 1..1024 distinct-output regtest capacity case")
     args = parser.parse_args()
+    if not 0 <= args.capacity_outputs <= 1024:
+        parser.error("capacity outputs must be 0..1024")
     with tempfile.TemporaryDirectory(dir="/tmp/opencode", prefix="lsm-electrum-core-") as directory:
         root = Path(directory)
         data = root / "core"
@@ -177,6 +183,24 @@ def main():
                 rpc("createwallet", "lsm-electrum-only-test")
                 mining, mining_script = address()
                 rpc("generatetoaddress", 101, mining)
+                capacity = None
+                if args.capacity_outputs:
+                    funding = rpc_json("listunspent", 101)[0]
+                    outputs = {}
+                    scripts = []
+                    for index in range(args.capacity_outputs):
+                        destination, script = address()
+                        scripts.append(script)
+                        # Exact decimal strings avoid binary float accumulation.
+                        outputs[destination] = "0.00100000" if index + 1 < args.capacity_outputs else f"{(4_999_900_000 - 100_000 * index) / 100_000_000:.8f}"
+                    raw = rpc("createrawtransaction", json.dumps([{"txid": funding["txid"], "vout": funding["vout"]}]), json.dumps(outputs))
+                    signed_tx = rpc_json("signrawtransactionwithwallet", raw)
+                    assert signed_tx["complete"]
+                    transaction = rpc_json("decoderawtransaction", signed_tx["hex"])
+                    assert any(entry.get("txinwitness") for entry in transaction["vin"])
+                    rpc("generateblock", mining, json.dumps([signed_tx["hex"]]))
+                    capacity = (scripts, signed_tx["hex"], transaction["txid"])
+                    capacity_started = time.monotonic()
                 app = start_server(app_log)
                 for _ in range(240):
                     assert app.poll() is None, (root / "lsm.log").read_text()[-2000:]
@@ -190,6 +214,28 @@ def main():
                 clients.append(client)
                 diagnostic = Client(("127.0.0.1", tcp_port))
                 clients.append(diagnostic)
+                if capacity:
+                    ready(diagnostic, 102)
+                    synced_seconds = time.monotonic() - capacity_started
+                    scripts, raw, txid = capacity
+                    assert client.call("blockchain.transaction.get", [txid]) == raw
+                    for index, script in enumerate(scripts):
+                        coins = client.call("blockchain.scripthash.listunspent", [script])
+                        assert len(coins) == 1 and coins[0]["tx_hash"] == txid and coins[0]["tx_pos"] == index
+                        assert len(client.call("blockchain.scripthash.get_history", [script])) == 1
+                    def rss(pid):
+                        fields = Path(f"/proc/{pid}/statm").read_text().split()
+                        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+                    print(json.dumps({"case": "bounded-local-capacity", "outputs": len(scripts),
+                                      "height": 102, "transaction_bytes": len(raw) // 2,
+                                      "startup_and_sync_seconds": round(synced_seconds, 3),
+                                      "queries_completed_seconds": round(time.monotonic() - capacity_started, 3),
+                                      "lite_rss_sample_bytes": rss(app.pid), "core_rss_sample_bytes": rss(core.pid),
+                                      "core_disk": disk_bytes(data), "lite_disk": disk_bytes(root / "lsm"),
+                                      "scope": "offline synthetic regtest; RSS sample, not peak; no public capacity claim"}, sort_keys=True), flush=True)
+                    print("PASS bounded local LSM capacity: distinct UTXO/history and exact witness transaction", flush=True)
+                    # Return still executes finally and TemporaryDirectory cleanup.
+                    return
                 ready(diagnostic, 101)
                 assert client.call("server.version", ["fixture", ["1.4", "1.6"]])[1] == "1.4"
                 assert client.call("server.version", ["fixture", "1.6"], error=True)["code"] == 1
