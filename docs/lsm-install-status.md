@@ -81,3 +81,35 @@ reduzca retraso mientras Core avanza. A petición del usuario no se ejecutan má
 suites extensas: la prueba pública queda en sus manos. No se afirma rendimiento,
 producción, interoperabilidad GUI Sparrow ni seguridad de poda mainnet.
 Mainnet gestionada continúa bloqueada. Esta entrega sigue siendo experimental.
+
+## Tu prueba pública: observación sin controlar los nodos
+
+Con Signet ejecutándose, desde otra terminal puedes registrar 30 minutos:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/scripts/lsm_observe.py | python3 - --seconds 1800 --interval 30 --output "$HOME/electrum-lite/logs/signet-observation-$(date +%s).jsonl"
+```
+
+El observador no inicia, pausa, detiene ni poda nodos. Lee RPC cookie local,
+health, tamaños de disco y RSS de ejecutables de esta instalación. No registra
+credenciales, scripts ni transacciones. Rechaza sobrescribir el archivo de salida.
+No lo ejecutes mientras otra red use la misma instalación: el RSS agregado incluye
+todos los procesos de los binarios del bundle, no solo Signet. RSS sumado puede
+contar páginas compartidas dos veces; no es PSS ni memoria total del sistema.
+Los recorridos de disco añaden E/S y no son snapshots atómicos; pueden omitir picos
+entre muestras. Errores se registran explícitamente, nunca como ceros.
+
+Comparte el JSONL al terminar. Para evaluar co-sync hacen falta intervalos donde
+**Core avance y el retraso disminuya**, sin pausas de Core ni ventanas de poda
+contadas como mejora del indexador. `core_ibd` y cabeceras ayudan a distinguir
+alcanzar el Core local de terminar la cadena pública. Un prefijo corto, un solo
+intervalo favorable o `ready=true` no prueban convergencia sostenida.
+
+Registra también hardware, duración, interrupciones/mantenimiento y cualquier
+error visible. `bundle_disk` incluye binarios, temporales y backups; compara con
+Core+Lite por separado. La prueba no establece por sí sola capacidad de bloques
+grandes, límites RSS, consumo máximo ni seguridad ante fallos físicos.
+
+[CONFIRMADO] Solo se probaron localmente los helpers del observador (2 tests),
+sin arrancar nodos ni descargar cadena pública. La evidencia de co-sync real
+sigue pendiente de la ejecución del usuario.
