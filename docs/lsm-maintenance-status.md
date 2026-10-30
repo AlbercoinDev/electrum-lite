@@ -56,6 +56,25 @@ restore de intención inconclusa y cola torn rechazada. No se han probado todos
 los fallos de disco ni corte físico de energía. Procesos y datos de ensayo se
 limpian; solo evidencia pequeña y código se conservan.
 
-[PENDIENTE] Co-sync sostenida Signet/Testnet4, capacidad, operaciones CLI completas,
-ensayo de poda con Core 32.1 y publicación del artefacto/instalador LSM. No se
+[CONFIRMADO] La misma prueba de poda pasó con Core **32.1 oficial autenticado**:
+
+```sh
+python3 scripts/lsm_official_core_smoke.py --electrum-lite target/release/electrum-lite --suite prune
+```
+
+```text
+RUN LSM prune with authenticated official Core 32.1
+PASS AUTOMATIC PRUNING: owned supervisor, verified backup, real Core deletion, local witness TX/Merkle, restart cursor
+PASS LSM unfinished prune intent blocks supervisor before Core startup; journal and backup preserved
+PASS official Core tools and signature verification metadata removed
+```
+
+El wrapper verifica firma y checksum y rechaza otra última estable sin validación
+explícita. Nodos, datos y herramientas Core descargadas se eliminaron. A petición
+del usuario, las siguientes validaciones se limitarán a las mínimas imprescindibles;
+la prueba pública completa la realizará el usuario. Esto no convierte los objetivos
+de capacidad ni co-sync sostenida en resultados demostrados.
+
+[PENDIENTE] Co-sync sostenida Signet/Testnet4, capacidad, operaciones CLI completas
+y publicación del artefacto/instalador LSM. No se
 afirma preparación de producción ni poda mainnet segura.

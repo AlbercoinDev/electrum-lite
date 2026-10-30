@@ -6,6 +6,7 @@ No existing Core is used; the child suite only creates isolated offline regtest.
 import argparse
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -20,6 +21,8 @@ from install import MAX_ARCHIVE, download
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--electrum-lite", type=Path, required=True)
+    parser.add_argument("--suite", choices=("tcp", "prune"), default="tcp",
+                        help="prune generates hundreds of MiB in a disposable offline regtest")
     args = parser.parse_args()
     version, base = official_core_release(json.loads(download(CORE_RELEASE_API, 4 * 1024 * 1024)))
     if version != "32.1":
@@ -42,8 +45,15 @@ def main():
                     path = root / name
                     path.write_bytes(source.read(MAX_ARCHIVE + 1))
                     path.chmod(0o755)
-        print(f"RUN LSM Electrum TCP with authenticated official Core {version}", flush=True)
-        subprocess.run([sys.executable, str(Path(__file__).with_name("lsm_electrum_smoke.py")),
+        print(f"RUN LSM {args.suite} with authenticated official Core {version}", flush=True)
+        if args.suite == "prune":
+            environment = dict(os.environ, LSM_PRUNE="1", AUTO_PRUNE="1",
+                               BITCOIND=str(root / "bitcoind"),
+                               ELECTRUM_LITE=str(args.electrum_lite.resolve()))
+            subprocess.run([sys.executable, str(Path(__file__).with_name("prune_smoke.py"))],
+                           env=environment, check=True, timeout=1200)
+        else:
+            subprocess.run([sys.executable, str(Path(__file__).with_name("lsm_electrum_smoke.py")),
                         "--bitcoind", str(root / "bitcoind"), "--bitcoin-cli", str(root / "bitcoin-cli"),
                         "--electrum-lite", str(args.electrum_lite.resolve())], check=True, timeout=600)
     assert not root.exists()
