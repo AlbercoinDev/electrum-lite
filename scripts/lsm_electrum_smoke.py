@@ -112,9 +112,13 @@ def main():
     parser.add_argument("--electrum-lite", type=Path, required=True)
     parser.add_argument("--capacity-outputs", type=int, default=0,
                         help="Only run a bounded 1..1024 distinct-output regtest capacity case")
+    parser.add_argument("--capacity-payload-bytes", type=int, default=0,
+                        help="Add up to 900000 OP_RETURN bytes to the capacity transaction")
     args = parser.parse_args()
     if not 0 <= args.capacity_outputs <= 1024:
         parser.error("capacity outputs must be 0..1024")
+    if not 0 <= args.capacity_payload_bytes <= 900000 or (args.capacity_payload_bytes and not args.capacity_outputs):
+        parser.error("payload requires capacity mode and must be 0..900000 bytes")
     with tempfile.TemporaryDirectory(dir="/tmp/opencode", prefix="lsm-electrum-core-") as directory:
         root = Path(directory)
         data = root / "core"
@@ -125,7 +129,9 @@ def main():
         common = ["-regtest", f"-datadir={data}", f"-rpcport={rpc_port}"]
 
         def rpc(method, *arguments):
-            return subprocess.check_output([str(args.bitcoin_cli.resolve()), *common, method, *map(str, arguments)],
+            # Avoid Linux per-argument size limits for near-weight-limit blocks.
+            return subprocess.check_output([str(args.bitcoin_cli.resolve()), *common, "-stdin", method],
+                                           input="".join(str(argument) + "\n" for argument in arguments),
                                            text=True, stderr=subprocess.DEVNULL, timeout=30).strip()
 
         def rpc_json(method, *arguments):
@@ -193,13 +199,17 @@ def main():
                         scripts.append(script)
                         # Exact decimal strings avoid binary float accumulation.
                         outputs[destination] = "0.00100000" if index + 1 < args.capacity_outputs else f"{(4_999_900_000 - 100_000 * index) / 100_000_000:.8f}"
+                    if args.capacity_payload_bytes:
+                        outputs["data"] = "00" * args.capacity_payload_bytes
                     raw = rpc("createrawtransaction", json.dumps([{"txid": funding["txid"], "vout": funding["vout"]}]), json.dumps(outputs))
                     signed_tx = rpc_json("signrawtransactionwithwallet", raw)
                     assert signed_tx["complete"]
                     transaction = rpc_json("decoderawtransaction", signed_tx["hex"])
                     assert any(entry.get("txinwitness") for entry in transaction["vin"])
                     rpc("generateblock", mining, json.dumps([signed_tx["hex"]]))
-                    capacity = (scripts, signed_tx["hex"], transaction["txid"])
+                    block_weight = rpc_json("getblock", rpc("getblockhash", 102))["weight"]
+                    assert block_weight <= 4_000_000
+                    capacity = (scripts, signed_tx["hex"], transaction["txid"], block_weight)
                     capacity_started = time.monotonic()
                 app = start_server(app_log)
                 for _ in range(240):
@@ -217,7 +227,7 @@ def main():
                 if capacity:
                     ready(diagnostic, 102)
                     synced_seconds = time.monotonic() - capacity_started
-                    scripts, raw, txid = capacity
+                    scripts, raw, txid, block_weight = capacity
                     assert client.call("blockchain.transaction.get", [txid]) == raw
                     for index, script in enumerate(scripts):
                         coins = client.call("blockchain.scripthash.listunspent", [script])
@@ -228,6 +238,7 @@ def main():
                         return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
                     print(json.dumps({"case": "bounded-local-capacity", "outputs": len(scripts),
                                       "height": 102, "transaction_bytes": len(raw) // 2,
+                                      "block_weight": block_weight, "op_return_payload_bytes": args.capacity_payload_bytes,
                                       "startup_and_sync_seconds": round(synced_seconds, 3),
                                       "queries_completed_seconds": round(time.monotonic() - capacity_started, 3),
                                       "lite_rss_sample_bytes": rss(app.pid), "core_rss_sample_bytes": rss(core.pid),

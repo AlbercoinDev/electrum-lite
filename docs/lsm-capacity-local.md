@@ -57,3 +57,47 @@ La co-sincronización pública sigue reservada al usuario. Se necesita su JSONL 
 [observador](lsm-install-status.md#tu-prueba-pública-observación-sin-controlar-los-nodos)
 para analizar retraso mientras Core avanza, junto con duración y mantenimiento.
 Sin esos datos no se marca la validación sostenida como completada.
+
+## Segundo caso: bloque de 3,73 MWU, 1024 salidas
+
+[CONFIRMADO] Se ejecutó un único caso adicional local con el mismo paquete
+publicado, hash comprobado y Core 31.0 aislado, sin cadena pública:
+
+```sh
+python3 scripts/lsm_electrum_smoke.py \
+  --bitcoind /ruta/bitcoin-31.0/bin/bitcoind \
+  --bitcoin-cli /ruta/bitcoin-31.0/bin/bitcoin-cli \
+  --electrum-lite /ruta/al/binario/publicado/electrum-lite \
+  --capacity-outputs 1024 --capacity-payload-bytes 900000
+```
+
+| Métrica | Valor |
+|---|---:|
+| Peso real del bloque, validado por Core | 3 728 261 WU (93,2 % de 4 MWU) |
+| Transacción witness serializada | 931 925 bytes |
+| Salidas a scripts distintos consultadas | 1024 |
+| Payload OP_RETURN adicional | 900 000 bytes |
+| Arranque + importación observada | 4,287 s |
+| Tiempo hasta acabar consultas | 55,406 s |
+| RSS Lite, muestra tras consultas | 30 056 448 bytes |
+| RSS Core, muestra tras consultas | 102 567 936 bytes |
+| Disco Core, lógico / asignado | 19 238 748 / 19 288 064 bytes |
+| Disco Lite, lógico / asignado | 1 806 685 / 1 826 816 bytes |
+
+```text
+PASS bounded local LSM capacity: distinct UTXO/history and exact witness transaction
+PASS high-load local test data and downloaded executable removed
+```
+
+Verificadas las 1024 posiciones de UTXO, historial por script y transacción
+witness byte-exact por TCP. El fixture usa stdin de bitcoin-cli para evitar
+límites de tamaño de argumentos del sistema. Core validó el bloque generado.
+Mismo entorno de la primera ejecución; no se fijaron frecuencia/carga.
+
+Esto añade evidencia de bytes/peso cercanos al límite, **no del peor coste de
+indexación**: el payload es cero deliberadamente compresible y OP_RETURN no crea
+UTXO persistente. Faltan bloques densos en transacciones/inputs, witness grande,
+presión máxima de undo/lotes, largos historiales y crecimiento sostenido. No se
+deducen ahorro de disco, picos de memoria, throughput público ni capacidad general.
+No se ejecutó la suite extensa ni se arrancó Signet. La prueba pública continúa
+reservada al usuario; sin su JSONL no puede validarse convergencia sostenida.
