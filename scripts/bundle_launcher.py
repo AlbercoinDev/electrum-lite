@@ -42,13 +42,15 @@ def launch(root, network, offline=False):
                     or not os.access(target, os.X_OK)):
                 raise RuntimeError("Missing executable or symlink in installed pair")
             binaries.append(target)
-        network_root = real_directory(root, f"data/{network}")
+        # New engine, new generation: never reuse/adapt an older index or an
+        # already-pruned Core that cannot supply the new index's history.
+        network_root = real_directory(root, f"data/{network}/lsm-v3")
         # Supervisor must create a NEW Core root itself and write its ownership
         # marker. Precreating an empty directory would correctly be rejected.
         core_root = network_root / "core"
         if core_root.is_symlink() or (core_root.exists() and not core_root.is_dir()):
             raise RuntimeError("Core root must be a real managed directory")
-        lite_root = real_directory(root, f"data/{network}/lite")
+        lite_root = real_directory(root, f"data/{network}/lsm-v3/lite")
         backup = real_directory(root, f"backups/{network}")
         # Separate per-network ownership excludes duplicate launches, while the
         # shared bundle lock permits independent networks and excludes updates.
@@ -61,7 +63,7 @@ def launch(root, network, offline=False):
             rpc, electrum = {"signet": (39332, 60601), "testnet4": (49332, 60602),
                              "regtest": (19443, 60603)}[network]
             command = [str(binaries[0]), "--network", network, "--data-dir", str(lite_root),
-                       "managed-serve", "--bitcoind", str(binaries[1]),
+                       "managed-serve", "--lsm", "--bitcoind", str(binaries[1]),
                        "--core-dir", str(core_root), "--rpc-port", str(rpc),
                        "--listen", f"127.0.0.1:{electrum}", "--confirm-dedicated",
                        "--auto-prune", "--prune-backup-root", str(backup)]

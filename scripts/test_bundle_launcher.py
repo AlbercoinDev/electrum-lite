@@ -27,10 +27,11 @@ class LauncherTests(unittest.TestCase):
             def execute(binary, command):
                 self.assertEqual(binary, command[0])
                 for flag, expected in (("--network", "signet"),
-                                       ("--core-dir", str(root / "data/signet/core")),
-                                       ("--data-dir", str(root / "data/signet/lite"))):
+                                       ("--core-dir", str(root / "data/signet/lsm-v3/core")),
+                                       ("--data-dir", str(root / "data/signet/lsm-v3/lite"))):
                     self.assertEqual(command[command.index(flag) + 1], expected)
                 self.assertIn("--auto-prune", command)
+                self.assertIn("--lsm", command)
                 self.assertIn("--offline", command)
                 with self.assertRaises(RuntimeError):
                     with bundle_lock(root, updating=True):
