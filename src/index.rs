@@ -1486,7 +1486,8 @@ impl Index {
             return Ok(());
         }
         if self.options.fast_sync {
-            self.set_bulk(true)?;
+            let remaining = core_height.saturating_sub(start);
+            self.set_bulk(remaining > 64)?;
         }
         // Bounded two-worker fetch pipeline. Blocks may arrive out of order;
         // the single writer reorders them and remains the only DB writer.
