@@ -3,7 +3,7 @@ set -eu
 
 # This installer is pinned to one experimental build, not the historical tag.
 version=thin-v3-txnum-fast-2026-10-31
-asset=electrum-lite-linux-x86_64
+asset=electrum-lite
 sha256=11d61cd72a9e31758daa4e0b37ccde53030242d9eb0447b13be07d25b52919dc
 url="https://github.com/AlbercoinDev/electrum-lite/releases/download/$version/$asset"
 core_installer_url=https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/117da10b27a5d349c7d4f357f7f97365ae30dbd3/scripts/install-bitcoin-core.py
