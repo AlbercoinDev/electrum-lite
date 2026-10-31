@@ -1,54 +1,30 @@
-# Rewrite status (2026-10-30)
+# Project guidance
 
-The user explicitly requested a from-scratch thin-server rewrite in this directory,
-deleted the previous tree, and authorized implementation. Historical instructions
-below describe the archived engine at commit a971a2d, NOT the new implementation.
-Where architecture differs, the rewrite scope in docs/rewrite.md and the current
-README take precedence: RocksDB, disposable historical block cache, direct P2P or
-optional Tor, no mandatory permanent archive. Do not restore the old implementation
-or claim that its tests validate the new code. Preserve its safety requirements
-where applicable: version/tag, isolated test nodes, fail-closed behavior, network
-identity, witness verification, BIP30 occurrences, bounded resources, no mainnet
-pruning, explicit backups/new destinations and no unrequested data deletion.
+Electrum Lite is an experimental Bitcoin thin server, developed from scratch in
+Rust. The current README and `docs/project-status.md` describe the product,
+implementation, operational boundaries and known limitations. Keep project
+descriptions focused on this application and its own design.
 
-Run cargo fmt --check, cargo clippy --locked --all-targets -- -D warnings,
-cargo test --locked, cargo build --release --locked, and the disposable regtest
-smoke. Keep documented limitations explicit. No claims of production readiness,
-full network sync, privacy guarantees, measured mainnet capacity or GUI testing.
+Keep version `0.0.1-beta.1` unchanged unless explicitly requested. Do not alter
+existing Git tags. Preserve the app's safety requirements: fail closed,
+verify network identity and witness data, distinguish repeated TXID occurrences,
+bound resources, prohibit mainnet pruning, use isolated disposable test nodes,
+and require explicit backups and new destinations. Never delete user data unless
+explicitly requested.
 
-# Historical engine instructions (reference only)
+Before changes, inspect the affected code and preserve unrelated user edits. Keep
+documented limitations explicit. Do not claim production readiness, full public
+network synchronization, privacy guarantees, measured mainnet capacity or GUI
+interoperability without corresponding evidence.
 
-# Repository status and source of truth
+For Rust changes, run:
 
-- Keep app version `0.0.1-beta.1` unchanged and do not move the original tag. Current main has the private Electrum daemon, mempool, reorgs, maintenance pruning and recovery CLI. Do not claim production readiness, full public-network sync or tested Sparrow GUI interoperability.
-- Read `ELECTRUM_LITE_ENGINE_v1.0.md` (revision 1.3.0-draft) and README. Specification describes the target; `src/` and `docs/beta-0.0.1.md` identify the implemented subset and evidence.
-- Preserve the specification's distinctions: `[CONFIRMADO]`, `[DECIDIDO]`, `[HIPÓTESIS]`, and `[PENDIENTE]`. Example APIs, configurations, resource budgets, and pseudocode are not validated implementations.
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --release --locked
+```
 
-# Implementation boundaries
-
-- Build an original Rust indexer and Electrum server, not a fork or copied architecture/code from Electrs, Fulcrum, or bindex. Mature generic libraries are allowed; verify versions, APIs, and licenses against official sources before implementation and pin dependencies with `Cargo.lock`.
-- Follow phases A–F (§9); one Cargo package with library modules and CLI. Rust is pinned in `rust-toolchain.toml`. Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, and `cargo build --release --locked`.
-- `scripts/core_smoke.py` uses BITCOIND/BITCOINCLI and optionally ELECTRUM_LITE; it creates offline nodes and exercises TCP/mempool/RBF and shallow/deep reorg recovery. `prune_smoke.py` generates hundreds of MiB in its own regtest and actually deletes Core blocks. Never target existing nodes. Optional `live_smoke.py` is bounded P2P prefix validation, not full sync.
-- The target is one process with bounded queues, one logical confirmed-state writer, and consistent reader snapshots. Bitcoin Core owns consensus; Electrum 1.4 is the protocol baseline. Keep mempool state separate from confirmed state.
-- Runtime storage is `src/store.rs` + `src/schema.sql`: SQLite schema 2, DELETE journal, synchronous EXTRA, foreign keys ON, 64 MiB page cache, mmap OFF. The in-memory Index in `src/index.rs` is a reference; Coin/hash helpers are shared. redb is dev-only (ADR-001). No custom history engine. Baseline x86-64 must not require AVX2.
-- `src/electrum.rs` uses Tokio for transport; one bounded worker owns Core/SQLite/archive/mempool and serializes queries with updates. Keep blocking work off async tasks. `src/sync.rs` matches Core branches; propagate RPC failures, never interpret them as proof of a fork.
-- Start with cookie-authenticated RPC, not REST or ZMQ. `getblock(hash, 0)` returns hex in JSON, not raw binary. Reconcile mempool over RPC.
-
-# Data safety and verification
-
-- Core uses manual pruning (`prune=1`, `txindex=0`). Sync and verify archived blocks before committing index references, UTXO, undo and metadata in one durable database transaction; publish a consistent generation before considering pruning (§§5–6). Archive-only persistence is insufficient. Mainnet support is a product requirement, but real mainnet deployment/pruning must wait for safety and capacity validation.
-- Support mainnet, Signet and Testnet4 with explicit network selection, isolated configuration/data and identity checks against Core. Keep initial live integration tests on Signet/Testnet4; do not mistake that test scope for dropping mainnet support.
-- Publish through `AlbercoinDev/electrum-lite`; current code is in main, not the original release tag. Experimental Linux binaries attached to the original release identify their actual main commit; never imply they were built from that tag. No production claims. systemd examples require edited paths and were not started here.
-- `--network` precedes the subcommand; data root gets a network subdirectory. Startup verifies all archive/index data and applies only records after the durable cursor. Index count caps apply on import/new blocks, not RSS. Script response limits error, never truncate. Wallet queries require catching up to observed Core and a complete bounded mempool snapshot.
-- `Store::commit` stages SQL, fsyncs archive, then commits references and state atomically. Recovery imports complete uncommitted records idempotently; missing/mixed references and torn tails fail closed. `Archive::scan` must succeed before append. Never silently truncate, discard or migrate data.
-- Schema 1 requires explicit `migrate-index --backup-dir NEW`. Schema 2 preserves ELBETA01 physical records but adds durable ancestral-block repetitions as rewind intent plus archive_cursor; old linear readers cannot process branched logs (ADR-002). Never use database-only rollback operationally: Store::rewind preserves replay intent.
-- Undo retains up to 288 blocks; deeper/unavailable undo fails closed. `recover-chain --output-root NEW` builds another canonical generation from matching local blocks and Core's missing branch, preserving the source. Missing canonical bytes require a trusted historical source, not omission.
-- Backup/verify/restore use manifests and new destinations; preserve journals and never mix generations. `rebuild-index --output NEW.sqlite` refuses overwrite. Restore/rollback into another root; keep backup + previous binary for schema changes.
-- Pruning is test-network-only: explicit CLI confirmation or opt-in managed-serve --auto-prune, semantic audit, new verified backup, manual Core prune mode, P2P explicitly offline and no other chain writers. The automatic supervisor only owns its dedicated Core, stops its daemon before maintenance, disables P2P, and resumes after success; it never bypasses operations::prune. Mainnet is hard-gated, without unsafe override. A requested-but-unfinished prune_audit blocks startup of automatic pruning and later pruning; never clear it just to bypass checks.
-- Electrum advertises only 1.4: header chunks use hex/count/max, not 1.6's headers array. Exclude genesis from Electrum script history (CLI/archive retains it). Preserve status ordering and 0/-1 semantics. Remote access needs a secure tunnel/proxy; no native TLS.
-- An empty index against an already-pruned Core must fail clearly unless trusted historical data is available. Historical queries must work locally after Core deletes blocks; retain original transaction bytes including witness, headers, and ordered block TXIDs.
-- Do not assume historical TXIDs are globally unique (BIP30); distinguish occurrences by block hash and position. Deduplicate history per transaction/scripthash, preserve intra-block spend order, and fail on missing prevouts. Reverse scripthash bytes only at the Electrum protocol boundary.
-- Schema changes, pruning, deletion, and restoration require backup, migration/recovery, rollback, and fail-safe behavior. Never trade production durability for benchmark speed or run destructive pruning on valuable node data.
-- Signet and Testnet4 are the integration networks; isolate their data/configuration and verify network identity. Regtest is auxiliary for deterministic reorg, pruning and fault-injection tests. A successful prune RPC alone is not proof: check actual prune height and block unavailability, then retrieve original transaction bytes and validate Merkle proofs without historical Core access (§8).
-- TXID/Merkle-root checks alone do not protect witness bytes: verify the witness commitment where applicable and test byte-exact archive round trips. Measure total Core + archive + database disk usage and temporary peaks; compression savings and low-resource operation are unproven.
-- Default services to localhost, keep RPC credentials out of the repository, and avoid wallet-identifying logs. Record reproducible tests and remaining risks; hardware budgets and performance claims remain unmeasured until demonstrated.
+The regtest smoke must use only its own disposable nodes. Never aim smoke tests,
+pruning or fault injection at an existing node or valuable data directory.

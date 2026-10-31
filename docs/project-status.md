@@ -1,8 +1,8 @@
-# Reescritura desde cero — diseño y estado
+# Electrum Lite — diseño y estado
 
-Versión `0.0.1-beta.1`, formato independiente `thin-v1`. El tag original no cambia.
-El historial anterior sigue en Git, pero su implementación no se ha restaurado.
-Código original en Rust, un paquete, RocksDB como biblioteca genérica.
+Versión `0.0.1-beta.1`, formato de almacenamiento `thin-v1`. Aplicación nueva,
+desarrollada desde cero en Rust como un único paquete y con RocksDB como biblioteca
+genérica de almacenamiento.
 
 ## Objetivo
 
@@ -15,7 +15,7 @@ La instalación debe ser probada primero en un regtest dedicado y sin fondos.
 Mainnet/Signet/Testnet4 son redes seleccionables, NO sincronizaciones completas
 validadas. No se garantiza seguir la velocidad de IBD ni un tamaño final.
 
-## Correcciones al plan de conversación
+## Principios de diseño y límites
 
 - **Privacidad no garantizada:** pedir bloques concretos permite inferencias y
   correlación entre peticiones. Tor reduce exposición de IP; no elimina el patrón
@@ -31,14 +31,14 @@ validadas. No se garantiza seguir la velocidad de IBD ni un tamaño final.
 - No existe anonimato demostrable por una prueba que busque TXIDs en paquetes:
   los propios bloques recibidos contienen transacciones. Se revisa qué mensajes
   se **envían**, sin confundirlos con los bytes recibidos.
-- No se prometen 115–165 GB, tiempos de desarrollo, rendimiento Tor, ni velocidad
-  doble a Core. Esas cifras del diálogo eran hipótesis sin mediciones.
+- No se prometen tamaños de datos, tiempos de desarrollo, rendimiento Tor ni
+  velocidad relativa a Core sin mediciones reproducibles.
 - Una caché de capacidad ilimitada no descarga cada bloque "una vez en la vida":
   pérdida, corrupción, borrado o una futura expulsión requieren volver a obtenerlo.
 
 ## Estado del código
 
-### Implementado para prueba inicial
+### Implementado para pruebas experimentales
 
 1. CLI, red explícita, directorio separado por red e identidad persistente.
 2. RPC autenticado por cookie, solo loopback, con límites y timeouts.
@@ -59,20 +59,24 @@ validadas. No se garantiza seguir la velocidad de IBD ni un tamaño final.
     vacía, índice sincronizado, auditoría semántica, backup nuevo y marcador durable
     antes del RPC.
 13. `managed-serve`: Core dedicado con marcador/configuración/PID verificados,
-    backpressure 200/20, parada de Electrum antes de auditar/podar, reanudación
-    solo tras éxito y parada de los hijos propios ante error. SIGINT/SIGTERM
-    sincronizan WAL y detienen Core; un proceso existente nunca se adopta.
+    backpressure configurable (por defecto 2000/200 bloques) y freno por espacio.
+    Electrum sigue activo durante auditoría, backup y poda; Core pausa P2P para
+    la fase final. Algunas consultas pueden fallar o demorarse y la difusión se
+    rechaza durante la reserva. Ante error se detienen los hijos propios.
+    SIGINT/SIGTERM sincronizan WAL y detienen Core; nunca se adopta otro proceso.
 14. Tor privado sin torrc del sistema, control con cookie y comprobación de PID,
     sin fallback directo. Las consultas locales no esperan al bootstrap público.
 
 ### Pendiente de optimización/validación
 
-- Pipeline paralelo de fetch/compresión, batching y spool rodante.
+- Ampliar y medir la lectura anticipada y los lotes RPC ya implementados; pipeline
+  de compresión y spool rodante pendientes.
 - Validar el supervisor durante IBD sostenido en redes públicas y medir recursos;
   no recomendar `prune=550` automático. El supervisor usa exclusivamente `prune=1`.
 - Esquema compacto con números de transacción anchos y resolución exacta de colisiones.
 - Mempool incremental, lectores concurrentes, presupuestos globales de red/caché.
-- Recuperación profunda asistida, auditoría incremental y migraciones futuras.
+- Recuperación profunda asistida y migraciones futuras; ampliar la validación de
+  la auditoría incremental experimental ya implementada.
 - Recuperación P2P sostenida con fuentes públicas y GUI Electrum/Sparrow
   (no confundir el smoke TCP con GUI). Evidencia de regtest/Tor: `verification.md`.
 - Capacidad de mainnet, recursos, sincronización completa, ataques y energía.
@@ -128,14 +132,15 @@ No borrar ese marcador para saltarse el problema: inspeccionar Core y recuperar.
 La poda mainnet está prohibida en código, sin override.
 Se respeta además el umbral de altura 1000 de Core 31 en redes de prueba normales.
 Las auditorías de un prefijo ya podado recuperan y verifican bloques en memoria:
-no los incorporan a la caché de cartera. Los índices auditados y backups sí se
-conservan; sus costes de disco y mantenimiento incremental siguen pendientes de
-optimización.
+no los incorporan a la caché de cartera. Tras un mantenimiento gestionado
+exitoso se conserva la pareja auditada y el backup más recientes y se eliminan solo
+parejas antiguas reconocidas y verificadas; las generaciones incompletas o
+desconocidas se conservan. Los costes de disco siguen pendientes de medición.
 
 ## Fases siguientes
 
-1. **Base comprobable:** compilación, smoke offline, instrucciones manuales.
-2. **Eficiencia:** medir replay/espacio; después batching, pipeline y mempool incremental.
+1. **Base comprobable:** compilación, smoke offline e instrucciones manuales.
+2. **Eficiencia:** medir replay/espacio y batching existente; ampliar pipeline y mempool incremental.
 3. **Operación IBD:** ampliar validación del supervisor, spool acotado y medición de carrera/poda.
 4. **Endurecimiento:** cortes/ENOSPC/EIO, reorg profunda, auditorías y recuperación.
 5. **Validación pública:** prefijos Signet/Testnet4 aislados; luego sincronización

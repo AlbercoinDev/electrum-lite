@@ -1,8 +1,8 @@
-# Dependencias de la reescritura
+# Dependencias
 
 Versiones resueltas y licencias verificadas en los metadatos oficiales de crates,
-registradas en Cargo.lock. No se incorporó código de electrs, Fulcrum ni bindex.
-RocksDB y rust-bitcoin son bibliotecas genéricas, no motores Electrum reutilizados.
+registradas en Cargo.lock. Electrum Lite implementa su propio servidor; RocksDB y
+rust-bitcoin se utilizan como bibliotecas genéricas.
 
 | Biblioteca | Versión | Licencia |
 |---|---|---|

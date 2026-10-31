@@ -1,9 +1,25 @@
-# Evidencia local — reescritura thin
+# Evidencia local — Electrum Lite thin
 
-Fecha: 2026-10-30. Linux x86-64, Rust 1.99.1, Bitcoin Core 31.0.0.
-Pruebas de laboratorio offline, no sincronización pública ni GUI.
+Evidencia de laboratorio del 30–31 de octubre de 2026, Linux x86-64 y Bitcoin
+Core 31.0 salvo indicación contraria. Son pruebas en regtest desechable, no una
+sincronización pública completa ni una prueba de GUI.
 
-## Detección de poda durante IBD — cambios locales posteriores
+## Resumen de la evidencia
+
+| Alcance | Resultado y límites |
+|---|---|
+| Binario experimental de `936e6b1`, SHA256 `9f24985251223ee9ca00850bd65f0c2ecde765cd16aa0bfa33a00fe289ec9f6c` | Pasaron 29 tests, Clippy, compilación release y smoke regtest básico. |
+| Poda física gestionada | Dos podas y reintento tras cambio de punta durante auditoría; hubo una compilación durante el smoke, por lo que no valida íntegramente un único binario final. |
+| Instantánea y backup obsoletos | Pruebas básicas de rechazo, sin inyección gestionada de ambas carreras de extremo a extremo. |
+| P2P activo durante poda | Test RPC simulado posterior rechazó la operación antes de la RPC irreversible; no se implementó poda con P2P conectado. |
+
+El registro siguiente es **histórico**: «trabajo local» describe el estado al
+realizar cada prueba, aunque algunos cambios se publicaron después. Sus resultados
+no validan por sí solos una compilación posterior. El comportamiento actual se
+describe en [README](../README.md) y [project-status.md](project-status.md); los
+límites de P2P están en [p2p-pruning-investigation.md](p2p-pruning-investigation.md).
+
+## Registro histórico: poda durante IBD y evolución posterior
 
 `scripts/managed_prune_smoke.py --bitcoind /tmp/opencode/bitcoin-31.0/bin/bitcoind
 --electrum-lite target/release/electrum-lite --temp-dir target/prune-smoke`
@@ -38,7 +54,7 @@ base con registro completo y pareja coincidente, comprueba la ascendencia con Co
 reproduce el tramo nuevo y compara el estado completo. Un test de RPC simulado
 verificó que solo se solicita el bloque nuevo, que una rama divergente provoca
 replay completo y que un error RPC aborta. La prueba física de dos podas terminó
-con un error del entorno y no tiene resultado concluyente. Electrum sigue detenido
+con un error del entorno y no tiene resultado concluyente. En esa revisión intermedia Electrum seguía detenido
 durante auditoría y poda, y se reinicia antes de limpiar generaciones antiguas;
 este nuevo orden no se ha probado con una poda física de extremo a extremo.
 
@@ -191,9 +207,9 @@ retraso y la histéresis de 512 MiB. No se ha probado un agotamiento real de dis
 ni una poda física con la nueva política. La comprobación periódica no garantiza
 evitar ENOSPC si el espacio cae rápidamente o se necesita para auditoría/backup.
 
-## Build
+## Build de referencia inicial
 
-Se ejecutó sobre el árbol nuevo:
+Se ejecutó sobre el código de la aplicación:
 
 ```text
 cargo fmt --check                                      OK
@@ -256,16 +272,7 @@ dependencia de ejecución. Eso no demuestra compatibilidad con cualquier Linux.
 Se ejecutó también `scripts/devnet.py` con una raíz nueva: creó 101 bloques e
 imprimió los comandos manuales; después se detuvo su Core dedicado.
 
-## Historial preservado
-
-Se recuperó `.git` desde el remoto, no el código anterior. HEAD histórico:
-`a971a2d1077b5a6805c94e6541f8004095ae1389`.
-Tag original intacto:
-`v0.0.1-beta.1 -> accc8cd00c061fa2a1cff9455826d89d76584351`.
-En el momento de esa comprobación, la reescritura seguía sin publicar; esta
-sección registra el estado histórico, no el estado actual de GitHub.
-
-## Ampliación: supervisor y Tor opcional
+## Supervisor y Tor opcional
 
 La compilación ampliada supera nuevamente fmt, Clippy y release. Ahora son
 **7 tests unitarios**: añade rechazo de directorios Core ajenos y el bloqueo
@@ -383,8 +390,7 @@ opcional. La versión sigue siendo `0.0.1-beta.1`; el binario anterior queda en
 
 El paquete actual se denomina
 `dist/electrum-lite-thin-managed-experimental-linux-x86_64.tar.gz`; el paquete
-básico anterior no se sobrescribe. Son artefactos locales sin firma y no son
-construcciones del tag inicial.
+básico anterior no se sobrescribe. Son artefactos locales sin firma.
 
 ## No demostrado
 

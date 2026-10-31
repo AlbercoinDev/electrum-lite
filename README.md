@@ -1,4 +1,4 @@
-# Electrum Lite — reescritura thin experimental
+# Electrum Lite — servidor thin experimental
 
 **Versión `0.0.1-beta.1`.** Servidor Electrum en Rust construido desde cero:
 Core valida, RocksDB conserva índices y los bloques históricos ausentes se obtienen
@@ -8,7 +8,8 @@ completos por P2P. Tor opcional. Sin APIs públicas ni servidores Electrum exter
 IBD ni la capacidad mainnet. El supervisor de Core y la poda coordinada son experimentales.
 No usar `prune=550` automático: usar un **Core nuevo dedicado con `prune=1`**.
 No se ha probado una GUI de cartera; el smoke comprueba el protocolo TCP.
-Diseño, estado y límites: [docs/rewrite.md](docs/rewrite.md).
+Diseño, estado y límites: [docs/project-status.md](docs/project-status.md).
+Evidencia y alcance de las pruebas: [docs/verification.md](docs/verification.md).
 
 Los mensajes de progreso y supervisor detectan `LC_ALL`, `LC_MESSAGES` y `LANG`,
 en ese orden: español para `es` e inglés para los demás idiomas. La traducción
@@ -244,6 +245,8 @@ procesos pausa P2P de Core y mantiene el servidor Electrum en ejecución mientra
 compara auditoría, instantánea y backup con el índice congelado y poda tras volver
 a comprobar Core. Dos podas físicas en regtest conservaron el mismo proceso y una
 conexión TCP existente; esto no garantiza disponibilidad continua de consultas.
+La razón de conservar la desconexión P2P y las alternativas pendientes se explican
+en [la investigación de poda](docs/p2p-pruning-investigation.md).
 Durante la reserva se rechaza temporalmente la difusión de transacciones y algunas
 consultas históricas pueden fallar o retrasarse; `server.health` indica que no
 está listo. Si Core confirma que la punta cambió durante la preparación, el
@@ -303,6 +306,25 @@ Sin `--auto-prune` solo supervisa y controla el retraso: Core sigue acumulando
 bloques hasta que realices mantenimiento. La poda automática **mainnet está
 bloqueada**, sin excepción insegura. `prune-pending` bloquea su arranque automático.
 Los eventos están en `RED/supervisor/events.jsonl`, sin consultas de cartera.
+
+### Si el arranque falla por un archivo inexistente
+
+`No such file or directory (os error 2)` no indica por sí solo qué ruta falta.
+Comprueba primero el ejecutable indicado en `--bitcoind`, sin modificar los datos:
+
+```sh
+ls -l "$HOME/.local/bin/bitcoind"
+"$HOME/.local/bin/bitcoind" --version
+command -v bitcoind
+```
+
+Si usas otra ruta en `--bitcoind`, comprueba esa ruta en su lugar. Un enlace roto
+o un ejecutable que no puede arrancar también requieren investigación. Si Core
+está instalado en otro lugar, usa su ruta real; si no está instalado, consulta la
+sección 2. Si el ejecutable funciona, revisa las rutas configuradas y, si existe,
+`RED/supervisor/events.jsonl`. Antes de compartir diagnósticos, revisa si contienen
+rutas o direcciones privadas. No borres ni recrees los directorios de Core o Lite
+para intentar resolver el error, ni elimines `prune-pending`.
 
 ### Con un Core arrancado por ti
 
@@ -407,7 +429,7 @@ electrum-lite --network regtest --data-dir /ruta/lite \
 El checkpoint es el directorio del índice, no el data root. Para restaurarlo,
 con Lite detenido, copia a **OTRA** raíz: `/otra-raiz/regtest/index`, conservando
 fuente y backup. Sirve con `--data-dir /otra-raiz`. Nunca mezcles generaciones ni
-abras thin-v1 con el binario anterior al rewrite. Conserva este binario con el backup.
+abras thin-v1 con un binario incompatible. Conserva este binario con el backup.
 Los hardlinks de un checkpoint no protegen frente a fallo del disco: copia fuera.
 
 La poda es manual, experimental y **bloqueada en mainnet**. Solo un Core de pruebas
