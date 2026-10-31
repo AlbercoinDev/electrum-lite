@@ -55,25 +55,37 @@ echo mq-deadline > /sys/block/sdX/queue/scheduler
 por SST, un job de compactación y 8 MiB de readahead. `--storage ssd` usa 128 MiB
 por SST y dos jobs. El perfil se fija al crear el índice y no se cambia en caliente.
 
-## systemd
+## Arranque manual
 
-Crea un usuario de sistema y los directorios antes de instalar la unidad:
-
-```sh
-sudo useradd --system --home /srv/electrum-lite --shell /usr/sbin/nologin electrum-lite
-sudo install -d -o electrum-lite -g electrum-lite /srv/electrum-lite /srv/electrum-lite-core
-```
-
-Copia `contrib/electrum-lite.service` a `/etc/systemd/system/`, ajusta usuario,
-rutas y binarios, y:
+No se instala ni se habilita systemd. Lite se lanza en primer plano y arranca su
+propio Core:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now electrum-lite
+mkdir -p /srv/electrum-lite /srv/electrum-lite-core
+
+electrum-lite --network mainnet \
+  --data-dir /srv/electrum-lite \
+  --core-dir /srv/electrum-lite-core \
+  --bitcoind "$HOME/.local/bin/bitcoind" \
+  --core-rpc http://127.0.0.1:8332 \
+  --core-p2p-port 8333 \
+  --listen 127.0.0.1:50001 \
+  --confirm-dedicated \
+  --confirm-pruned-mainnet \
+  --storage hdd \
+  --tor \
+  managed-serve
 ```
 
-`KillMode=control-group` hace que Core muera con Lite. Sin esto, un fallo de Lite
-podría dejar Core descargando y podando por delante del índice.
+- `Ctrl-C` detiene Lite y Core de forma ordenada.
+- Para mantenerlo tras cerrar la terminal, usa `tmux` o `screen`.
+- Para pararlo desde otra terminal: `pkill -TERM -f 'electrum-lite.*managed-serve'`.
+- No uses `kill -9` salvo como último recurso.
+- No ejecutes dos instancias sobre el mismo `--data-dir`: RocksDB y el índice
+  solo admiten un escritor.
+
+`contrib/electrum-lite.service` es una referencia opcional. No se instala ni se
+habilita; si algún día quieres usarlo, tendrás que copiarlo y ajustarlo tú.
 
 ## Poda de Core y recuperación
 
@@ -117,5 +129,5 @@ Core anterior está podado, necesita un `core-dir` nuevo y una sincronización
 completa; un Core podado no puede reconstruir el índice. Si el Core anterior
 conserva todos los bloques, puede reutilizarse.
 
-Las rutas de ejemplo y el procedimiento systemd están en el apartado
+Las rutas de ejemplo y el procedimiento manual están en el apartado
 “Actualizar desde `thin-v1` o `thin-v2`” del README.

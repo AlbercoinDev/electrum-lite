@@ -54,6 +54,64 @@ export PATH="$HOME/.local/bin:$PATH"
 electrum-lite --version
 ```
 
+### Ejecutar manualmente (sin systemd)
+
+El binario **no instala ni habilita ningún servicio**. Lite arranca y detiene su
+propio Core; tú lanzas el proceso y decides cuándo pararlo. Ejecútalo como tu
+usuario normal, no como root.
+
+En una terminal:
+
+```sh
+mkdir -p /srv/electrum-lite /srv/electrum-lite-core
+
+electrum-lite --network mainnet \
+  --data-dir /srv/electrum-lite \
+  --core-dir /srv/electrum-lite-core \
+  --bitcoind "$HOME/.local/bin/bitcoind" \
+  --core-rpc http://127.0.0.1:8332 \
+  --core-p2p-port 8333 \
+  --listen 127.0.0.1:50001 \
+  --confirm-dedicated \
+  --confirm-pruned-mainnet \
+  --storage hdd \
+  --tor \
+  managed-serve
+```
+
+Para Signet/Testnet4 cambia `--network`, los puertos RPC/P2P y elimina
+`--confirm-pruned-mainnet` si no aplica. Sin `--tor`, la reconstrucción pública
+queda desactivada salvo que añadas `--esplora` y `--allow-public-data` (esto
+último expone tu IP al proveedor). `--storage hdd` es el perfil recomendado para
+HDD; usa `--storage ssd` en SSD.
+
+Para dejarlo corriendo al cerrar la terminal, usa `tmux` o `screen`:
+
+```sh
+tmux new -s electrum-lite
+# ejecuta el comando anterior dentro de tmux
+# Ctrl-b d para desconectar
+tmux attach -t electrum-lite
+```
+
+Para pararlo:
+
+- En primer plano: `Ctrl-C`.
+- En segundo plano: `pkill -TERM -f 'electrum-lite.*managed-serve'`.
+- Evita `kill -9`; si el gestor muere de forma abrupta, Core recibe `SIGTERM`
+  por `PDEATHSIG`, pero un cierre ordenado es más seguro.
+- Comprueba que no queda otro Lite/Core dedicado antes de volver a arrancar.
+
+Los mensajes aparecen por la terminal. Los eventos y el log de Core quedan en
+`/srv/electrum-lite/mainnet/supervisor/events.jsonl` y
+`/srv/electrum-lite/mainnet/supervisor/core.log`.
+
+Comprobación desde otra terminal:
+
+```sh
+python3 scripts/query.py server.health
+```
+
 ### Actualizar desde `thin-v1` o `thin-v2`
 
 La release actual usa **`thin-v3-txnum`** (TxNum/txpos y commit con
@@ -61,35 +119,33 @@ La release actual usa **`thin-v3-txnum`** (TxNum/txpos y commit con
 con `wrong network or database format`. No borres el índice anterior; muévelo a
 otra ruta y conserva el binario antiguo junto a él.
 
-Si el servicio es gestionado y el Core anterior está podado:
+Detén primero tu proceso manual:
 
 ```sh
-sudo systemctl stop electrum-lite
-sudo install -d -o electrum-lite -g electrum-lite /srv/electrum-lite-nuevo /srv/electrum-lite-core-nuevo
-# Instala el binario nuevo con el instalador o con install.sh.
-sudo mv /srv/electrum-lite /srv/electrum-lite.thin-v2
-sudo mv /srv/electrum-lite-core /srv/electrum-lite-core.thin-v2
-sudo mv /srv/electrum-lite-nuevo /srv/electrum-lite
-sudo mv /srv/electrum-lite-core-nuevo /srv/electrum-lite-core
-sudo systemctl start electrum-lite
+pkill -TERM -f 'electrum-lite.*managed-serve'
+# espera a que termine; comprueba:
+pgrep -af 'electrum-lite|bitcoind'
 ```
 
-Ajusta las rutas a tu unidad systemd. El Core nuevo empieza desde génesis y Lite
-indexa en paralelo; un Core podado no puede reconstruir el índice antiguo. Si el
-Core anterior **no está podado y conserva todos los bloques**, puedes reutilizar su
-`core-dir`; Lite volverá a leer los bloques locales. Si no, la actualización exige
-una sincronización completa.
-
-En una instalación manual, usa un `--data-dir` NUEVO y un `--core-dir` NUEVO (o un
-Core no podado con todos los bloques). Comprueba después:
+Instala el binario nuevo con el instalador o con `install.sh`. Si el Core anterior
+está podado, conserva los directorios antiguos y crea raíces nuevas:
 
 ```sh
-target/release/electrum-lite --data-dir /srv/electrum-lite --core-cookie ... health
+mv /srv/electrum-lite /srv/electrum-lite.thin-v2
+mv /srv/electrum-lite-core /srv/electrum-lite-core.thin-v2
+mkdir -p /srv/electrum-lite /srv/electrum-lite-core
 ```
 
-La respuesta debe indicar `"engine":"thin-v3-txnum"`.
+Vuelve a lanzar el comando manual de la sección anterior. El Core nuevo empieza
+desde génesis y Lite indexa en paralelo; un Core podado no puede reconstruir el
+índice antiguo. Si el Core anterior **no está podado y conserva todos los bloques**,
+puedes reutilizar su `--core-dir`; Lite volverá a leer los bloques locales. Si no,
+la actualización exige una sincronización completa.
 
-### Alternativa: compilar desde fuentes
+La unidad `contrib/electrum-lite.service` existe solo como referencia opcional.
+No se instala, no se habilita y no es necesaria para usar la aplicación.
+
+### Alternativa: compilar desde fuentes### Alternativa: compilar desde fuentes
 
 ```sh
 sudo apt-get update
