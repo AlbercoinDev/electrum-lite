@@ -454,7 +454,7 @@ Release publicada:
 <https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31>.
 Assets: binario `electrum-lite`, paquete tar.gz, checksum e
 `install-release.sh`. SHA256 del binario:
-`d0383494efe244493e32248fb8ce424ccde66f2e4f7ae7db375238ae2897a14f`.
+`31817299545bf244feff70f0e00252f4b176f7264f6cebf06077b4c18ac487e3`.
 
 Se implementaron el motor local, el esquema de 24 B, la reconstrucción por
 ventana ciega, el perfil HDD/4 GB y la coordinación de poda mainnet. Evidencia
