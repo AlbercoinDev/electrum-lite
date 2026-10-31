@@ -198,6 +198,42 @@ fn health(listen: SocketAddr) -> Result<Value> {
     ensure!(r["error"].is_null(), "health request failed");
     Ok(r["result"].clone())
 }
+
+#[cfg(unix)]
+fn request_snapshot(control: &Path, snapshot: &Path, expected_height: u32) -> Result<()> {
+    use std::os::unix::net::UnixStream;
+    let mut stream =
+        UnixStream::connect(control).context("private snapshot control unavailable")?;
+    stream.set_read_timeout(Some(Duration::from_secs(130)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    serde_json::to_writer(&mut stream, &json!({"method":"snapshot", "path":snapshot}))?;
+    stream.write_all(b"\n")?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .take(65537)
+        .read_line(&mut response)?;
+    ensure!(response.len() < 65536, "snapshot response too large");
+    let response: Value = serde_json::from_str(&response)?;
+    ensure!(
+        response.get("error").is_none_or(Value::is_null),
+        "snapshot request failed: {}",
+        response["error"]
+    );
+    ensure!(
+        response["result"]["height"].as_u64() == Some(u64::from(expected_height)),
+        "snapshot height mismatch"
+    );
+    let _: bitcoin::BlockHash = response["result"]["hash"]
+        .as_str()
+        .context("snapshot hash missing")?
+        .parse()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn request_snapshot(_control: &Path, _snapshot: &Path, _expected_height: u32) -> Result<()> {
+    bail!("private supervisor control requires Unix")
+}
 impl Config {
     fn base_command(&self, cookie: &Path) -> Result<Command> {
         let mut c = Command::new(std::env::current_exe()?);
@@ -219,9 +255,38 @@ impl Config {
         }
         Ok(c)
     }
-    fn server(&self, cookie: &Path) -> Result<OwnedChild> {
-        OwnedChild::spawn(self.base_command(cookie)?.arg("serve"))
+    fn server(&self, cookie: &Path, control: Option<&Path>) -> Result<OwnedChild> {
+        let mut command = self.base_command(cookie)?;
+        if let Some(control) = control {
+            command.arg("--control-socket").arg(control);
+        }
+        OwnedChild::spawn(command.arg("serve"))
     }
+}
+
+/// Allocate a new private capability directory for this supervisor run.
+/// Never adopt or remove an existing directory or socket after a crash.
+#[cfg(unix)]
+fn private_control_path(maintenance: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let name = format!("c-{:x}-{:x}", std::process::id(), stamp as u32);
+    let private = fs::canonicalize(maintenance)?.join(name);
+    let path = private.join("s");
+    use std::os::unix::ffi::OsStrExt;
+    ensure!(
+        path.as_os_str().as_bytes().len() < 108,
+        "private control socket path too long; use a shorter data directory"
+    );
+    fs::DirBuilder::new().mode(0o700).create(&private)?;
+    Ok(path)
+}
+
+#[cfg(not(unix))]
+fn private_control_path(_maintenance: &Path) -> Result<PathBuf> {
+    bail!("private supervisor control requires Unix")
 }
 pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     ensure!(
@@ -312,6 +377,12 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let maintenance = root.join("supervisor");
     ensure!(!maintenance.is_symlink(), "maintenance symlink refused");
     fs::create_dir_all(&maintenance)?;
+    let maintenance = fs::canonicalize(&maintenance)?;
+    let control = if c.auto_prune {
+        Some(private_control_path(&maintenance)?)
+    } else {
+        None
+    };
     let events = maintenance.join("events.jsonl");
     let network_dir = match c.network.as_str() {
         "mainnet" => core_dir.clone(),
@@ -375,7 +446,7 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         "core_owned",
         json!({"pid":node.0.id(),"manual_pruning":true}),
     )?;
-    let mut daemon = c.server(&cookie)?;
+    let mut daemon = c.server(&cookie, control.as_deref())?;
     let mut started = Instant::now();
     let mut paused = false;
     let minimum_free = u64::from(c.min_free_mib) * 1024 * 1024;
@@ -579,6 +650,62 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         }
         if maintenance_due && !eligible.is_empty() {
             waiting_for_files = false;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            let snapshot = maintenance.join(format!("snapshot-{tip}-{stamp}"));
+            let audit = maintenance.join(format!("audit-{tip}-{stamp}"));
+            let backup = maintenance.join(format!("backup-{tip}-{stamp}"));
+            let control = control.as_deref().context("private control missing")?;
+            event(&events, "audit_preparing", json!({"height":tip}))?;
+            request_snapshot(control, &snapshot, tip)?;
+            let mut auditing = OwnedChild::spawn(
+                c.base_command(&cookie)?
+                    .arg("--snapshot-dir")
+                    .arg(&snapshot)
+                    .arg("--audit-dir")
+                    .arg(&audit)
+                    .arg("audit"),
+            )?;
+            let mut reserve_checked = Instant::now();
+            let audit_status = loop {
+                if let Some(status) = auditing.0.try_wait()? {
+                    break status;
+                }
+                ensure!(
+                    !stop.load(Ordering::Relaxed),
+                    "online audit interrupted; partial generations preserved"
+                );
+                node.live()?;
+                daemon.live()?;
+                if reserve_checked.elapsed() >= Duration::from_secs(5) {
+                    let free = available_bytes(&core_dir)?.min(available_bytes(&root)?);
+                    ensure!(
+                        free >= minimum_free,
+                        "disk reserve exhausted during online audit; generations preserved"
+                    );
+                    reserve_checked = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(100));
+            };
+            ensure!(
+                audit_status.success(),
+                "online audit failed; generations preserved and no pruning performed"
+            );
+            let proof = control
+                .parent()
+                .context("private control parent")?
+                .join(format!("audit-{stamp}.ok"));
+            durable_new(
+                &proof,
+                format!(
+                    "snapshot={}\naudit={}\n",
+                    fs::canonicalize(&snapshot)?.display(),
+                    fs::canonicalize(&audit)?.display()
+                )
+                .as_bytes(),
+            )?;
+            event(&events, "audit_prepared", json!({"height":tip}))?;
             daemon.stop()?;
             let before = block_files(&block_dir)?;
             core.call("setnetworkactive", json!([false]))?;
@@ -587,17 +714,16 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 "maintenance_offline",
                 json!({"height":tip,"electrum_stopped":true,"networkactive":false}),
             )?;
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
-            let audit = maintenance.join(format!("audit-{tip}-{stamp}"));
-            let backup = maintenance.join(format!("backup-{tip}-{stamp}"));
             let mut pruning = OwnedChild::spawn(
                 c.base_command(&cookie)?
                     .args(["--confirm-prune", "--audit-dir"])
                     .arg(&audit)
                     .arg("--backup-dir")
                     .arg(&backup)
+                    .arg("--prepared-snapshot")
+                    .arg(&snapshot)
+                    .arg("--prepared-proof")
+                    .arg(&proof)
                     .arg("prune"),
             )?;
             let status = loop {
@@ -642,16 +768,31 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             // Retention only reads closed checkpoints, not the live index. Bring
             // Electrum back before that potentially expensive verification while
             // Core networking stays paused and no other maintenance can run.
-            daemon = c.server(&cookie)?;
+            daemon = c.server(&cookie, Some(control))?;
             started = Instant::now();
             health_seen = false;
             event(&events, "electrum_resuming", json!({"networkactive":false}))?;
             match crate::retention::clean(&root, &maintenance, &audit, &backup, network) {
-                Ok(count) => event(
-                    &events,
-                    "retention_complete",
-                    json!({"removed_pairs":count}),
-                )?,
+                Ok(count) => {
+                    event(
+                        &events,
+                        "retention_complete",
+                        json!({"removed_pairs":count}),
+                    )?;
+                    if let Err(e) = crate::retention::clean_prepared(
+                        &root,
+                        &maintenance,
+                        &snapshot,
+                        &proof,
+                        network,
+                    ) {
+                        event(
+                            &events,
+                            "retention_skipped",
+                            json!({"reason":format!("temporary generation preserved: {e:#}")}),
+                        )?;
+                    }
+                }
                 Err(e) => event(
                     &events,
                     "retention_skipped",
@@ -787,6 +928,58 @@ mod tests {
             minimum + 512 * mib,
             minimum
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_control_rejects_failed_or_mismatched_replies() -> Result<()> {
+        use std::os::unix::net::UnixListener;
+        let root = std::env::temp_dir().join(format!(
+            "el-control-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        fs::create_dir(&root)?;
+        let hash = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        for (i, response, valid) in [
+            (
+                0,
+                json!({"result":{"height":7,"hash":hash.to_string()}}),
+                true,
+            ),
+            (1, json!({"error":{"message":"refused"}}), false),
+            (
+                2,
+                json!({"result":{"height":8,"hash":hash.to_string()}}),
+                false,
+            ),
+            (3, json!({"result":{"height":7,"hash":"invalid"}}), false),
+        ] {
+            let path = root.join(format!("s{i}"));
+            let listener = UnixListener::bind(&path)?;
+            let worker = thread::spawn(move || -> Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut request)?;
+                let request: Value = serde_json::from_str(&request)?;
+                ensure!(
+                    request["method"] == "snapshot",
+                    "unexpected control request"
+                );
+                writeln!(stream, "{response}")?;
+                Ok(())
+            });
+            assert_eq!(
+                request_snapshot(&path, &root.join("snapshot-7-1"), 7).is_ok(),
+                valid
+            );
+            worker.join().expect("control test worker")?;
+            fs::remove_file(path)?;
+        }
+        fs::remove_dir(root)?;
+        Ok(())
     }
 
     #[test]

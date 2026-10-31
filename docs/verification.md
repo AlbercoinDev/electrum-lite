@@ -45,11 +45,41 @@ este nuevo orden no se ha probado con una poda física de extremo a extremo.
 Trabajo local posterior: el smoke regtest sencillo creó un checkpoint mediante
 un socket Unix en un directorio privado, rechazó un destino inválido y uno ya
 existente, comprobó que el método no está expuesto por Electrum TCP y confirmó que
-`server.ping` respondía después. El supervisor aún no utiliza este canal para
-auditar ni podar; no se ha medido disponibilidad durante checkpoints grandes.
+`server.ping` respondía después. No se ha medido disponibilidad durante
+checkpoints grandes.
 Otra prueba sencilla mantuvo bloqueada una auditoría de una copia de ese
 checkpoint y comprobó que el servidor Electrum vivo respondió a `server.ping`.
-La conexión automática del supervisor a ese flujo sigue pendiente.
+
+Trabajo local posterior: el proceso de auditoría puede abrir un checkpoint
+existente de `supervisor/snapshot-ALTURA-SELLO` sin abrir el índice activo y
+utiliza la caché histórica de la raíz original y bases verificadas. El smoke
+regtest mantuvo esa auditoría detenida en una petición de bloque mientras
+Electrum respondió a `server.ping`, y rechazó un nombre con altura distinta sin
+crear la auditoría. No se ha probado una poda preparada con instantánea.
+Una comprobación local adicional compara la auditoría con la instantánea y esta
+con el índice bloqueado, incluyendo los undo retenidos. Un test rechazó usar el
+mismo directorio, modificar el índice vivo a igual altura y modificar el estado
+auditado. La igualdad no prueba que la reproducción se haya ejecutado: el
+supervisor también comprueba el fin correcto de su propio proceso auditor.
+En trabajo local, el servidor gestionado con `--auto-prune` crea también un
+socket privado en un directorio nuevo con permisos 0700. El smoke dedicado
+solicitó una instantánea mediante ese socket mientras el servidor seguía activo.
+Las rutas de socket Unix largas se rechazan; los directorios privados de ejecuciones
+anteriores se conservan y no se adoptan.
+El smoke gestionado también ejecutó un auditor separado sobre el checkpoint y
+comprobó que Electrum respondió después. Otra prueba hizo avanzar Core mientras
+la auditoría estaba detenida: la auditoría falló y conservó la instantánea y el
+resultado parcial. En otra ejecución regtest desechable, el flujo automático
+completo terminó la auditoría antes de detener Electrum y realizó dos podas
+físicas; la segunda reutilizó una base incremental verificada. La primera borró
+`blk00000.dat` (435757602 → 301586406 bytes; `pruneheight=743`); pasaron la
+recuperación witness, prueba Merkle, limpieza de checkpoint temporal, retención
+conservadora y bloqueo por `prune-pending`. No demuestra disponibilidad
+ininterrumpida: Electrum se detiene para backup, verificación final y poda.
+Una prueba regtest separada rechazó una prueba preparada inválida y una
+instantánea desactualizada antes de crear el backup o llamar a la poda; conservó
+las generaciones y el `pruneheight` no cambió. No es una simulación exhaustiva de
+caídas o fallos de disco.
 
 Un regtest dedicado desechable arrancó con `--core-dbcache-mib 256`; se verificó
 en los argumentos del proceso Core `-dbcache=256` y se detuvo limpiamente. Este

@@ -38,8 +38,11 @@ def main():
             result = subprocess.run([args.bitcoin_cli, "-regtest", f"-datadir={root / 'core'}", f"-rpcport={rpc}", "getnetworkinfo"], capture_output=True, text=True, timeout=5, check=True)
             return json.loads(result.stdout)["networkactive"]
 
-        def run(reserve_mib, expect_paused):
-            child = subprocess.Popen(common + ["--min-free-mib", str(reserve_mib), "managed-serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def run(reserve_mib, expect_paused, test_control=False):
+            command = common + ["--min-free-mib", str(reserve_mib)]
+            if test_control:
+                command.append("--auto-prune")
+            child = subprocess.Popen(command + ["managed-serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 deadline = time.monotonic() + 30
                 while time.monotonic() < deadline:
@@ -50,8 +53,29 @@ def main():
                         if expect_paused and any(e["event"] == "backpressure_pause" and e["details"]["reason"] == "disk" for e in entries) and not network():
                             return
                         if not expect_paused and network():
-                            return
-                    except (OSError, subprocess.CalledProcessError, KeyError):
+                            if not test_control:
+                                return
+                            maintenance = root / "lite/regtest/supervisor"
+                            for control in maintenance.glob("c-*/s"):
+                                snapshot = maintenance / "snapshot-0-1"
+                                try:
+                                    with socket.socket(socket.AF_UNIX) as sock:
+                                        sock.settimeout(3)
+                                        sock.connect(str(control))
+                                        sock.sendall(json.dumps({"method": "snapshot", "path": str(snapshot)}).encode() + b"\n")
+                                        response = json.loads(sock.makefile("rb").readline())
+                                    if response.get("error") is None and response["result"]["height"] == 0 and snapshot.is_dir():
+                                        audit = maintenance / "audit-0-1"
+                                        audit_command = [str(Path(args.electrum_lite).resolve()), "--network", "regtest", "--data-dir", str(root / "lite"), "--core-cookie", str(root / "core/regtest/.cookie"), "--core-rpc", f"http://127.0.0.1:{rpc}", "--snapshot-dir", str(snapshot), "--audit-dir", str(audit), "audit"]
+                                        audited = subprocess.run(audit_command, capture_output=True, text=True, timeout=30)
+                                        assert audited.returncode == 0, audited.stderr
+                                        with socket.create_connection(("127.0.0.1", listen), timeout=5) as tcp:
+                                            tcp.sendall(b'{"id":1,"method":"server.ping","params":[]}\n')
+                                            assert json.loads(tcp.makefile("rb").readline())["result"] is None
+                                        return
+                                except (OSError, ValueError, KeyError):
+                                    pass
+                    except (OSError, subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
                         pass
                     time.sleep(0.1)
                 raise RuntimeError("network state timeout")
@@ -65,6 +89,8 @@ def main():
         print("PASS: insufficient configured reserve pauses dedicated Core networking")
         run(256, False)
         print("PASS: restart with sufficient free space permits networking")
+        run(256, False, test_control=True)
+        print("PASS: managed snapshot audited separately; Electrum responds afterward")
 
 
 if __name__ == "__main__":

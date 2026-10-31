@@ -66,6 +66,14 @@ struct Args {
     /// Private supervisor control socket; never exposed over Electrum TCP.
     #[arg(long, hide = true)]
     control_socket: Option<PathBuf>,
+    /// Supervisor-owned checkpoint to audit independently from the live index.
+    #[arg(long, hide = true)]
+    snapshot_dir: Option<PathBuf>,
+    /// Internal handoff from the managed supervisor after its audit child exits.
+    #[arg(long, hide = true)]
+    prepared_snapshot: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    prepared_proof: Option<PathBuf>,
     #[arg(value_parser=["sync","serve","managed-serve","health","backup","audit","prune"], default_value="serve")]
     command: String,
 }
@@ -159,6 +167,14 @@ fn main() -> Result<()> {
             "managed-serve owns its private control socket"
         );
         ensure!(
+            a.snapshot_dir.is_none(),
+            "managed-serve cannot use an audit snapshot"
+        );
+        ensure!(
+            a.prepared_snapshot.is_none() && a.prepared_proof.is_none(),
+            "managed-serve owns prepared pruning"
+        );
+        ensure!(
             a.confirm_dedicated,
             "managed-serve requires --confirm-dedicated; never adopts an existing Core"
         );
@@ -194,9 +210,79 @@ fn main() -> Result<()> {
         a.control_socket.is_none() || a.command == "serve",
         "private control socket only applies to serve"
     );
-    let mut index = Index::open(&root.join("index"), network)?;
+    ensure!(
+        a.snapshot_dir.is_none() || a.command == "audit",
+        "snapshot only applies to audit"
+    );
+    ensure!(
+        a.prepared_snapshot.is_some() == a.prepared_proof.is_some(),
+        "prepared prune requires both snapshot and proof"
+    );
+    ensure!(
+        a.prepared_snapshot.is_none() || a.command == "prune",
+        "prepared snapshot only applies to prune"
+    );
+    let mut index = if let Some(snapshot) = &a.snapshot_dir {
+        let metadata = std::fs::symlink_metadata(snapshot)?;
+        ensure!(
+            metadata.file_type().is_dir(),
+            "snapshot must be a real directory"
+        );
+        let supervisor = std::fs::canonicalize(root.join("supervisor"))?;
+        ensure!(
+            std::fs::canonicalize(snapshot)?.parent() == Some(supervisor.as_path()),
+            "snapshot must be inside supervisor directory"
+        );
+        let name = snapshot
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid snapshot name"))?;
+        let (height, stamp) = name
+            .strip_prefix("snapshot-")
+            .and_then(|s| s.split_once('-'))
+            .ok_or_else(|| anyhow::anyhow!("invalid snapshot name"))?;
+        ensure!(
+            !height.is_empty()
+                && height.bytes().all(|b| b.is_ascii_digit())
+                && !stamp.is_empty()
+                && stamp.bytes().all(|b| b.is_ascii_digit()),
+            "invalid snapshot name"
+        );
+        let height: u32 = height.parse()?;
+        let _: u128 = stamp.parse()?;
+        ensure!(
+            std::fs::symlink_metadata(snapshot.join("CURRENT"))?
+                .file_type()
+                .is_file(),
+            "snapshot is not an existing RocksDB checkpoint"
+        );
+        {
+            let check =
+                rocksdb::DB::open_for_read_only(&rocksdb::Options::default(), snapshot, false)?;
+            let identity = format!("thin-v1:{network}");
+            ensure!(
+                check.get(b"identity")?.as_deref() == Some(identity.as_bytes()),
+                "snapshot network identity mismatch"
+            );
+            ensure!(
+                check.get(b"tip")?.as_deref() == Some(height.to_be_bytes().as_slice()),
+                "snapshot name does not match its tip"
+            );
+        }
+        let checkpoint = Index::open(snapshot, network)?;
+        ensure!(
+            checkpoint.tip()? == Some(height),
+            "snapshot name does not match its tip"
+        );
+        checkpoint
+    } else {
+        Index::open(&root.join("index"), network)?
+    };
     index.fetcher.peers = a.block_peer;
     index.fetcher.proxy = proxy;
+    if a.snapshot_dir.is_some() {
+        index.cache = root.join("cache");
+    }
     let core = Core::new(
         a.core_rpc,
         a.core_cookie
@@ -213,13 +299,27 @@ fn main() -> Result<()> {
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--backup-dir NEW is required"))?,
         )?,
-        "audit" => index.audit_with_cancel(
-            &core,
-            a.audit_dir
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("--audit-dir NEW is required"))?,
-            &stop,
-        )?,
+        "audit" => {
+            let base = if a.snapshot_dir.is_some() {
+                electrum_lite::retention::verified_audit_base(
+                    &root,
+                    network,
+                    index
+                        .tip()?
+                        .ok_or_else(|| anyhow::anyhow!("empty snapshot"))?,
+                )?
+            } else {
+                None
+            };
+            index.audit_with_verified_base(
+                &core,
+                a.audit_dir
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--audit-dir NEW is required"))?,
+                &stop,
+                base.as_deref(),
+            )?
+        }
         "prune" => {
             ensure!(
                 a.confirm_prune,
@@ -256,15 +356,50 @@ fn main() -> Result<()> {
                     .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
                 "this height already has a completed prune record"
             );
-            let base = electrum_lite::retention::verified_audit_base(&root, network, height)?;
-            index.audit_with_verified_base(
-                &core,
-                a.audit_dir
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--audit-dir NEW is required before pruning"))?,
-                &stop,
-                base.as_deref(),
-            )?;
+            let audit_path = a
+                .audit_dir
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--audit-dir is required before pruning"))?;
+            if let Some(snapshot) = a.prepared_snapshot.as_deref() {
+                let proof = a.prepared_proof.as_deref().expect("checked prepared proof");
+                let maintenance = std::fs::canonicalize(root.join("supervisor"))?;
+                let private = proof
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("prepared proof parent missing"))?;
+                ensure!(
+                    std::fs::symlink_metadata(private)?.file_type().is_dir()
+                        && std::fs::canonicalize(private)?.parent() == Some(maintenance.as_path()),
+                    "prepared proof directory invalid"
+                );
+                let proof_meta = std::fs::symlink_metadata(proof)?;
+                ensure!(
+                    proof_meta.file_type().is_file() && proof_meta.len() <= 16384,
+                    "prepared proof invalid"
+                );
+                for path in [snapshot, audit_path] {
+                    ensure!(
+                        std::fs::symlink_metadata(path)?.file_type().is_dir()
+                            && std::fs::canonicalize(path)?.parent() == Some(maintenance.as_path()),
+                        "prepared generation outside supervisor directory"
+                    );
+                }
+                let snapshot = std::fs::canonicalize(snapshot)?;
+                let audit_path = std::fs::canonicalize(audit_path)?;
+                let expected = format!(
+                    "snapshot={}\naudit={}\n",
+                    snapshot.display(),
+                    audit_path.display()
+                );
+                ensure!(
+                    std::fs::read_to_string(proof)? == expected,
+                    "prepared proof mismatch"
+                );
+                let (prepared_height, _) = index.verify_prepared_audit(&snapshot, &audit_path)?;
+                ensure!(prepared_height == height, "prepared audit height changed");
+            } else {
+                let base = electrum_lite::retention::verified_audit_base(&root, network, height)?;
+                index.audit_with_verified_base(&core, audit_path, &stop, base.as_deref())?;
+            }
             index.backup(
                 a.backup_dir
                     .as_deref()
@@ -292,6 +427,16 @@ fn main() -> Result<()> {
             )?;
             file.sync_all()?;
             std::fs::File::open(&root)?.sync_all()?;
+            ensure!(
+                !stop.load(std::sync::atomic::Ordering::Relaxed),
+                "maintenance interrupted; intent preserved"
+            );
+            let expected_hash = index.header(height)?.block_hash();
+            ensure!(
+                index.tip()? == Some(height),
+                "index tip changed before prune; intent preserved"
+            );
+            core.verify_prune_preconditions(height, expected_hash)?;
             ensure!(
                 !stop.load(std::sync::atomic::Ordering::Relaxed),
                 "maintenance interrupted; intent preserved"

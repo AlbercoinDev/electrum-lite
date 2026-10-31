@@ -33,6 +33,18 @@ fn write_options() -> WriteOptions {
     w
 }
 impl Index {
+    /// Validate prepared state while holding the only live index lock. This is
+    /// not prune authorization: the supervisor must own a successful audit
+    /// process and the caller must recheck Core and persist pruning intent.
+    pub fn verify_prepared_audit(
+        &self,
+        snapshot: &Path,
+        audit: &Path,
+    ) -> Result<(u32, bitcoin::BlockHash)> {
+        crate::retention::verify_audit_snapshot(audit, snapshot, self.network)?;
+        self.verify_snapshot_matches(snapshot)
+    }
+
     /// Create an immutable, NEW checkpoint while the sole index writer is held.
     /// Before pruning it must be audited and compared against the live index.
     pub fn create_snapshot(&self, path: &Path) -> Result<(u32, bitcoin::BlockHash)> {
@@ -826,6 +838,45 @@ mod tests {
         live.commit(1, &next)?;
         assert!(live.verify_snapshot_matches(&snapshot).is_err());
         assert!(snapshot.exists(), "rejected snapshots must be preserved");
+        drop(live);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_audit_requires_three_matching_independent_states() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "el-prepared-audit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let live = Index::open(&root.join("live"), Network::Regtest)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        live.commit(0, &genesis)?;
+        let snapshot = root.join("snapshot");
+        let audit = root.join("audit");
+        live.create_snapshot(&snapshot)?;
+        live.create_snapshot(&audit)?;
+        assert_eq!(
+            live.verify_prepared_audit(&snapshot, &audit)?,
+            (0, genesis.block_hash())
+        );
+        assert!(live.verify_prepared_audit(&snapshot, &snapshot).is_err());
+        live.db.put(b"unexpected", b"changed")?;
+        assert!(live.verify_prepared_audit(&snapshot, &audit).is_err());
+        live.db.delete(b"unexpected")?;
+        {
+            let changed = Index::open(&audit, Network::Regtest)?;
+            changed.db.put(b"unexpected", b"changed")?;
+        }
+        assert!(live.verify_prepared_audit(&snapshot, &audit).is_err());
+        assert!(
+            snapshot.exists() && audit.exists(),
+            "rejected data must be preserved"
+        );
         drop(live);
         std::fs::remove_dir_all(root)?;
         Ok(())

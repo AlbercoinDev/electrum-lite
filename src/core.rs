@@ -23,6 +23,27 @@ impl std::fmt::Display for RpcError {
 impl std::error::Error for RpcError {}
 
 impl Core {
+    /// Revalidate immediately before pruning. Caller must own the index lock,
+    /// preserve prune intent and ensure there are no other chain writers.
+    pub fn verify_prune_preconditions(
+        &self,
+        expected_height: u32,
+        expected_hash: bitcoin::BlockHash,
+    ) -> Result<()> {
+        let chain = self.call("getblockchaininfo", json!([]))?;
+        let network = self.call("getnetworkinfo", json!([]))?;
+        let mempool = self.call("getrawmempool", json!([]))?;
+        let tip = self.call("getbestblockhash", json!([]))?;
+        validate_prune_preconditions(
+            &chain,
+            &network,
+            &mempool,
+            &tip,
+            expected_height,
+            expected_hash,
+        )
+    }
+
     pub fn new(url: String, cookie: PathBuf) -> Result<Self> {
         let address: std::net::SocketAddr = url
             .strip_prefix("http://")
@@ -165,6 +186,41 @@ impl Core {
     }
 }
 
+fn validate_prune_preconditions(
+    chain: &Value,
+    network: &Value,
+    mempool: &Value,
+    tip: &Value,
+    expected_height: u32,
+    expected_hash: bitcoin::BlockHash,
+) -> Result<()> {
+    ensure!(
+        chain["pruned"] == true && chain["automatic_pruning"] == false,
+        "Core manual pruning mode changed"
+    );
+    ensure!(
+        chain["blocks"].as_u64() == Some(u64::from(expected_height)),
+        "Core height changed before prune"
+    );
+    ensure!(
+        chain["bestblockhash"].as_str() == Some(expected_hash.to_string().as_str()),
+        "Core chain tip changed before prune"
+    );
+    ensure!(
+        tip.as_str() == Some(expected_hash.to_string().as_str()),
+        "Core best block changed before prune"
+    );
+    ensure!(
+        network["networkactive"] == false,
+        "Core network became active before prune"
+    );
+    ensure!(
+        mempool.as_array().is_some_and(Vec::is_empty),
+        "Core mempool is not empty before prune"
+    );
+    Ok(())
+}
+
 fn parse_hash_batch(bytes: &[u8], count: usize) -> Result<Vec<bitcoin::BlockHash>> {
     let replies: Vec<Value> = serde_json::from_slice(bytes)?;
     ensure!(replies.len() == count, "incomplete hash batch");
@@ -196,6 +252,39 @@ fn parse_hash_batch(bytes: &[u8], count: usize) -> Result<Vec<bitcoin::BlockHash
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    #[test]
+    fn prune_preconditions_reject_changed_or_missing_state() {
+        let hash =
+            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest).block_hash();
+        let chain = json!({"pruned":true,"automatic_pruning":false,"blocks":1000,"bestblockhash":hash.to_string()});
+        let network = json!({"networkactive":false});
+        let mempool = json!([]);
+        let tip = json!(hash.to_string());
+        let check = |c: &Value, n: &Value, m: &Value, t: &Value| {
+            validate_prune_preconditions(c, n, m, t, 1000, hash).is_ok()
+        };
+        assert!(check(&chain, &network, &mempool, &tip));
+        for (field, value) in [
+            ("pruned", json!(false)),
+            ("automatic_pruning", json!(true)),
+            ("blocks", json!(1001)),
+            ("bestblockhash", json!("wrong")),
+        ] {
+            let mut changed = chain.clone();
+            changed[field] = value;
+            assert!(!check(&changed, &network, &mempool, &tip));
+        }
+        assert!(!check(
+            &chain,
+            &json!({"networkactive":true}),
+            &mempool,
+            &tip
+        ));
+        assert!(!check(&chain, &json!({}), &mempool, &tip));
+        assert!(!check(&chain, &network, &json!(["tx"]), &tip));
+        assert!(!check(&chain, &network, &Value::Null, &tip));
+        assert!(!check(&chain, &network, &mempool, &json!("wrong")));
+    }
     #[test]
     fn hash_batch_validates_all_responses() -> Result<()> {
         let hash =

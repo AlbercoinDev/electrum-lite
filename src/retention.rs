@@ -132,6 +132,62 @@ fn recognized_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove only the supervisor's temporary checkpoint and proof after a
+/// completed prune and successful generation verification. Unknown contents,
+/// symlinks and unfinished maintenance are never removed.
+pub fn clean_prepared(
+    root: &Path,
+    maintenance: &Path,
+    snapshot: &Path,
+    proof: &Path,
+    network: bitcoin::Network,
+) -> Result<()> {
+    ensure!(
+        is_absent(&root.join("prune-pending"))?,
+        "pending prune prevents temporary cleanup"
+    );
+    let parent = fs::canonicalize(maintenance)?;
+    ensure!(
+        fs::symlink_metadata(snapshot)?.file_type().is_dir()
+            && fs::canonicalize(snapshot)?.parent() == Some(parent.as_path()),
+        "unrecognized snapshot directory"
+    );
+    let name = snapshot
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("invalid snapshot name")?;
+    let suffix = generation_name(name, "snapshot-").context("unrecognized snapshot name")?;
+    let (height, stamp) = suffix.split_once('-').context("invalid snapshot suffix")?;
+    let record_path = root.join(format!("prune-complete-{height}"));
+    let fields = record(&record_path)?;
+    let (audit, backup) = owned_pair(&fields, maintenance)?;
+    ensure!(
+        audit.file_name().and_then(|n| n.to_str()) == Some(format!("audit-{suffix}").as_str()),
+        "snapshot does not match completed generation"
+    );
+    verify_current(&audit, &backup, format!("thin-v1:{network}").as_bytes())?;
+    let proof_parent = proof.parent().context("proof parent missing")?;
+    ensure!(
+        fs::symlink_metadata(proof_parent)?.file_type().is_dir()
+            && fs::canonicalize(proof_parent)?.parent() == Some(parent.as_path()),
+        "unrecognized proof directory"
+    );
+    ensure!(
+        proof.file_name().and_then(|n| n.to_str()) == Some(format!("audit-{stamp}.ok").as_str())
+            && fs::symlink_metadata(proof)?.file_type().is_file(),
+        "unrecognized proof file"
+    );
+    recognized_directory(snapshot)?;
+    for entry in fs::read_dir(snapshot)? {
+        fs::remove_file(entry?.path())?;
+    }
+    fs::remove_dir(snapshot)?;
+    fs::remove_file(proof)?;
+    fs::File::open(maintenance)?.sync_all()?;
+    fs::File::open(proof_parent)?.sync_all()?;
+    Ok(())
+}
+
 fn verify_current(audit: &Path, backup: &Path, expected_identity: &[u8]) -> Result<()> {
     let audit = DB::open_for_read_only(&Options::default(), audit, false)?;
     let backup = DB::open_for_read_only(&Options::default(), backup, false)?;
@@ -169,6 +225,27 @@ fn verify_current(audit: &Path, backup: &Path, expected_identity: &[u8]) -> Resu
         );
     }
     Ok(())
+}
+
+/// Compare a completed semantic replay against an independently captured
+/// checkpoint. Equality is necessary but does not prove that the audit process
+/// actually ran: the supervisor must also own and verify its successful exit.
+pub fn verify_audit_snapshot(
+    audit: &Path,
+    snapshot: &Path,
+    network: bitcoin::Network,
+) -> Result<()> {
+    for path in [audit, snapshot] {
+        ensure!(
+            fs::symlink_metadata(path)?.file_type().is_dir(),
+            "audit and snapshot must be real directories"
+        );
+    }
+    ensure!(
+        fs::canonicalize(audit)? != fs::canonicalize(snapshot)?,
+        "audit and snapshot must be independent directories"
+    );
+    verify_current(audit, snapshot, format!("thin-v1:{network}").as_bytes())
 }
 
 /// Select the highest independently verified supervisor audit with a complete
@@ -353,6 +430,62 @@ mod tests {
             height - 288, b.display(), a.display()
         ))?;
         Ok((a, b))
+    }
+
+    #[test]
+    fn prepared_cleanup_requires_completed_matching_generation_and_known_files() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "el-prepared-clean-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let maintenance = root.join("supervisor");
+        let private = maintenance.join("c-test");
+        fs::create_dir_all(&private)?;
+        let snapshot = maintenance.join("snapshot-1000-7");
+        let proof = private.join("audit-7.ok");
+        db(&snapshot, b"same")?;
+        fs::write(&proof, b"proof")?;
+        assert!(clean_prepared(
+            &root,
+            &maintenance,
+            &snapshot,
+            &proof,
+            bitcoin::Network::Regtest
+        )
+        .is_err());
+        let (audit, backup) = completed(&root, &maintenance, 1000, 7, b"same")?;
+        fs::write(snapshot.join("foreign.txt"), b"preserve")?;
+        assert!(clean_prepared(
+            &root,
+            &maintenance,
+            &snapshot,
+            &proof,
+            bitcoin::Network::Regtest
+        )
+        .is_err());
+        assert!(snapshot.join("foreign.txt").exists() && proof.exists());
+        fs::remove_file(snapshot.join("foreign.txt"))?;
+        fs::write(root.join("prune-pending"), b"pending")?;
+        assert!(clean_prepared(
+            &root,
+            &maintenance,
+            &snapshot,
+            &proof,
+            bitcoin::Network::Regtest
+        )
+        .is_err());
+        fs::remove_file(root.join("prune-pending"))?;
+        clean_prepared(
+            &root,
+            &maintenance,
+            &snapshot,
+            &proof,
+            bitcoin::Network::Regtest,
+        )?;
+        assert!(!snapshot.exists() && !proof.exists() && audit.exists() && backup.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

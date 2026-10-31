@@ -142,11 +142,17 @@ def main():
             # Audit an independent copy of the checkpoint. Hold the audit at its
             # first block RPC to prove the live Electrum worker can answer while
             # that separate audit process is actively in progress.
-            snapshot_root = root / "snapshot-test-root"
-            (snapshot_root / "regtest").mkdir(parents=True)
-            shutil.copytree(shot, snapshot_root / "regtest/index")
-            audit_command = command.copy()
-            audit_command[audit_command.index("--data-dir") + 1] = str(snapshot_root)
+            supervisor = root / "lite/regtest/supervisor"
+            supervisor.mkdir()
+            audit_snapshot = supervisor / "snapshot-101-2"
+            shutil.copytree(shot, audit_snapshot)
+            bad_snapshot = supervisor / "snapshot-102-3"
+            shutil.copytree(shot, bad_snapshot)
+            bad_audit = root / "rejected-audit"
+            rejected = subprocess.run(command + ["--snapshot-dir", str(bad_snapshot), "--audit-dir", str(bad_audit), "audit"], capture_output=True, text=True, timeout=30)
+            assert rejected.returncode != 0 and "snapshot name does not match its tip" in rejected.stderr
+            assert not bad_audit.exists() and bad_snapshot.is_dir()
+            audit_command = command + ["--snapshot-dir", str(audit_snapshot)]
             hold_audit.set()
             audit_process = launch(audit_command + ["--audit-dir", str(root / "online-audit"), "audit"], "online-audit")
             assert audit_waiting.wait(timeout=20), "audit did not start reading blocks"
@@ -156,6 +162,24 @@ def main():
             hold_audit.clear()
             assert audit_process.wait(timeout=60) == 0
             print("PASS: Electrum answered while a separate snapshot audit was in progress", flush=True)
+            # A new Core tip during snapshot replay invalidates the audit. Keep
+            # the generation for inspection; never let it authorize pruning.
+            changing_snapshot = supervisor / "snapshot-101-4"
+            shutil.copytree(shot, changing_snapshot)
+            changed_audit = root / "changed-tip-audit"
+            release_audit.clear()
+            audit_waiting.clear()
+            hold_audit.set()
+            changing = launch(command + ["--snapshot-dir", str(changing_snapshot), "--audit-dir", str(changed_audit), "audit"], "changed-tip-audit")
+            assert audit_waiting.wait(timeout=20), "second audit did not start reading blocks"
+            changed_block = cli("generatetoaddress", 1, miner)[0]
+            release_audit.set()
+            hold_audit.clear()
+            assert changing.wait(timeout=60) != 0, "audit accepted a changed Core tip"
+            assert changed_audit.is_dir() and changing_snapshot.is_dir(), "failed audit data was removed"
+            cli("invalidateblock", changed_block)
+            wait(lambda: electrum("blockchain.headers.subscribe")["height"] == 101, "return to original branch")
+            print("PASS: changed Core tip aborts snapshot audit; failed generations preserved", flush=True)
             with socket.create_connection(("127.0.0.1", port), timeout=5) as batch:
                 batch.sendall(json.dumps([{"id": 1, "method": "server.version", "params": ["smoke", ["1.4", "1.4.5"]]}, {"id": 2, "method": "server.ping", "params": []}]).encode() + b"\n")
                 replies = json.loads(batch.makefile("rb").readline())
