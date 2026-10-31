@@ -211,8 +211,8 @@ fn main() -> Result<()> {
         "private control socket only applies to serve"
     );
     ensure!(
-        a.snapshot_dir.is_none() || a.command == "audit",
-        "snapshot only applies to audit"
+        a.snapshot_dir.is_none() || matches!(a.command.as_str(), "audit" | "backup"),
+        "snapshot only applies to audit or backup"
     );
     ensure!(
         a.prepared_snapshot.is_some() == a.prepared_proof.is_some(),
@@ -360,6 +360,10 @@ fn main() -> Result<()> {
                 .audit_dir
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("--audit-dir is required before pruning"))?;
+            let backup_path = a
+                .backup_dir
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--backup-dir is required before pruning"))?;
             if let Some(snapshot) = a.prepared_snapshot.as_deref() {
                 let proof = a.prepared_proof.as_deref().expect("checked prepared proof");
                 let maintenance = std::fs::canonicalize(root.join("supervisor"))?;
@@ -376,7 +380,7 @@ fn main() -> Result<()> {
                     proof_meta.file_type().is_file() && proof_meta.len() <= 16384,
                     "prepared proof invalid"
                 );
-                for path in [snapshot, audit_path] {
+                for path in [snapshot, audit_path, backup_path] {
                     ensure!(
                         std::fs::symlink_metadata(path)?.file_type().is_dir()
                             && std::fs::canonicalize(path)?.parent() == Some(maintenance.as_path()),
@@ -385,10 +389,24 @@ fn main() -> Result<()> {
                 }
                 let snapshot = std::fs::canonicalize(snapshot)?;
                 let audit_path = std::fs::canonicalize(audit_path)?;
+                let backup_path = std::fs::canonicalize(backup_path)?;
+                let suffix = snapshot
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("snapshot-"))
+                    .ok_or_else(|| anyhow::anyhow!("invalid prepared snapshot name"))?;
+                ensure!(
+                    audit_path.file_name().and_then(|n| n.to_str())
+                        == Some(format!("audit-{suffix}").as_str())
+                        && backup_path.file_name().and_then(|n| n.to_str())
+                            == Some(format!("backup-{suffix}").as_str()),
+                    "prepared generations do not match"
+                );
                 let expected = format!(
-                    "snapshot={}\naudit={}\n",
+                    "snapshot={}\naudit={}\nbackup={}\n",
                     snapshot.display(),
-                    audit_path.display()
+                    audit_path.display(),
+                    backup_path.display()
                 );
                 ensure!(
                     std::fs::read_to_string(proof)? == expected,
@@ -396,15 +414,13 @@ fn main() -> Result<()> {
                 );
                 let (prepared_height, _) = index.verify_prepared_audit(&snapshot, &audit_path)?;
                 ensure!(prepared_height == height, "prepared audit height changed");
+                let (backup_height, _) = index.verify_snapshot_matches(&backup_path)?;
+                ensure!(backup_height == height, "prepared backup height changed");
             } else {
                 let base = electrum_lite::retention::verified_audit_base(&root, network, height)?;
                 index.audit_with_verified_base(&core, audit_path, &stop, base.as_deref())?;
+                index.backup(backup_path)?;
             }
-            index.backup(
-                a.backup_dir
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--backup-dir NEW is required"))?,
-            )?;
             ensure!(
                 !stop.load(std::sync::atomic::Ordering::Relaxed),
                 "maintenance interrupted before pruning"

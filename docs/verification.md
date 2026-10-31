@@ -81,6 +81,18 @@ instantánea desactualizada antes de crear el backup o llamar a la poda; conserv
 las generaciones y el `pruneheight` no cambió. No es una simulación exhaustiva de
 caídas o fallos de disco.
 
+Trabajo local posterior: el backup se crea a partir de la instantánea mientras
+el servidor sigue activo. Un smoke regtest gestionado creó auditoría y backup por
+separado, rechazó sobrescribir el backup y comprobó `server.ping` después. Otra
+prueba rechazó un backup de otra altura sin podar ni eliminar generaciones. La
+comparación final del índice con el backup incluye todas las claves y undo. Una
+ejecución posterior del smoke gestionado verificó el orden auditoría, backup,
+desconexión y poda y completó dos podas físicas regtest; la primera borró
+`blk00000.dat` (435757602 → 301586406 bytes, `pruneheight=743`). Pasaron también
+la retención conservadora, witness, Merkle y el bloqueo por `prune-pending`.
+Un test unitario adicional creó un backup desde el checkpoint y rechazó una
+modificación de undo aunque la altura siguiera siendo la misma.
+
 Un regtest dedicado desechable arrancó con `--core-dbcache-mib 256`; se verificó
 en los argumentos del proceso Core `-dbcache=256` y se detuvo limpiamente. Este
 ajuste limita esa caché de Core, no la RAM total, y no es una medición de velocidad.

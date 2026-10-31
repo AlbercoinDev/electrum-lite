@@ -858,8 +858,25 @@ mod tests {
         live.commit(0, &genesis)?;
         let snapshot = root.join("snapshot");
         let audit = root.join("audit");
+        let backup = root.join("backup");
         live.create_snapshot(&snapshot)?;
         live.create_snapshot(&audit)?;
+        {
+            let frozen = Index::open(&snapshot, Network::Regtest)?;
+            frozen.backup(&backup)?;
+        }
+        assert_eq!(
+            live.verify_snapshot_matches(&backup)?,
+            (0, genesis.block_hash())
+        );
+        {
+            let changed = Index::open(&backup, Network::Regtest)?;
+            changed.db.put(height_key(b'U', 0), b"altered undo")?;
+        }
+        assert!(
+            live.verify_snapshot_matches(&backup).is_err(),
+            "same-tip backup with different undo must be rejected"
+        );
         assert_eq!(
             live.verify_prepared_audit(&snapshot, &audit)?,
             (0, genesis.block_hash())

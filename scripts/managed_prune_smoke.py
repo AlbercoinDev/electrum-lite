@@ -172,9 +172,9 @@ def main():
             wait(lambda: has_event("retention_complete"), "verified retention", timeout=120,guard=manager)
             wait(lambda: query(listen, "server.health")["ready"], "post-maintenance server resume")
             event_names = [json.loads(line)["event"] for line in events.read_text().splitlines()]
-            assert event_names.index("audit_preparing") < event_names.index("audit_prepared") < event_names.index("maintenance_offline") < event_names.index("maintenance_complete")
+            assert event_names.index("audit_preparing") < event_names.index("audit_prepared") < event_names.index("backup_preparing") < event_names.index("backup_prepared") < event_names.index("maintenance_offline") < event_names.index("maintenance_complete")
             wait(lambda: not list(maintenance.glob("snapshot-*")), "temporary checkpoint cleanup", timeout=120, guard=manager)
-            print("PASS: managed online audit finished before offline prune; temporary checkpoint cleaned", flush=True)
+            print("PASS: managed online audit and backup finished before offline prune; temporary checkpoint cleaned", flush=True)
             assert not old_audit.exists() and not old_backup.exists()
             assert (foreign_audit / "user-notes.txt").read_text() == "preserve" and foreign_backup.exists()
             assert (orphan / "keep.txt").exists()

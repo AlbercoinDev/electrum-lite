@@ -72,17 +72,31 @@ def main():
             proof = private / "audit-1.ok"
             proof.write_text("invalid proof\n")
             backup = maintenance / "backup-999-1"
+            shutil.copytree(snapshot, backup)
             prune = ["--confirm-prune", "--prepared-snapshot", snapshot, "--prepared-proof", proof, "--audit-dir", audit, "--backup-dir", backup, "prune"]
             rejected = lite(*prune)
             assert rejected.returncode != 0 and "prepared proof mismatch" in rejected.stderr, rejected.stderr
-            assert not backup.exists() and not (root / "lite/regtest/prune-pending").exists()
-            proof.write_text(f"snapshot={snapshot.resolve()}\naudit={audit.resolve()}\n")
+            assert backup.exists() and not (root / "lite/regtest/prune-pending").exists()
+            proof.write_text(f"snapshot={snapshot.resolve()}\naudit={audit.resolve()}\nbackup={backup.resolve()}\n")
             rejected = lite(*prune)
             assert rejected.returncode != 0 and "snapshot tip differs" in rejected.stderr, rejected.stderr
-            assert not backup.exists() and not (root / "lite/regtest/prune-pending").exists()
+            assert backup.exists() and not (root / "lite/regtest/prune-pending").exists()
             assert cli("getblockchaininfo")["pruneheight"] == before
             assert snapshot.exists() and audit.exists() and proof.exists()
-            print("PASS: invalid proof and stale snapshot rejected before backup or prune; generations preserved")
+            new_snapshot = maintenance / "snapshot-1000-2"
+            new_audit = maintenance / "audit-1000-2"
+            stale_backup = maintenance / "backup-1000-2"
+            result = lite("--backup-dir", new_snapshot, "backup")
+            assert result.returncode == 0, result.stderr
+            shutil.copytree(new_snapshot, new_audit)
+            shutil.copytree(snapshot, stale_backup)
+            new_proof = private / "audit-2.ok"
+            new_proof.write_text(f"snapshot={new_snapshot.resolve()}\naudit={new_audit.resolve()}\nbackup={stale_backup.resolve()}\n")
+            rejected = lite("--confirm-prune", "--prepared-snapshot", new_snapshot, "--prepared-proof", new_proof, "--audit-dir", new_audit, "--backup-dir", stale_backup, "prune")
+            assert rejected.returncode != 0 and "snapshot tip differs" in rejected.stderr, rejected.stderr
+            assert cli("getblockchaininfo")["pruneheight"] == before and not (root / "lite/regtest/prune-pending").exists()
+            assert stale_backup.exists() and new_snapshot.exists() and new_audit.exists()
+            print("PASS: invalid proof, stale snapshot and stale backup rejected before prune; generations preserved")
         finally:
             if node.poll() is None:
                 node.terminate()

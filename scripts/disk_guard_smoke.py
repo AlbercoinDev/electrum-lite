@@ -69,6 +69,11 @@ def main():
                                         audit_command = [str(Path(args.electrum_lite).resolve()), "--network", "regtest", "--data-dir", str(root / "lite"), "--core-cookie", str(root / "core/regtest/.cookie"), "--core-rpc", f"http://127.0.0.1:{rpc}", "--snapshot-dir", str(snapshot), "--audit-dir", str(audit), "audit"]
                                         audited = subprocess.run(audit_command, capture_output=True, text=True, timeout=30)
                                         assert audited.returncode == 0, audited.stderr
+                                        backup = maintenance / "backup-0-1"
+                                        backup_command = [str(Path(args.electrum_lite).resolve()), "--network", "regtest", "--data-dir", str(root / "lite"), "--core-cookie", str(root / "core/regtest/.cookie"), "--core-rpc", f"http://127.0.0.1:{rpc}", "--snapshot-dir", str(snapshot), "--backup-dir", str(backup), "backup"]
+                                        backed_up = subprocess.run(backup_command, capture_output=True, text=True, timeout=30)
+                                        assert backed_up.returncode == 0 and backup.is_dir(), backed_up.stderr
+                                        assert subprocess.run(backup_command, capture_output=True, text=True, timeout=30).returncode != 0
                                         with socket.create_connection(("127.0.0.1", listen), timeout=5) as tcp:
                                             tcp.sendall(b'{"id":1,"method":"server.ping","params":[]}\n')
                                             assert json.loads(tcp.makefile("rb").readline())["result"] is None
@@ -90,7 +95,7 @@ def main():
         run(256, False)
         print("PASS: restart with sufficient free space permits networking")
         run(256, False, test_control=True)
-        print("PASS: managed snapshot audited separately; Electrum responds afterward")
+        print("PASS: managed snapshot audited and backed up separately; no overwrite; Electrum responds afterward")
 
 
 if __name__ == "__main__":

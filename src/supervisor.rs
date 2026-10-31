@@ -692,6 +692,46 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 audit_status.success(),
                 "online audit failed; generations preserved and no pruning performed"
             );
+            event(&events, "audit_prepared", json!({"height":tip}))?;
+            ensure!(
+                available_bytes(&core_dir)?.min(available_bytes(&root)?) >= minimum_free,
+                "disk reserve exhausted before online backup; generations preserved"
+            );
+            event(&events, "backup_preparing", json!({"height":tip}))?;
+            let mut backing_up = OwnedChild::spawn(
+                c.base_command(&cookie)?
+                    .arg("--snapshot-dir")
+                    .arg(&snapshot)
+                    .arg("--backup-dir")
+                    .arg(&backup)
+                    .arg("backup"),
+            )?;
+            let mut reserve_checked = Instant::now();
+            let backup_status = loop {
+                if let Some(status) = backing_up.0.try_wait()? {
+                    break status;
+                }
+                ensure!(
+                    !stop.load(Ordering::Relaxed),
+                    "online backup interrupted; partial generations preserved"
+                );
+                node.live()?;
+                daemon.live()?;
+                if reserve_checked.elapsed() >= Duration::from_secs(5) {
+                    let free = available_bytes(&core_dir)?.min(available_bytes(&root)?);
+                    ensure!(
+                        free >= minimum_free,
+                        "disk reserve exhausted during online backup; generations preserved"
+                    );
+                    reserve_checked = Instant::now();
+                }
+                thread::sleep(Duration::from_millis(100));
+            };
+            ensure!(
+                backup_status.success(),
+                "online backup failed; generations preserved and no pruning performed"
+            );
+            event(&events, "backup_prepared", json!({"height":tip}))?;
             let proof = control
                 .parent()
                 .context("private control parent")?
@@ -699,13 +739,13 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             durable_new(
                 &proof,
                 format!(
-                    "snapshot={}\naudit={}\n",
+                    "snapshot={}\naudit={}\nbackup={}\n",
                     fs::canonicalize(&snapshot)?.display(),
-                    fs::canonicalize(&audit)?.display()
+                    fs::canonicalize(&audit)?.display(),
+                    fs::canonicalize(&backup)?.display()
                 )
                 .as_bytes(),
             )?;
-            event(&events, "audit_prepared", json!({"height":tip}))?;
             daemon.stop()?;
             let before = block_files(&block_dir)?;
             core.call("setnetworkactive", json!([false]))?;
