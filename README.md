@@ -1,7 +1,7 @@
 # Electrum Lite — servidor thin experimental
 
 **Versión `0.0.1-beta.1`.** Release experimental actual:
-[**`thin-v3-txnum-fast-2026-10-31`**](https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31).
+[**`thin-v3-txnum-fast-2026-10-31.1`**](https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31.1).
 Servidor Electrum en Rust construido desde cero:
 Core valida, RocksDB conserva índices y los bloques históricos ausentes se obtienen
 completos por P2P. Tor opcional. Para bloques que Core ya podó, Lite pide el bloque crudo a Esplora/onion: nunca envía scripthashes ni TXID.
@@ -583,6 +583,14 @@ Auditoría/backup pueden necesitar otro índice completo y, tras una poda previa
 descargas históricas; sin backup externo no hay recuperación local.
 Si hay `prune-pending`, una operación anterior quedó incierta: conservar todo y
 revisar/recuperar antes de continuar. No borrar el marcador para eludir el bloqueo.
+
+## Fase 4 opcional no incluida
+
+El fichero plano de TXIDs, el parser `bitcoin_slices` y la eliminación completa de
+la tabla `C` no forman parte de esta release. Requieren otro formato/migración y
+validación adicional; se documentan como trabajo futuro. Lo incluido y probado
+es el presupuesto automático, `--fast-sync`, lotes de 32 bloques, reorg por
+reindexado y verificación selectiva de Core.
 
 ## Límites importantes
 

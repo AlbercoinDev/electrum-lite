@@ -1,6 +1,6 @@
 # Electrum Lite — diseño y estado
 
-Versión `0.0.1-beta.1`, release `thin-v3-txnum-fast-2026-10-31`, formato de
+Versión `0.0.1-beta.1`, release `thin-v3-txnum-fast-2026-10-31.1`, formato de
 almacenamiento `thin-v3-txnum`. Aplicación nueva,
 desarrollada desde cero en Rust como un único paquete y con RocksDB como biblioteca
 genérica de almacenamiento.
@@ -132,6 +132,19 @@ tip hace flush y vuelve al modo normal.
 La reorg en fast-sync no usa undo: reindexa el bloque obsoleto, borra sus claves
 y restaura UTXO desde `spenttxouts`; requiere Core REST. `server.health` publica
 `index_rate`, `bulk`, `durable_height` y el último lote.
+
+## Fase 4 opcional: fuera del alcance de esta release
+
+Las siguientes optimizaciones se evaluaron y **no se incluyen** en esta release:
+
+- fichero plano de TXIDs (`txnum * 32`) para sustituir la parte de TXIDs del LSM;
+- parser cero-copia con `bitcoin_slices`;
+- eliminar por completo la tabla `C` y resolver la mempool con `gettxout`.
+
+Motivo: cambian el formato de almacenamiento o el modelo de consulta y exigen
+reindexado/migración y una nueva ronda de validación. No son necesarias para el
+objetivo actual (budget automático, fast-sync, lotes, reorg por reindexado y
+verificación selectiva). Quedan como trabajo futuro, no como deuda oculta.
 
 ## Concurrencia inicial
 

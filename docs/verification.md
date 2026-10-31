@@ -448,10 +448,10 @@ La matriz de scripts, comandos y límites de ejecución está en
 [`testing.md`](testing.md). La disponibilidad de una herramienta no equivale a
 haber ejecutado o aprobado una prueba.
 
-## Revisión `thin-v3-txnum` (release `thin-v3-txnum-fast-2026-10-31`)
+## Revisión `thin-v3-txnum` (release `thin-v3-txnum-fast-2026-10-31.1`)
 
 Release publicada:
-<https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31>.
+<https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31.1>.
 Assets: binario `electrum-lite`, paquete tar.gz, checksum e
 `install-release.sh`. SHA256 del binario:
 `31817299545bf244feff70f0e00252f4b176f7264f6cebf06077b4c18ac487e3`.
