@@ -450,6 +450,12 @@ haber ejecutado o aprobado una prueba.
 
 ## Revisión `thin-v3-txnum` (release `thin-v3-txnum-2026-10-31`)
 
+Release publicada:
+<https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-2026-10-31>.
+Assets: binario `electrum-lite-linux-x86_64`, paquete tar.gz, checksum e
+`install-release.sh`. SHA256 del binario:
+`d0383494efe244493e32248fb8ce424ccde66f2e4f7ae7db375238ae2897a14f`.
+
 Se implementaron el motor local, el esquema de 24 B, la reconstrucción por
 ventana ciega, el perfil HDD/4 GB y la coordinación de poda mainnet. Evidencia
 ejecutada en este árbol de trabajo:
