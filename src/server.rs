@@ -488,6 +488,7 @@ pub fn serve(
         let index = std::sync::Arc::new(index);
         let mut synced = Instant::now() - Duration::from_secs(2);
         let mut ready = false;
+        let mut sync_warning: Option<Instant> = None;
         let mut mempool = Mempool::default();
         let mut verification: Option<mpsc::Receiver<Result<(u32, bitcoin::BlockHash)>>> = None;
         let mut verification_hold: Option<Instant> = None;
@@ -578,17 +579,53 @@ pub fn serve(
                     }) {
                     Ok(m) => {
                         mempool = m;
+                        if sync_warning.take().is_some() {
+                            eprintln!(
+                                "{}",
+                                crate::i18n::text(
+                                    "Synchronization available again",
+                                    "Sincronización disponible de nuevo"
+                                )
+                            );
+                        }
                         true
                     }
                     Err(e) => {
                         if e.to_string() == "catching up" {
-                            eprintln!(
-                                "{}",
-                                crate::i18n::text(
-                                    "Sync unavailable: catching up",
-                                    "Sincronización no disponible: alcanzando a Bitcoin Core"
-                                )
-                            );
+                            let heights = (|| -> Result<(u64, u64)> {
+                                let indexed = u64::from(index.tip()?.context("empty index")?);
+                                let info = core.call("getblockchaininfo", json!([]))?;
+                                let core_height =
+                                    info["blocks"].as_u64().context("missing Core height")?;
+                                Ok((indexed, core_height))
+                            })();
+                            match heights {
+                                Ok((indexed, core_height)) => {
+                                    let lag = core_height.saturating_sub(indexed);
+                                    if (lag > 100 || core_height <= indexed)
+                                        && sync_warning
+                                            .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+                                    {
+                                        if core_height > indexed {
+                                            eprintln!(
+                                                "{}: {lag} {}",
+                                                crate::i18n::text("Bitcoin Core is ahead by", "Bitcoin Core va por delante"),
+                                                crate::i18n::text("blocks", "bloques")
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "{}",
+                                                crate::i18n::text("Synchronization unavailable: chain tips differ; checking for a reorganization", "Sincronización no disponible: las puntas de cadena difieren; comprobando posible reorganización")
+                                            );
+                                        }
+                                        sync_warning = Some(Instant::now());
+                                    }
+                                }
+                                Err(error) => eprintln!(
+                                    "{}: {error:#}",
+                                    crate::i18n::text("Sync unavailable", "Sincronización no disponible")
+                                ),
+                            }
                         } else {
                             eprintln!(
                                 "{}: {e:#}",

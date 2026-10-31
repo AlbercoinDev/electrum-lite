@@ -630,9 +630,9 @@ impl Index {
         while self.tip()? != ancestor {
             self.rewind_one()?;
         }
-        let end = info["blocks"].as_u64().context("missing height")? as u32;
+        let core_height = info["blocks"].as_u64().context("missing height")? as u32;
         let start = self.tip()?.map_or(0, |h| h + 1);
-        let end = end.min(start.saturating_add(limit.saturating_sub(1)));
+        let end = core_height.min(start.saturating_add(limit.saturating_sub(1)));
         if start > end {
             return Ok(());
         }
@@ -687,9 +687,6 @@ impl Index {
                     let writing = std::time::Instant::now();
                     self.commit_with_sync(h, &block, h == end || (h - start + 1) % 64 == 0)?;
                     write_time += writing.elapsed();
-                    if h % 1000 == 0 {
-                        eprintln!("{} {h}/{end}", crate::i18n::text("indexed", "indexados"));
-                    }
                 }
                 Ok(())
             })();
@@ -699,7 +696,19 @@ impl Index {
                 .map_err(|_| anyhow::anyhow!("block reader panicked"))?;
             result?;
             if start / 1000 != end / 1000 || start == 0 {
-                eprintln!("sync_metrics blocks={} elapsed_ms={} fetch_ms={} hash_rpc_ms={} block_rpc_decode_ms={} index_ms={} (fetch and index overlap)", end - start + 1, begun.elapsed().as_millis(), fetch_time.as_millis(), hash_time.as_millis(), fetch_time.saturating_sub(hash_time).as_millis(), write_time.as_millis());
+                let completed = u64::from(end) + 1;
+                let total = u64::from(core_height) + 1;
+                let percent = completed as f64 * 100.0 / total as f64;
+                eprintln!("{} {completed}/{total} ({percent:.2}%)", crate::i18n::text("indexed", "indexados"));
+                eprintln!(
+                    "  {}: {} | {}: {} ms | {}: {} ms | {}: {} ms | {}: {} ms ({})",
+                    crate::i18n::text("batch blocks", "bloques del lote"), end - start + 1,
+                    crate::i18n::text("total", "total"), begun.elapsed().as_millis(),
+                    crate::i18n::text("fetch", "descarga"), fetch_time.as_millis(),
+                    crate::i18n::text("hashes", "hashes"), hash_time.as_millis(),
+                    crate::i18n::text("index", "índice"), write_time.as_millis(),
+                    crate::i18n::text("fetch and indexing overlap", "descarga e indexado se solapan")
+                );
             }
             Ok(())
         })?;
