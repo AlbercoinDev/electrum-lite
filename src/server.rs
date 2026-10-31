@@ -228,6 +228,15 @@ struct Request {
     internal: bool,
 }
 
+#[derive(Clone)]
+struct PreparedVerification {
+    snapshot: PathBuf,
+    audit: PathBuf,
+    backup: PathBuf,
+    height: u32,
+    hash: bitcoin::BlockHash,
+}
+
 fn snapshot_destination(path: &Path, allowed: &Path) -> Result<u32> {
     let parent = path.parent().context("snapshot parent missing")?;
     ensure!(
@@ -253,6 +262,80 @@ fn snapshot_destination(path: &Path, allowed: &Path) -> Result<u32> {
         "snapshot destination must be NEW"
     );
     Ok(parsed_height)
+}
+
+fn prepared_generations(value: &Value, allowed: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let mut paths = Vec::new();
+    for (field, prefix) in [
+        ("snapshot", "snapshot-"),
+        ("audit", "audit-"),
+        ("backup", "backup-"),
+    ] {
+        let path = PathBuf::from(value[field].as_str().context("prepared path missing")?);
+        ensure!(
+            std::fs::symlink_metadata(&path)?.file_type().is_dir(),
+            "prepared generation must be a real directory"
+        );
+        let canonical = std::fs::canonicalize(&path)?;
+        ensure!(
+            canonical.parent() == Some(allowed),
+            "prepared generation outside supervisor directory"
+        );
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("invalid generation name")?;
+        let suffix = name
+            .strip_prefix(prefix)
+            .context("invalid generation name")?;
+        let (height, stamp) = suffix.split_once('-').context("invalid generation name")?;
+        ensure!(
+            !height.is_empty()
+                && height.bytes().all(|b| b.is_ascii_digit())
+                && !stamp.is_empty()
+                && stamp.bytes().all(|b| b.is_ascii_digit()),
+            "invalid generation name"
+        );
+        height.parse::<u32>()?;
+        stamp.parse::<u128>()?;
+        paths.push((canonical, suffix.to_owned()));
+    }
+    ensure!(
+        paths[0].1 == paths[1].1 && paths[1].1 == paths[2].1,
+        "prepared generation names differ"
+    );
+    Ok((paths[0].0.clone(), paths[1].0.clone(), paths[2].0.clone()))
+}
+
+fn verify_prune_handoff(
+    proof: &Path,
+    allowed: &Path,
+    snapshot: &Path,
+    audit: &Path,
+    backup: &Path,
+) -> Result<()> {
+    let private = proof.parent().context("prepared proof parent missing")?;
+    ensure!(
+        std::fs::symlink_metadata(private)?.file_type().is_dir()
+            && std::fs::canonicalize(private)?.parent() == Some(allowed),
+        "prepared proof directory invalid"
+    );
+    let meta = std::fs::symlink_metadata(proof)?;
+    ensure!(
+        meta.file_type().is_file() && meta.len() <= 16384,
+        "prepared proof invalid"
+    );
+    let expected = format!(
+        "snapshot={}\naudit={}\nbackup={}\n",
+        snapshot.display(),
+        audit.display(),
+        backup.display()
+    );
+    ensure!(
+        std::fs::read_to_string(proof)? == expected,
+        "prepared proof mismatch"
+    );
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -331,7 +414,16 @@ fn private_request(
     );
     let value: Value = serde_json::from_slice(&line)?;
     ensure!(
-        value["method"] == "snapshot" && value["path"].is_string(),
+        matches!(
+            value["method"].as_str(),
+            Some(
+                "snapshot"
+                    | "verify-prepared"
+                    | "verification-status"
+                    | "release-verification"
+                    | "prune-prepared"
+            )
+        ),
         "invalid private request"
     );
     let (reply, rx) = mpsc::sync_channel(1);
@@ -378,11 +470,86 @@ pub fn serve(
     let published = health.clone();
     let worker_stop = stop.clone();
     let worker = thread::spawn(move || -> Result<()> {
+        let index = std::sync::Arc::new(index);
         let mut synced = Instant::now() - Duration::from_secs(2);
         let mut ready = false;
         let mut mempool = Mempool::default();
+        let mut verification: Option<mpsc::Receiver<Result<(u32, bitcoin::BlockHash)>>> = None;
+        let mut verification_hold: Option<Instant> = None;
+        let mut prepared: Option<PreparedVerification> = None;
+        let mut pruning: Option<mpsc::Receiver<Result<Value>>> = None;
+        let mut prune_failed = false;
+        let mut verification_status = json!({"state":"idle"});
         while !worker_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            if synced.elapsed() >= Duration::from_secs(1) {
+            if let Some(pending) = &verification {
+                match pending.try_recv() {
+                    Ok(Ok((height, hash))) => {
+                        // This experimental lease does not authorize pruning.
+                        // It expires if the private controller disappears.
+                        verification_status = json!({"state":"verified", "height":height, "hash":hash.to_string(), "prune_authorized":false, "lease_seconds":30});
+                        verification = None;
+                        verification_hold = Some(Instant::now() + Duration::from_secs(30));
+                    }
+                    Ok(Err(error)) => {
+                        verification_status =
+                            json!({"state":"failed", "error":format!("{error:#}")});
+                        verification = None;
+                        prepared = None;
+                        ready = false;
+                        synced = Instant::now() - Duration::from_secs(1);
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        verification_status =
+                            json!({"state":"failed", "error":"verification worker stopped"});
+                        verification = None;
+                        prepared = None;
+                        ready = false;
+                        synced = Instant::now() - Duration::from_secs(1);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if verification_hold.is_some_and(|deadline| Instant::now() >= deadline) {
+                verification_hold = None;
+                prepared = None;
+                verification_status = json!({"state":"expired", "prune_authorized":false});
+                ready = false;
+                synced = Instant::now() - Duration::from_secs(1);
+            }
+            if let Some(pending) = &pruning {
+                match pending.try_recv() {
+                    Ok(Ok(result)) => {
+                        verification_status = json!({"state":"pruned", "result":result});
+                        pruning = None;
+                        prepared = None;
+                        ready = false;
+                        synced = Instant::now() - Duration::from_secs(1);
+                    }
+                    Ok(Err(error)) => {
+                        verification_status =
+                            json!({"state":"prune-failed", "error":format!("{error:#}")});
+                        pruning = None;
+                        prepared = None;
+                        prune_failed = true;
+                        ready = false;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        verification_status =
+                            json!({"state":"prune-failed", "error":"prune worker stopped"});
+                        pruning = None;
+                        prepared = None;
+                        prune_failed = true;
+                        ready = false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if verification.is_none()
+                && verification_hold.is_none()
+                && pruning.is_none()
+                && !prune_failed
+                && synced.elapsed() >= Duration::from_secs(1)
+            {
                 ready = match index
                     .sync_batch_with_cancel(&core, 64, &worker_stop)
                     .and_then(|()| {
@@ -435,7 +602,204 @@ pub fn serve(
                     let params = &r.value["params"];
                     let result = (|| {
                         if r.internal {
+                            if method == "verification-status" {
+                                return Ok(verification_status.clone());
+                            }
+                            if method == "release-verification" {
+                                ensure!(
+                                    verification.is_none() && pruning.is_none() && !prune_failed,
+                                    "verification or prune still running or failed"
+                                );
+                                ensure!(
+                                    verification_hold.take().is_some(),
+                                    "no verification lease"
+                                );
+                                verification_status =
+                                    json!({"state":"released", "prune_authorized":false});
+                                prepared = None;
+                                ready = false;
+                                synced = Instant::now() - Duration::from_secs(1);
+                                return Ok(verification_status.clone());
+                            }
+                            if method == "prune-prepared" {
+                                ensure!(
+                                    verification.is_none() && pruning.is_none() && !prune_failed,
+                                    "verification or prune unavailable"
+                                );
+                                let deadline =
+                                    verification_hold.context("no verification lease")?;
+                                ensure!(Instant::now() < deadline, "verification lease expired");
+                                let state = prepared
+                                    .as_ref()
+                                    .context("prepared verification missing")?
+                                    .clone();
+                                ensure!(
+                                    index.network != bitcoin::Network::Bitcoin,
+                                    "mainnet pruning is blocked"
+                                );
+                                ensure!(
+                                    state.height >= crate::TESTNET_PRUNE_MIN_HEIGHT,
+                                    "Core test-network pruning requires at least 1000 blocks"
+                                );
+                                let dir = snapshot_dir
+                                    .as_ref()
+                                    .context("private control unavailable")?;
+                                let root = dir.parent().context("supervisor data root missing")?;
+                                ensure!(
+                                    dir.file_name().and_then(|n| n.to_str()) == Some("supervisor")
+                                        && std::fs::canonicalize(
+                                            index.cache.parent().context("index cache parent")?
+                                        )? == root,
+                                    "prepared prune requires the managed index root"
+                                );
+                                let proof = PathBuf::from(
+                                    r.value["proof"]
+                                        .as_str()
+                                        .context("prepared proof missing")?,
+                                );
+                                verify_prune_handoff(
+                                    &proof,
+                                    dir,
+                                    &state.snapshot,
+                                    &state.audit,
+                                    &state.backup,
+                                )?;
+                                ensure!(
+                                    index.tip()? == Some(state.height)
+                                        && index.header(state.height)?.block_hash() == state.hash,
+                                    "index changed after verification"
+                                );
+                                core.verify_prune_preconditions(state.height, state.hash)?;
+                                ensure!(
+                                    Instant::now() < deadline,
+                                    "verification lease expired before prune"
+                                );
+                                let (done, pending) = mpsc::sync_channel(1);
+                                let frozen = index.clone();
+                                let core = core.clone();
+                                let stop = worker_stop.clone();
+                                let root = root.to_path_buf();
+                                verification_hold = None;
+                                pruning = Some(pending);
+                                verification_status =
+                                    json!({"state":"pruning", "height":state.height});
+                                thread::spawn(move || {
+                                    let result = (|| -> Result<Value> {
+                                        ensure!(
+                                            frozen.verify_prepared_audit(
+                                                &state.snapshot,
+                                                &state.audit
+                                            )? == (state.height, state.hash),
+                                            "prepared state changed before prune"
+                                        );
+                                        ensure!(
+                                            frozen.verify_snapshot_matches(&state.backup)?
+                                                == (state.height, state.hash),
+                                            "prepared backup changed before prune"
+                                        );
+                                        crate::prune::commit_verified_prune(
+                                            &frozen,
+                                            &core,
+                                            &root,
+                                            &state.audit,
+                                            &state.backup,
+                                            &stop,
+                                        )
+                                    })();
+                                    let _ = done.send(result);
+                                });
+                                return Ok(verification_status.clone());
+                            }
+                            if method == "verify-prepared" {
+                                ensure!(
+                                    verification.is_none()
+                                        && verification_hold.is_none()
+                                        && pruning.is_none()
+                                        && !prune_failed,
+                                    "prepared verification already running"
+                                );
+                                ensure!(ready && mempool.raw.is_empty(), "prepared verification requires a ready index and empty mempool");
+                                let dir = snapshot_dir
+                                    .as_ref()
+                                    .context("private control unavailable")?;
+                                let (snapshot, audit, backup) =
+                                    prepared_generations(&r.value, dir)?;
+                                let height = index.tip()?.context("empty index")?;
+                                let named_height: u32 = snapshot
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .and_then(|name| name.strip_prefix("snapshot-"))
+                                    .and_then(|name| name.split_once('-'))
+                                    .context("invalid snapshot name")?
+                                    .0
+                                    .parse()?;
+                                ensure!(
+                                    named_height == height,
+                                    "prepared generation height differs from index"
+                                );
+                                let hash = index.header(height)?.block_hash();
+                                ensure!(
+                                    core.call("getbestblockhash", json!([]))? == hash.to_string(),
+                                    "Core tip changed before verification"
+                                );
+                                ensure!(
+                                    core.call("getrawmempool", json!([]))?
+                                        .as_array()
+                                        .is_some_and(|x| x.is_empty()),
+                                    "mempool not empty before verification"
+                                );
+                                let (done, pending) = mpsc::sync_channel(1);
+                                let frozen = index.clone();
+                                let core = core.clone();
+                                prepared = Some(PreparedVerification {
+                                    snapshot: snapshot.clone(),
+                                    audit: audit.clone(),
+                                    backup: backup.clone(),
+                                    height,
+                                    hash,
+                                });
+                                verification_status = json!({"state":"running"});
+                                verification = Some(pending);
+                                *published.lock().map_err(|_| {
+                                    anyhow::anyhow!("health publication poisoned")
+                                })? = json!({"pid":std::process::id(),"ready":false,"indexed_height":index.tip()?,"network":index.network.to_string(),"transport":if index.fetcher.proxy.is_some(){"socks5"}else{"direct"},"mempool_transactions":mempool.raw.len(),"experimental":true,"verification_in_progress":true});
+                                thread::spawn(move || {
+                                    let result = (|| -> Result<(u32, bitcoin::BlockHash)> {
+                                        let verified =
+                                            frozen.verify_prepared_audit(&snapshot, &audit)?;
+                                        ensure!(
+                                            verified == (height, hash),
+                                            "live index changed during verification"
+                                        );
+                                        ensure!(
+                                            frozen.verify_snapshot_matches(&backup)? == verified,
+                                            "backup differs from verified state"
+                                        );
+                                        ensure!(
+                                            core.call("getbestblockhash", json!([]))?
+                                                == hash.to_string(),
+                                            "Core tip changed during verification"
+                                        );
+                                        ensure!(
+                                            core.call("getrawmempool", json!([]))?
+                                                .as_array()
+                                                .is_some_and(|x| x.is_empty()),
+                                            "mempool changed during verification"
+                                        );
+                                        Ok(verified)
+                                    })();
+                                    let _ = done.send(result);
+                                });
+                                return Ok(verification_status.clone());
+                            }
                             ensure!(method == "snapshot", "unsupported private method");
+                            ensure!(
+                                verification.is_none()
+                                    && verification_hold.is_none()
+                                    && pruning.is_none()
+                                    && !prune_failed,
+                                "prepared verification in progress"
+                            );
                             ensure!(
                                 ready && mempool.raw.is_empty(),
                                 "snapshot requires a ready index and empty mempool"
@@ -474,6 +838,25 @@ pub fn serve(
                             ready || method.starts_with("server."),
                             "index not synchronized"
                         );
+                        ensure!(
+                            method != "blockchain.transaction.broadcast"
+                                || (verification.is_none()
+                                    && verification_hold.is_none()
+                                    && pruning.is_none()),
+                            "broadcast temporarily unavailable during coordinated maintenance"
+                        );
+                        if (verification.is_some()
+                            || verification_hold.is_some()
+                            || pruning.is_some())
+                            && !method.starts_with("server.")
+                        {
+                            let height = index.tip()?.context("index empty")?;
+                            ensure!(
+                                core.call("getbestblockhash", json!([]))?
+                                    == index.header(height)?.block_hash().to_string(),
+                                "chain changed; retry"
+                            );
+                        }
                         if method.starts_with("blockchain.scripthash.") {
                             let tip = index.tip()?.context("index empty")?;
                             ensure!(

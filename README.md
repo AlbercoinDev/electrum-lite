@@ -240,10 +240,13 @@ bloques no tienen un tamaño fijo. Core siempre usa
 tras cada bloque nuevo (`--prune-interval`, valor predeterminado 1) y, estando
 al día y con un archivo candidato, prepara y audita una instantánea y crea un
 backup a partir de ella mientras Electrum sigue activo. Tras el éxito de ambos
-procesos detiene Electrum y P2P, compara auditoría, instantánea y backup con el
-índice bloqueado y poda tras volver a comprobar Core. El flujo con backup en línea
-se probó con dos podas físicas en regtest desechable y sigue siendo experimental.
-Si la punta cambia durante la auditoría o
+procesos pausa P2P de Core y mantiene el servidor Electrum en ejecución mientras
+compara auditoría, instantánea y backup con el índice congelado y poda tras volver
+a comprobar Core. Dos podas físicas en regtest conservaron el mismo proceso y una
+conexión TCP existente; esto no garantiza disponibilidad continua de consultas.
+Durante la reserva se rechaza temporalmente la difusión de transacciones y algunas
+consultas históricas pueden fallar o retrasarse; `server.health` indica que no
+está listo. Si la punta cambia durante la auditoría o
 falla cualquier comprobación, no poda; el supervisor se detiene y conserva las
 generaciones para inspección.
 Con los parámetros normales de Core en las redes de prueba, no intenta podar
@@ -259,8 +262,7 @@ Si Core no borra ningún archivo, los candidatos sin cambios se posponen durante
 Este aplazamiento se conserva solo mientras el supervisor está en ejecución.
 Sigue aplicándose el intervalo configurado. Esta detección es experimental y
 ha superado una prueba de poda física regtest desechable durante IBD; no se ha
-validado una sincronización Signet completa. La prueba física más reciente cubrió
-el backup en línea, pero no todos los posibles fallos.
+validado una sincronización Signet completa ni todos los posibles fallos.
 SIGINT/SIGTERM cierran Electrum, sincronizan su WAL y detienen el Core propio.
 Un fallo de mantenimiento detiene Core y no reanuda automáticamente.
 Una terminación no interceptable del gestor (`SIGKILL`/fallo del sistema) no puede
@@ -285,9 +287,9 @@ la auditoría completa; un fallo RPC interrumpe el mantenimiento. La confianza
 en el prefijo procede de su auditoría anterior, no de volver a procesar todos sus
 bloques; los registros no son firmas contra manipulación. Esta auditoría incremental
 es experimental. En mantenimiento gestionado Electrum sigue activo durante la
-auditoría y la creación del backup, pero se detiene para la comprobación final y la poda; se
-reinicia antes de verificar y limpiar las generaciones antiguas. La red de Core
-permanece pausada hasta que termine esa limpieza.
+auditoría, el backup, la comprobación final y la poda. La red de Core permanece
+pausada desde la comprobación final hasta que termine la limpieza; sus pares
+deben reconectarse después. Un fallo de mantenimiento detiene el servicio y Core.
 Para auditorías completas pueden necesitarse fuentes archivadoras: el supervisor
 conserva candidatos conocidos antes de apagar P2P, o puedes indicarlos explícitamente
 con `--block-peer host:puerto`.

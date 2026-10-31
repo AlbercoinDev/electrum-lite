@@ -421,78 +421,15 @@ fn main() -> Result<()> {
                 index.audit_with_verified_base(&core, audit_path, &stop, base.as_deref())?;
                 index.backup(backup_path)?;
             }
-            ensure!(
-                !stop.load(std::sync::atomic::Ordering::Relaxed),
-                "maintenance interrupted before pruning"
-            );
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&audit)?;
-            use std::io::Write;
-            writeln!(file, "requested_height={}", height - 288)?;
-            writeln!(
-                file,
-                "backup={}",
-                a.backup_dir.as_deref().expect("checked backup").display()
+            let result = electrum_lite::prune::commit_verified_prune(
+                &index,
+                &core,
+                &root,
+                audit_path,
+                backup_path,
+                &stop,
             )?;
-            writeln!(
-                file,
-                "audit={}",
-                a.audit_dir.as_deref().expect("checked audit").display()
-            )?;
-            file.sync_all()?;
-            std::fs::File::open(&root)?.sync_all()?;
-            ensure!(
-                !stop.load(std::sync::atomic::Ordering::Relaxed),
-                "maintenance interrupted; intent preserved"
-            );
-            let expected_hash = index.header(height)?.block_hash();
-            ensure!(
-                index.tip()? == Some(height),
-                "index tip changed before prune; intent preserved"
-            );
-            core.verify_prune_preconditions(height, expected_hash)?;
-            ensure!(
-                !stop.load(std::sync::atomic::Ordering::Relaxed),
-                "maintenance interrupted; intent preserved"
-            );
-            let result = core.call("pruneblockchain", serde_json::json!([height - 288]))?;
-            let after = core.call("getblockchaininfo", serde_json::json!([]))?;
-            let pruneheight = after["pruneheight"]
-                .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("Core pruneheight missing"))?;
-            let mut deleted = false;
-            if pruneheight > 0 {
-                let hash = index
-                    .header(u32::try_from(pruneheight - 1)?)?
-                    .block_hash()
-                    .to_string();
-                match core.block(&hash) {
-                    Err(e)
-                        if e.downcast_ref::<electrum_lite::core::RpcError>()
-                            .is_some_and(|e| e.code == -1) =>
-                    {
-                        deleted = true
-                    }
-                    Err(e) => return Err(e),
-                    Ok(_) => anyhow::bail!(
-                        "Core reports pruning but removed historical block remains available"
-                    ),
-                };
-                core.call("getblockchaininfo", serde_json::json!([]))?;
-            }
-            writeln!(
-                file,
-                "actual_pruneheight={pruneheight}\nmissing_block_verified={deleted}"
-            )?;
-            file.sync_all()?;
-            std::fs::rename(&audit, completed)?;
-            std::fs::File::open(&root)?.sync_all()?;
-            println!(
-                "{}",
-                serde_json::json!({"pruned_to":result,"pruneheight":pruneheight,"missing_block_verified":deleted})
-            );
+            println!("{result}");
         }
         _ => {
             ensure!(

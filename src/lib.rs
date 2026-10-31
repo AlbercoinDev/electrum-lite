@@ -5,6 +5,7 @@ pub mod i18n;
 pub mod index;
 pub mod mempool;
 pub mod net;
+pub mod prune;
 pub mod retention;
 pub mod server;
 pub mod supervisor;

@@ -93,6 +93,44 @@ la retención conservadora, witness, Merkle y el bloqueo por `prune-pending`.
 Un test unitario adicional creó un backup desde el checkpoint y rechazó una
 modificación de undo aunque la altura siguiera siendo la misma.
 
+Trabajo local posterior: el servidor puede iniciar por el socket privado una
+comparación del índice, auditoría, instantánea y backup en un hilo lector mientras
+el trabajador evita modificar el índice. En regtest esa comparación terminó,
+se rechazó un backup corrupto y Electrum respondió a `server.ping`; el método no
+está expuesto por TCP. La prueba no demuestra que `ping` llegara mientras la
+comparación aún estaba ejecutándose ni mide latencia con bases grandes. Tras una
+comparación correcta se mantiene una reserva experimental de 30 segundos; un
+regtest verificó que no se sirve una cabecera obsoleta si Core avanza y que la
+liberación explícita reanuda la sincronización. Una prueba integrada separada
+comprobó también el vencimiento automático. El resultado aislado no autoriza
+podar: el supervisor local ejecuta después la poda dentro de la reserva.
+
+Trabajo local adicional: la fase irreversible se separó de la CLI en
+`src/prune.rs`, con la misma intención durable y comprobación de Core antes de
+la RPC. Una prueba RPC simulada falló después de crear la intención y confirmó
+que permanece `prune-pending` sin registro de finalización. Localmente se ha
+conectado al servidor mediante el socket privado: un regtest con 1000 bloques
+pequeños rechazó una prueba inválida y ejecutó la RPC de poda con el servidor
+activo, conservando el registro durable. Esa prueba no provocó ni demostró
+borrado físico. Una prueba física posterior con el supervisor integrado y la
+barrera de difusión conservó el mismo proceso y una conexión TCP durante dos
+podas; borró `blk00000.dat` (435757596 → 301586401 bytes; `pruneheight=743`).
+También pasaron recuperación witness, Merkle, auditoría incremental y retención.
+La conexión se comprobó antes y después del mantenimiento, no se midió cada
+consulta durante la poda. No se verificaron todos los posibles fallos.
+
+La caducidad real de la reserva de 30 segundos pasó un smoke regtest: después
+del vencimiento el servidor rechazó su liberación y pudo volver a verificar. La
+reserva no caduca durante la RPC de poda; si el hilo de poda falla, las consultas
+de cadena quedan deshabilitadas y se preserva cualquier intención pendiente.
+Un regtest adicional inyectó un error en `pruneblockchain`: se conservó
+`prune-pending`, el servidor rechazó consultas de cadena y la liberación de la
+reserva, y `server.ping` siguió respondiendo. El servidor rechaza también la
+difusión de transacciones durante la reserva o poda, para evitar cambios del
+mempool desde Electrum; esta barrera pasó un smoke con compilaciones debug y
+release. La prueba física conservó una sesión, pero no inyectó una difusión
+durante la RPC de poda.
+
 Un regtest dedicado desechable arrancó con `--core-dbcache-mib 256`; se verificó
 en los argumentos del proceso Core `-dbcache=256` y se detuvo limpiamente. Este
 ajuste limita esa caché de Core, no la RAM total, y no es una medición de velocidad.

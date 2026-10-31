@@ -168,13 +168,26 @@ def main():
             (orphan / "keep.txt").write_text("incomplete; preserve")
             # Resume only this owned Core. Mining is now finished: no competing writer.
             manager = launch(command + ["--auto-prune", "managed-serve"], "manager-prune")
+            initial_health = wait(lambda: (h if (h := query(listen, "server.health"))["ready"] else None), "managed server before maintenance", timeout=180, guard=manager)
+            session = socket.create_connection(("127.0.0.1", listen), timeout=10)
+            session.settimeout(30)
+            session_reader = session.makefile("rb")
+            session.sendall(b'{"id":701,"method":"server.ping","params":[]}\n')
+            assert json.loads(session_reader.readline())["id"] == 701
             wait(lambda: has_event("maintenance_complete"), "coordinated physical prune", timeout=600,guard=manager)
             wait(lambda: has_event("retention_complete"), "verified retention", timeout=120,guard=manager)
             wait(lambda: query(listen, "server.health")["ready"], "post-maintenance server resume")
+            assert query(listen, "server.health")["pid"] == initial_health["pid"], "Electrum server restarted"
+            session.sendall(b'{"id":702,"method":"server.ping","params":[]}\n')
+            assert json.loads(session_reader.readline())["id"] == 702, "existing Electrum connection did not survive maintenance"
+            session_reader.close()
+            session.close()
             event_names = [json.loads(line)["event"] for line in events.read_text().splitlines()]
             assert event_names.index("audit_preparing") < event_names.index("audit_prepared") < event_names.index("backup_preparing") < event_names.index("backup_prepared") < event_names.index("maintenance_offline") < event_names.index("maintenance_complete")
             wait(lambda: not list(maintenance.glob("snapshot-*")), "temporary checkpoint cleanup", timeout=120, guard=manager)
-            print("PASS: managed online audit and backup finished before offline prune; temporary checkpoint cleaned", flush=True)
+            offline_event = next(json.loads(line) for line in events.read_text().splitlines() if json.loads(line)["event"] == "maintenance_offline")
+            assert offline_event["details"]["electrum_stopped"] is False
+            print("PASS: online audit, backup and prune kept the same Electrum process and TCP session; checkpoint cleaned", flush=True)
             assert not old_audit.exists() and not old_backup.exists()
             assert (foreign_audit / "user-notes.txt").read_text() == "preserve" and foreign_backup.exists()
             assert (orphan / "keep.txt").exists()

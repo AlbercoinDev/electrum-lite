@@ -200,40 +200,49 @@ fn health(listen: SocketAddr) -> Result<Value> {
 }
 
 #[cfg(unix)]
-fn request_snapshot(control: &Path, snapshot: &Path, expected_height: u32) -> Result<()> {
+fn private_call(control: &Path, request: Value) -> Result<Value> {
     use std::os::unix::net::UnixStream;
     let mut stream =
         UnixStream::connect(control).context("private snapshot control unavailable")?;
     stream.set_read_timeout(Some(Duration::from_secs(130)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    serde_json::to_writer(&mut stream, &json!({"method":"snapshot", "path":snapshot}))?;
+    serde_json::to_writer(&mut stream, &request)?;
     stream.write_all(b"\n")?;
     let mut response = String::new();
     BufReader::new(stream)
         .take(65537)
         .read_line(&mut response)?;
-    ensure!(response.len() < 65536, "snapshot response too large");
+    ensure!(response.len() < 65536, "private response too large");
     let response: Value = serde_json::from_str(&response)?;
     ensure!(
         response.get("error").is_none_or(Value::is_null),
-        "snapshot request failed: {}",
+        "private request failed: {}",
         response["error"]
     );
+    Ok(response
+        .get("result")
+        .context("private response missing result")?
+        .clone())
+}
+
+#[cfg(not(unix))]
+fn private_call(_control: &Path, _request: Value) -> Result<Value> {
+    bail!("private supervisor control requires Unix")
+}
+
+fn request_snapshot(control: &Path, snapshot: &Path, expected_height: u32) -> Result<()> {
+    let result = private_call(control, json!({"method":"snapshot", "path":snapshot}))?;
     ensure!(
-        response["result"]["height"].as_u64() == Some(u64::from(expected_height)),
+        result["height"].as_u64() == Some(u64::from(expected_height)),
         "snapshot height mismatch"
     );
-    let _: bitcoin::BlockHash = response["result"]["hash"]
+    let _: bitcoin::BlockHash = result["hash"]
         .as_str()
         .context("snapshot hash missing")?
         .parse()?;
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn request_snapshot(_control: &Path, _snapshot: &Path, _expected_height: u32) -> Result<()> {
-    bail!("private supervisor control requires Unix")
-}
 impl Config {
     fn base_command(&self, cookie: &Path) -> Result<Command> {
         let mut c = Command::new(std::env::current_exe()?);
@@ -447,7 +456,7 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         json!({"pid":node.0.id(),"manual_pruning":true}),
     )?;
     let mut daemon = c.server(&cookie, control.as_deref())?;
-    let mut started = Instant::now();
+    let started = Instant::now();
     let mut paused = false;
     let minimum_free = u64::from(c.min_free_mib) * 1024 * 1024;
     let mut free_bytes = available_bytes(&core_dir)?.min(available_bytes(&root)?);
@@ -746,40 +755,63 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 )
                 .as_bytes(),
             )?;
-            daemon.stop()?;
             let before = block_files(&block_dir)?;
             core.call("setnetworkactive", json!([false]))?;
             event(
                 &events,
                 "maintenance_offline",
-                json!({"height":tip,"electrum_stopped":true,"networkactive":false}),
+                json!({"height":tip,"electrum_stopped":false,"networkactive":false}),
             )?;
-            let mut pruning = OwnedChild::spawn(
-                c.base_command(&cookie)?
-                    .args(["--confirm-prune", "--audit-dir"])
-                    .arg(&audit)
-                    .arg("--backup-dir")
-                    .arg(&backup)
-                    .arg("--prepared-snapshot")
-                    .arg(&snapshot)
-                    .arg("--prepared-proof")
-                    .arg(&proof)
-                    .arg("prune"),
+            let started_verify = private_call(
+                control,
+                json!({"method":"verify-prepared","snapshot":snapshot,"audit":audit,"backup":backup}),
             )?;
-            let status = loop {
-                if let Some(status) = pruning.0.try_wait()? {
-                    break status;
+            ensure!(
+                started_verify["state"] == "running",
+                "prepared verification did not start"
+            );
+            loop {
+                ensure!(
+                    !stop.load(Ordering::Relaxed),
+                    "verification interrupted; owned Core will stop without resuming"
+                );
+                node.live()?;
+                daemon.live()?;
+                let state = private_call(control, json!({"method":"verification-status"}))?;
+                match state["state"].as_str() {
+                    Some("running") => {}
+                    Some("verified") => {
+                        ensure!(
+                            state["height"].as_u64() == Some(u64::from(tip)),
+                            "verified height changed"
+                        );
+                        break;
+                    }
+                    _ => bail!("prepared verification failed or expired: {state}"),
                 }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let started_prune =
+                private_call(control, json!({"method":"prune-prepared","proof":proof}))?;
+            ensure!(
+                started_prune["state"] == "pruning",
+                "coordinated prune did not start"
+            );
+            let prune_result = loop {
                 ensure!(
                     !stop.load(Ordering::Relaxed),
                     "maintenance interrupted; owned Core will stop without resuming"
                 );
+                node.live()?;
+                daemon.live()?;
+                let state = private_call(control, json!({"method":"verification-status"}))?;
+                match state["state"].as_str() {
+                    Some("pruning") => {}
+                    Some("pruned") => break state["result"].clone(),
+                    _ => bail!("coordinated prune failed; Core will stop: {state}"),
+                }
                 thread::sleep(Duration::from_millis(100));
             };
-            ensure!(
-                status.success(),
-                "coordinated prune failed; Core will stop, no automatic resume"
-            );
             let after = block_files(&block_dir)?;
             let deleted: Vec<_> = before
                 .keys()
@@ -787,10 +819,18 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 .cloned()
                 .collect();
             let post_info = core.call("getblockchaininfo", json!([]))?;
+            ensure!(
+                post_info["pruneheight"] == prune_result["pruneheight"],
+                "Core prune height changed after maintenance"
+            );
             last_maintenance = post_info["blocks"]
                 .as_u64()
                 .context("Core height after prune")?
                 .try_into()?;
+            ensure!(
+                last_maintenance == tip,
+                "Core height changed during maintenance"
+            );
             if deleted.is_empty() {
                 let now = Instant::now();
                 for (name, fp) in eligible {
@@ -804,14 +844,8 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 "maintenance_complete",
                 json!({"height":tip,"pruneheight":post_info["pruneheight"],"deleted_block_files":deleted,"block_file_bytes_before":before.values().sum::<u64>(),"block_file_bytes_after":after.values().sum::<u64>()}),
             )?;
-            // The audit and prune child has exited and released the index lock.
-            // Retention only reads closed checkpoints, not the live index. Bring
-            // Electrum back before that potentially expensive verification while
-            // Core networking stays paused and no other maintenance can run.
-            daemon = c.server(&cookie, Some(control))?;
-            started = Instant::now();
-            health_seen = false;
-            event(&events, "electrum_resuming", json!({"networkactive":false}))?;
+            // Retention operates on closed generations while the same server
+            // continues serving; Core remains offline until cleanup finishes.
             match crate::retention::clean(&root, &maintenance, &audit, &backup, network) {
                 Ok(count) => {
                     event(

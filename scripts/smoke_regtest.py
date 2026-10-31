@@ -40,6 +40,7 @@ def main():
     p.add_argument("--bitcoind", default="bitcoind")
     p.add_argument("--bitcoin-cli", default="bitcoin-cli")
     p.add_argument("--electrum-lite", default="target/release/electrum-lite")
+    p.add_argument("--lease-expiry", action="store_true", help="also wait for the real 30-second private lease to expire")
     a = p.parse_args()
     binary = str(Path(a.electrum_lite).resolve())
     temp_base = "/tmp/opencode" if Path("/tmp/opencode").is_dir() else None
@@ -125,12 +126,14 @@ def main():
                 pass
             else:
                 raise AssertionError("private snapshot exposed over Electrum")
-            def snapshot(path):
+            def private_request(request):
                 with socket.socket(socket.AF_UNIX) as s:
                     s.settimeout(30)
                     s.connect(str(control))
-                    s.sendall(json.dumps({"method":"snapshot", "path":str(path)}).encode() + b"\n")
+                    s.sendall(json.dumps(request).encode() + b"\n")
                     return json.loads(s.makefile("rb").readline())
+            def snapshot(path):
+                return private_request({"method":"snapshot", "path":str(path)})
             denied = snapshot(root / "not-a-snapshot")
             assert denied.get("error") and not (root / "not-a-snapshot").exists()
             shot = root / "snapshot-101-1"
@@ -162,6 +165,79 @@ def main():
             hold_audit.clear()
             assert audit_process.wait(timeout=60) == 0
             print("PASS: Electrum answered while a separate snapshot audit was in progress", flush=True)
+            verify_snapshot = root / "snapshot-101-2"
+            verify_audit = root / "audit-101-2"
+            verify_backup = root / "backup-101-2"
+            shutil.copytree(shot, verify_snapshot)
+            shutil.copytree(root / "online-audit", verify_audit)
+            shutil.copytree(shot, verify_backup)
+            request = {"method":"verify-prepared", "snapshot":str(verify_snapshot), "audit":str(verify_audit), "backup":str(verify_backup)}
+            response = private_request(request)
+            assert response.get("error") is None and response["result"]["state"] == "running", response
+            assert electrum("server.ping") is None
+            def verification_done():
+                result = private_request({"method":"verification-status"})["result"]
+                if result["state"] == "failed":
+                    raise AssertionError(result)
+                return result if result["state"] == "verified" else None
+            verified = wait(verification_done, "private prepared verification")
+            assert verified["height"] == 101 and verified["prune_authorized"] is False and verified["lease_seconds"] == 30
+            if a.lease_expiry:
+                expired = wait(lambda: (result if (result := private_request({"method":"verification-status"})["result"])["state"] == "expired" else None), "lease expiry")
+                assert expired["prune_authorized"] is False
+                assert private_request({"method":"release-verification"}).get("error")
+                assert electrum("server.ping") is None
+                def restart_verification():
+                    result = private_request(request)
+                    return result if result.get("result", {}).get("state") == "running" else None
+                wait(restart_verification, "verification after expiry")
+                verified = wait(verification_done, "second private prepared verification")
+                assert verified["prune_authorized"] is False
+                print("PASS: real verification lease expires and synchronization can resume", flush=True)
+            try:
+                electrum("blockchain.transaction.broadcast", "00")
+            except RuntimeError as e:
+                assert "broadcast temporarily unavailable" in str(e)
+            else:
+                raise AssertionError("broadcast accepted during verification lease")
+            print("PASS: broadcast rejected during verification lease", flush=True)
+            assert electrum("server.health")["ready"] is False
+            during_hold = cli("generatetoaddress", 1, cli("getnewaddress"))[0]
+            try:
+                electrum("blockchain.headers.subscribe")
+            except RuntimeError as e:
+                assert "chain changed" in str(e)
+            else:
+                raise AssertionError("stale chain exposed while verification lease held")
+            assert private_request({"method":"release-verification"})["result"]["state"] == "released"
+            wait(lambda: electrum("blockchain.headers.subscribe")["height"] == 102, "sync after lease release")
+            cli("invalidateblock", during_hold)
+            wait(lambda: electrum("blockchain.headers.subscribe")["height"] == 101, "rewind after lease release")
+            print("PASS: verification lease refuses stale headers and explicit release resumes synchronization", flush=True)
+            bad_snapshot = root / "snapshot-101-3"
+            bad_audit = root / "audit-101-3"
+            bad_backup = root / "backup-101-3"
+            shutil.copytree(shot, bad_snapshot)
+            shutil.copytree(root / "online-audit", bad_audit)
+            shutil.copytree(shot, bad_backup)
+            (bad_backup / "CURRENT").write_text("MANIFEST-DOES-NOT-EXIST\n")
+            failed_request = {"method":"verify-prepared", "snapshot":str(bad_snapshot), "audit":str(bad_audit), "backup":str(bad_backup)}
+            assert private_request(failed_request)["result"]["state"] == "running"
+            def verification_failed():
+                result = private_request({"method":"verification-status"})["result"]
+                return result if result["state"] == "failed" else None
+            assert wait(verification_failed, "private prepared verification failure")
+            assert bad_backup.exists() and electrum("server.ping") is None
+            bad_request = dict(request, backup=str(root / "backup-101-3"))
+            assert private_request(bad_request).get("error")
+            for private_method in ("verify-prepared", "prune-prepared"):
+                try:
+                    electrum(private_method)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError(f"{private_method} exposed through Electrum")
+            print("PASS: private concurrent prepared-state verification; public method refused", flush=True)
             # A new Core tip during snapshot replay invalidates the audit. Keep
             # the generation for inspection; never let it authorize pruning.
             changing_snapshot = supervisor / "snapshot-101-4"
