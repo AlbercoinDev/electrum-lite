@@ -44,6 +44,15 @@ fn pause_needed(paused: bool, lag: u64, high: u32, low: u32, free: u64, minimum:
         lag >= u64::from(high) || free < minimum
     }
 }
+
+fn current_core_tip(core: &Core) -> Result<bitcoin::BlockHash> {
+    let value = core.call("getbestblockhash", json!([]))?;
+    value
+        .as_str()
+        .context("Core current tip missing")?
+        .parse()
+        .context("invalid Core current tip")
+}
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -180,6 +189,10 @@ fn event(path: &Path, name: &str, extra: Value) -> Result<()> {
             "maintenance postponed: no eligible closed block file found",
             "mantenimiento aplazado: no hay archivos cerrados aptos para podar",
         ),
+        "maintenance_stale" => crate::i18n::text(
+            "maintenance postponed: Core chain changed during preparation",
+            "mantenimiento aplazado: la cadena de Core cambió durante la preparación",
+        ),
         "shutdown" => crate::i18n::text("shutdown complete", "cierre completado"),
         _ => name,
     };
@@ -214,6 +227,9 @@ fn private_call(control: &Path, request: Value) -> Result<Value> {
         .read_line(&mut response)?;
     ensure!(response.len() < 65536, "private response too large");
     let response: Value = serde_json::from_str(&response)?;
+    if response["error"]["code"].as_i64() == Some(i64::from(crate::AUDIT_STALE_EXIT_CODE)) {
+        return Err(crate::index::AuditTipChanged.into());
+    }
     ensure!(
         response.get("error").is_none_or(Value::is_null),
         "private request failed: {}",
@@ -230,17 +246,29 @@ fn private_call(_control: &Path, _request: Value) -> Result<Value> {
     bail!("private supervisor control requires Unix")
 }
 
-fn request_snapshot(control: &Path, snapshot: &Path, expected_height: u32) -> Result<()> {
-    let result = private_call(control, json!({"method":"snapshot", "path":snapshot}))?;
+fn request_snapshot(
+    control: &Path,
+    snapshot: &Path,
+    expected_height: u32,
+    expected_hash: bitcoin::BlockHash,
+) -> Result<bitcoin::BlockHash> {
+    let result = private_call(
+        control,
+        json!({"method":"snapshot", "path":snapshot, "expected_tip":expected_hash.to_string()}),
+    )?;
     ensure!(
         result["height"].as_u64() == Some(u64::from(expected_height)),
         "snapshot height mismatch"
     );
-    let _: bitcoin::BlockHash = result["hash"]
+    let hash: bitcoin::BlockHash = result["hash"]
         .as_str()
         .context("snapshot hash missing")?
         .parse()?;
-    Ok(())
+    ensure!(
+        hash == expected_hash,
+        "snapshot hash differs from requested tip"
+    );
+    Ok(hash)
 }
 
 impl Config {
@@ -667,7 +695,37 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             let backup = maintenance.join(format!("backup-{tip}-{stamp}"));
             let control = control.as_deref().context("private control missing")?;
             event(&events, "audit_preparing", json!({"height":tip}))?;
-            request_snapshot(control, &snapshot, tip)?;
+            let expected_hash: bitcoin::BlockHash = info["bestblockhash"]
+                .as_str()
+                .context("Core best hash missing")?
+                .parse()
+                .context("invalid Core best hash")?;
+            let snapshot_hash = match request_snapshot(control, &snapshot, tip, expected_hash) {
+                Ok(hash) => hash,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::index::AuditTipChanged>()
+                        .is_some() =>
+                {
+                    ensure!(
+                        current_core_tip(&core)? != expected_hash,
+                        "snapshot reported a changed chain but Core tip did not change"
+                    );
+                    ensure!(
+                        fs::symlink_metadata(&snapshot)
+                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                        "failed snapshot exists; preserve for inspection"
+                    );
+                    event(
+                        &events,
+                        "maintenance_stale",
+                        json!({"snapshot_height":tip,"phase":"snapshot"}),
+                    )?;
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut auditing = OwnedChild::spawn(
                 c.base_command(&cookie)?
                     .arg("--snapshot-dir")
@@ -675,6 +733,11 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                     .arg("--audit-dir")
                     .arg(&audit)
                     .arg("audit"),
+            )?;
+            event(
+                &events,
+                "audit_started",
+                json!({"height":tip,"pid":auditing.0.id(),"snapshot":snapshot,"audit":audit}),
             )?;
             let mut reserve_checked = Instant::now();
             let audit_status = loop {
@@ -697,6 +760,23 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 }
                 thread::sleep(Duration::from_millis(100));
             };
+            if audit_status.code() == Some(i32::from(crate::AUDIT_STALE_EXIT_CODE)) {
+                let current = current_core_tip(&core)?;
+                ensure!(
+                    current != snapshot_hash,
+                    "audit reported a changed chain but Core tip did not change"
+                );
+                crate::retention::discard_stale_preparation(
+                    &root,
+                    &maintenance,
+                    &snapshot,
+                    &audit,
+                    false,
+                )?;
+                event(&events, "maintenance_stale", json!({"snapshot_height":tip}))?;
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             ensure!(
                 audit_status.success(),
                 "online audit failed; generations preserved and no pruning performed"
@@ -741,31 +821,77 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 "online backup failed; generations preserved and no pruning performed"
             );
             event(&events, "backup_prepared", json!({"height":tip}))?;
-            let proof = control
-                .parent()
-                .context("private control parent")?
-                .join(format!("audit-{stamp}.ok"));
-            durable_new(
-                &proof,
-                format!(
-                    "snapshot={}\naudit={}\nbackup={}\n",
-                    fs::canonicalize(&snapshot)?.display(),
-                    fs::canonicalize(&audit)?.display(),
-                    fs::canonicalize(&backup)?.display()
-                )
-                .as_bytes(),
-            )?;
+            if current_core_tip(&core)? != snapshot_hash {
+                crate::retention::discard_stale_preparation(
+                    &root,
+                    &maintenance,
+                    &snapshot,
+                    &audit,
+                    true,
+                )?;
+                event(
+                    &events,
+                    "maintenance_stale",
+                    json!({"snapshot_height":tip,"phase":"backup"}),
+                )?;
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             let before = block_files(&block_dir)?;
             core.call("setnetworkactive", json!([false]))?;
+            paused = true;
             event(
                 &events,
                 "maintenance_offline",
                 json!({"height":tip,"electrum_stopped":false,"networkactive":false}),
             )?;
-            let started_verify = private_call(
+            if current_core_tip(&core)? != snapshot_hash {
+                crate::retention::discard_stale_preparation(
+                    &root,
+                    &maintenance,
+                    &snapshot,
+                    &audit,
+                    true,
+                )?;
+                event(
+                    &events,
+                    "maintenance_stale",
+                    json!({"snapshot_height":tip,"phase":"network_pause"}),
+                )?;
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            let started_verify = match private_call(
                 control,
-                json!({"method":"verify-prepared","snapshot":snapshot,"audit":audit,"backup":backup}),
-            )?;
+                json!({"method":"verify-prepared","snapshot":snapshot,"audit":audit,"backup":backup,"expected_tip":snapshot_hash.to_string()}),
+            ) {
+                Ok(result) => result,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::index::AuditTipChanged>()
+                        .is_some() =>
+                {
+                    ensure!(
+                        current_core_tip(&core)? != snapshot_hash,
+                        "verification reported a changed chain but Core tip did not change"
+                    );
+                    crate::retention::discard_stale_preparation(
+                        &root,
+                        &maintenance,
+                        &snapshot,
+                        &audit,
+                        true,
+                    )?;
+                    event(
+                        &events,
+                        "maintenance_stale",
+                        json!({"snapshot_height":tip,"phase":"verification"}),
+                    )?;
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             ensure!(
                 started_verify["state"] == "running",
                 "prepared verification did not start"
@@ -791,6 +917,20 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 }
                 thread::sleep(Duration::from_millis(100));
             }
+            let proof = control
+                .parent()
+                .context("private control parent")?
+                .join(format!("audit-{stamp}.ok"));
+            durable_new(
+                &proof,
+                format!(
+                    "snapshot={}\naudit={}\nbackup={}\n",
+                    fs::canonicalize(&snapshot)?.display(),
+                    fs::canonicalize(&audit)?.display(),
+                    fs::canonicalize(&backup)?.display()
+                )
+                .as_bytes(),
+            )?;
             let started_prune =
                 private_call(control, json!({"method":"prune-prepared","proof":proof}))?;
             ensure!(
@@ -1046,7 +1186,7 @@ mod tests {
                 Ok(())
             });
             assert_eq!(
-                request_snapshot(&path, &root.join("snapshot-7-1"), 7).is_ok(),
+                request_snapshot(&path, &root.join("snapshot-7-1"), 7, hash).is_ok(),
                 valid
             );
             worker.join().expect("control test worker")?;

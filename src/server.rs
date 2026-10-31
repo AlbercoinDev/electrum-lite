@@ -307,6 +307,21 @@ fn prepared_generations(value: &Value, allowed: &Path) -> Result<(PathBuf, PathB
     Ok((paths[0].0.clone(), paths[1].0.clone(), paths[2].0.clone()))
 }
 
+fn check_expected_core_tip(core: &Core, request: &Value) -> Result<()> {
+    if let Some(expected) = request.get("expected_tip") {
+        let expected: bitcoin::BlockHash = expected
+            .as_str()
+            .context("invalid expected Core tip")?
+            .parse()?;
+        let current = core.call("getbestblockhash", json!([]))?;
+        let current: bitcoin::BlockHash = current.as_str().context("invalid Core tip")?.parse()?;
+        if current != expected {
+            return Err(crate::index::AuditTipChanged.into());
+        }
+    }
+    Ok(())
+}
+
 fn verify_prune_handoff(
     proof: &Path,
     allowed: &Path,
@@ -718,6 +733,7 @@ pub fn serve(
                                         && !prune_failed,
                                     "prepared verification already running"
                                 );
+                                check_expected_core_tip(&core, &r.value)?;
                                 ensure!(ready && mempool.raw.is_empty(), "prepared verification requires a ready index and empty mempool");
                                 let dir = snapshot_dir
                                     .as_ref()
@@ -800,6 +816,7 @@ pub fn serve(
                                     && !prune_failed,
                                 "prepared verification in progress"
                             );
+                            check_expected_core_tip(&core, &r.value)?;
                             ensure!(
                                 ready && mempool.raw.is_empty(),
                                 "snapshot requires a ready index and empty mempool"
@@ -881,7 +898,14 @@ pub fn serve(
                     let response = match result {
                         Ok(v) => json!({"jsonrpc":"2.0","id":r.value["id"],"result":v}),
                         Err(e) => {
-                            json!({"jsonrpc":"2.0","id":r.value["id"],"error":{"code":1,"message":e.to_string()}})
+                            let code = if r.internal
+                                && e.downcast_ref::<crate::index::AuditTipChanged>().is_some()
+                            {
+                                i64::from(crate::AUDIT_STALE_EXIT_CODE)
+                            } else {
+                                1
+                            };
+                            json!({"jsonrpc":"2.0","id":r.value["id"],"error":{"code":code,"message":e.to_string()}})
                         }
                     };
                     let _ = r.reply.send(response);

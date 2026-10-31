@@ -136,6 +136,10 @@ def main():
                 return private_request({"method":"snapshot", "path":str(path)})
             denied = snapshot(root / "not-a-snapshot")
             assert denied.get("error") and not (root / "not-a-snapshot").exists()
+            stale_path = root / "snapshot-101-4"
+            stale = private_request({"method":"snapshot", "path":str(stale_path), "expected_tip":cli("getblockhash", 0)})
+            assert stale.get("error", {}).get("code") == 75 and not stale_path.exists()
+            print("PASS: stale expected tip rejected before snapshot creation", flush=True)
             shot = root / "snapshot-101-1"
             result = snapshot(shot)
             assert result.get("error") is None and result["result"]["height"] == 101 and shot.is_dir()
@@ -171,7 +175,10 @@ def main():
             shutil.copytree(shot, verify_snapshot)
             shutil.copytree(root / "online-audit", verify_audit)
             shutil.copytree(shot, verify_backup)
-            request = {"method":"verify-prepared", "snapshot":str(verify_snapshot), "audit":str(verify_audit), "backup":str(verify_backup)}
+            request = {"method":"verify-prepared", "snapshot":str(verify_snapshot), "audit":str(verify_audit), "backup":str(verify_backup), "expected_tip":cli("getbestblockhash")}
+            stale_request = dict(request, expected_tip=cli("getblockhash", 0))
+            assert private_request(stale_request).get("error", {}).get("code") == 75
+            print("PASS: stale expected tip rejected before final verification", flush=True)
             response = private_request(request)
             assert response.get("error") is None and response["result"]["state"] == "running", response
             assert electrum("server.ping") is None
@@ -251,10 +258,12 @@ def main():
             changed_block = cli("generatetoaddress", 1, miner)[0]
             release_audit.set()
             hold_audit.clear()
-            assert changing.wait(timeout=60) != 0, "audit accepted a changed Core tip"
+            assert changing.wait(timeout=60) == 75, "changed Core tip did not produce the distinct stale-audit status"
             assert changed_audit.is_dir() and changing_snapshot.is_dir(), "failed audit data was removed"
             cli("invalidateblock", changed_block)
             wait(lambda: electrum("blockchain.headers.subscribe")["height"] == 101, "return to original branch")
+            retried = subprocess.run(command + ["--snapshot-dir", str(changing_snapshot), "--audit-dir", str(root / "retried-audit"), "audit"], capture_output=True, text=True, timeout=60)
+            assert retried.returncode == 0, retried.stderr
             print("PASS: changed Core tip aborts snapshot audit; failed generations preserved", flush=True)
             with socket.create_connection(("127.0.0.1", port), timeout=5) as batch:
                 batch.sendall(json.dumps([{"id": 1, "method": "server.version", "params": ["smoke", ["1.4", "1.4.5"]]}, {"id": 2, "method": "server.ping", "params": []}]).encode() + b"\n")

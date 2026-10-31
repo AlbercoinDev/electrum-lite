@@ -8,7 +8,9 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
+import signal
 import socket
 import shutil
 import subprocess
@@ -174,6 +176,35 @@ def main():
             session_reader = session.makefile("rb")
             session.sendall(b'{"id":701,"method":"server.ping","params":[]}\n')
             assert json.loads(session_reader.readline())["id"] == 701
+            # Suspend only the audit child owned by this disposable supervisor,
+            # advance its dedicated Core through the disposable archive peer,
+            # then let the audit detect the changed tip and retry naturally.
+            def started_audit():
+                for line in events.read_text().splitlines():
+                    event = json.loads(line)
+                    if event["event"] == "audit_started":
+                        return event["details"]
+                return None
+            started = wait(started_audit, "online audit start", timeout=180, guard=manager)
+            audit_pid = started["pid"]
+            status = Path(f"/proc/{audit_pid}/status").read_text()
+            assert f"PPid:\t{manager.pid}\n" in status, "audit process is not the owned child"
+            assert b"--snapshot-dir\0" in Path(f"/proc/{audit_pid}/cmdline").read_bytes()
+            os.kill(audit_pid, signal.SIGSTOP)
+            try:
+                archive("generatetoaddress", 1, address)
+                rpc("addnode", f"127.0.0.1:{sourcep2p}", "onetry")
+                wait(lambda: rpc("getblockcount") == tip + 1, "advance Core while audit is paused", timeout=180, guard=manager)
+            finally:
+                os.kill(audit_pid, signal.SIGCONT)
+            tip += 1
+            wait(lambda: has_event("maintenance_stale"), "stale audit postponed", timeout=180, guard=manager)
+            assert not Path(started["snapshot"]).exists() and not Path(started["audit"]).exists()
+            assert not (lite / "regtest/prune-pending").exists()
+            assert query(listen, "server.health")["pid"] == initial_health["pid"]
+            assert rpc("getblockcount") == tip and manager.poll() is None
+            assert query(listen, "server.ping") is None
+            print("PASS: changing Core tip postponed audit, cleaned only its temporary data and kept both services alive", flush=True)
             wait(lambda: has_event("maintenance_complete"), "coordinated physical prune", timeout=600,guard=manager)
             wait(lambda: has_event("retention_complete"), "verified retention", timeout=120,guard=manager)
             wait(lambda: query(listen, "server.health")["ready"], "post-maintenance server resume")

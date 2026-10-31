@@ -132,6 +132,79 @@ fn recognized_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Discard only temporary generations created by an audit that explicitly
+/// reported a changed chain. Never remove completed, pending, unknown or linked
+/// content. The caller must have confirmed Core's current tip changed.
+pub fn discard_stale_preparation(
+    root: &Path,
+    maintenance: &Path,
+    snapshot: &Path,
+    audit: &Path,
+    include_backup: bool,
+) -> Result<()> {
+    ensure!(
+        is_absent(&root.join("prune-pending"))?,
+        "pending prune prevents stale cleanup"
+    );
+    let parent = fs::canonicalize(maintenance)?;
+    let suffix = snapshot
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| generation_name(n, "snapshot-"))
+        .context("unrecognized snapshot name")?;
+    ensure!(
+        audit
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| generation_name(n, "audit-"))
+            == Some(suffix.clone()),
+        "stale generation names differ"
+    );
+    let (height, _) = suffix.split_once('-').context("invalid stale generation")?;
+    ensure!(
+        is_absent(&root.join(format!("prune-complete-{height}")))?,
+        "completed prune prevents stale cleanup"
+    );
+    let backup = maintenance.join(format!("backup-{suffix}"));
+    ensure!(
+        is_absent(&backup)? != include_backup,
+        "unexpected backup presence prevents stale cleanup"
+    );
+    ensure!(!is_absent(snapshot)?, "stale snapshot missing");
+    if include_backup {
+        ensure!(
+            !is_absent(audit)?,
+            "completed backup requires audit generation"
+        );
+    }
+    for path in [snapshot, audit, backup.as_path()] {
+        if !is_absent(path)? {
+            ensure!(
+                fs::symlink_metadata(path)?.file_type().is_dir()
+                    && fs::canonicalize(path)?.parent() == Some(parent.as_path()),
+                "stale generation outside supervisor directory"
+            );
+            recognized_directory(path)?;
+        }
+    }
+    for path in [backup.as_path(), audit, snapshot] {
+        if !is_absent(path)? {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                ensure!(
+                    entry.file_type()?.is_file()
+                        && entry.file_name().to_str().is_some_and(known_file),
+                    "unrecognized stale content; preserving it"
+                );
+                fs::remove_file(entry.path())?;
+            }
+            fs::remove_dir(path)?;
+        }
+    }
+    fs::File::open(maintenance)?.sync_all()?;
+    Ok(())
+}
+
 /// Remove only the supervisor's temporary checkpoint and proof after a
 /// completed prune and successful generation verification. Unknown contents,
 /// symlinks and unfinished maintenance are never removed.
@@ -430,6 +503,46 @@ mod tests {
             height - 288, b.display(), a.display()
         ))?;
         Ok((a, b))
+    }
+
+    #[test]
+    fn stale_cleanup_removes_only_recognized_unfinished_generations() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "el-stale-clean-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let maintenance = root.join("supervisor");
+        fs::create_dir_all(&maintenance)?;
+        let snapshot = maintenance.join("snapshot-1000-7");
+        let audit = maintenance.join("audit-1000-7");
+        db(&snapshot, b"snapshot")?;
+        db(&audit, b"partial")?;
+        fs::write(root.join("prune-pending"), b"preserve")?;
+        assert!(discard_stale_preparation(&root, &maintenance, &snapshot, &audit, false).is_err());
+        assert!(snapshot.exists() && audit.exists());
+        fs::remove_file(root.join("prune-pending"))?;
+        fs::write(audit.join("foreign.txt"), b"preserve")?;
+        assert!(discard_stale_preparation(&root, &maintenance, &snapshot, &audit, false).is_err());
+        assert!(snapshot.exists() && audit.join("foreign.txt").exists());
+        fs::remove_file(audit.join("foreign.txt"))?;
+        fs::create_dir(maintenance.join("backup-1000-7"))?;
+        assert!(discard_stale_preparation(&root, &maintenance, &snapshot, &audit, false).is_err());
+        fs::remove_dir(maintenance.join("backup-1000-7"))?;
+        discard_stale_preparation(&root, &maintenance, &snapshot, &audit, false)?;
+        assert!(!snapshot.exists() && !audit.exists());
+        db(&snapshot, b"snapshot")?;
+        db(&audit, b"audit")?;
+        let backup = maintenance.join("backup-1000-7");
+        db(&backup, b"backup")?;
+        fs::write(backup.join("foreign.txt"), b"preserve")?;
+        assert!(discard_stale_preparation(&root, &maintenance, &snapshot, &audit, true).is_err());
+        assert!(snapshot.exists() && audit.exists() && backup.join("foreign.txt").exists());
+        fs::remove_file(backup.join("foreign.txt"))?;
+        discard_stale_preparation(&root, &maintenance, &snapshot, &audit, true)?;
+        assert!(!snapshot.exists() && !audit.exists() && !backup.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

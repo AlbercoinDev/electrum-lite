@@ -246,9 +246,11 @@ a comprobar Core. Dos podas físicas en regtest conservaron el mismo proceso y u
 conexión TCP existente; esto no garantiza disponibilidad continua de consultas.
 Durante la reserva se rechaza temporalmente la difusión de transacciones y algunas
 consultas históricas pueden fallar o retrasarse; `server.health` indica que no
-está listo. Si la punta cambia durante la auditoría o
-falla cualquier comprobación, no poda; el supervisor se detiene y conserva las
-generaciones para inspección.
+está listo. Si Core confirma que la punta cambió durante la preparación, el
+supervisor aplaza la poda y reintenta después de limpiar únicamente generaciones
+temporales reconocidas. Si no puede confirmar el cambio o encuentra contenido
+inesperado, detiene el mantenimiento y conserva lo que no pueda limpiar con
+seguridad. Los errores RPC y otros fallos no se interpretan como cambios de punta.
 Con los parámetros normales de Core en las redes de prueba, no intenta podar
 antes de altura **1000**; no usa `-fastprune` ni elude esa protección.
 Antes del mantenimiento, el supervisor inspecciona en segundo plano las cabeceras

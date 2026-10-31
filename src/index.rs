@@ -10,6 +10,28 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::Path};
 
 const WINDOW: u32 = 288;
+/// Core returned a valid chain hash different from the audited checkpoint.
+/// RPC failures and malformed responses are deliberately not classified here.
+#[derive(Debug)]
+pub struct AuditTipChanged;
+impl std::fmt::Display for AuditTipChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Core chain changed during semantic audit")
+    }
+}
+impl std::error::Error for AuditTipChanged {}
+
+fn audit_expect_hash(actual: Value, expected: bitcoin::BlockHash) -> Result<()> {
+    let actual: bitcoin::BlockHash = actual
+        .as_str()
+        .context("invalid Core audit hash")?
+        .parse()
+        .context("invalid Core audit hash")?;
+    if actual != expected {
+        return Err(AuditTipChanged.into());
+    }
+    Ok(())
+}
 pub struct Index {
     pub db: DB,
     pub network: Network,
@@ -256,10 +278,7 @@ impl Index {
                 let base_header: bitcoin::block::Header = deserialize(&meta[..80])?;
                 let index_hash = self.header(height)?.block_hash();
                 if base_header.block_hash() == index_hash {
-                    ensure!(
-                        core.call("getblockhash", json!([height]))? == index_hash.to_string(),
-                        "audit base differs from Core"
-                    );
+                    audit_expect_hash(core.call("getblockhash", json!([height]))?, index_hash)?;
                     drop(source);
                     let copied_height = self.checkpoint_audit_prefix(base, path)?;
                     ensure!(copied_height == height, "audit base changed during copying");
@@ -275,17 +294,14 @@ impl Index {
                 "semantic audit interrupted; partial audit generation preserved"
             );
             let hash = self.header(h)?.block_hash();
-            ensure!(
-                core.call("getblockhash", json!([h]))? == hash.to_string(),
-                "audit chain differs from Core"
-            );
+            audit_expect_hash(core.call("getblockhash", json!([h]))?, hash)?;
             let block = self.block_source(core, h, false)?;
             other.commit(h, &block)?;
         }
-        ensure!(
-            core.call("getbestblockhash", json!([]))? == self.header(tip)?.block_hash().to_string(),
-            "chain changed during audit"
-        );
+        audit_expect_hash(
+            core.call("getbestblockhash", json!([]))?,
+            self.header(tip)?.block_hash(),
+        )?;
         // A rewind can leave fewer than 288 retained undos; this is not a
         // confirmed-state difference. Compare every retained undo separately.
         let mut a = self
@@ -808,6 +824,24 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audit_distinguishes_chain_change_from_invalid_reply() {
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+        let other = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin).block_hash();
+        assert!(audit_expect_hash(json!(genesis.to_string()), genesis).is_ok());
+        assert!(audit_expect_hash(json!(other.to_string()), genesis)
+            .unwrap_err()
+            .downcast_ref::<AuditTipChanged>()
+            .is_some());
+        assert!(audit_expect_hash(json!("invalid"), genesis)
+            .unwrap_err()
+            .downcast_ref::<AuditTipChanged>()
+            .is_none());
+        assert!(audit_expect_hash(Value::Null, genesis)
+            .unwrap_err()
+            .downcast_ref::<AuditTipChanged>()
+            .is_none());
+    }
     #[test]
     fn prepared_snapshot_rejects_tip_or_state_changes() -> Result<()> {
         let root = std::env::temp_dir().join(format!(

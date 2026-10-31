@@ -131,6 +131,16 @@ mempool desde Electrum; esta barrera pasó un smoke con compilaciones debug y
 release. La prueba física conservó una sesión, pero no inyectó una difusión
 durante la RPC de poda.
 
+Trabajo local posterior: un cambio de punta confirmado durante la auditoría se
+clasifica con un código distinto de los errores RPC y aplaza el mantenimiento.
+En regtest gestionado se pausó el auditor, se avanzó Core y se confirmó que el
+supervisor eliminó solo los temporales reconocidos, mantuvo ambos procesos vivos
+y reintentó hasta completar dos podas. Los cambios adicionales para detectar una
+punta obsoleta al solicitar la instantánea o tras el backup pasan pruebas sencillas.
+Una compilación se efectuó mientras un smoke físico estaba en curso, por lo que
+ese resultado no se considera prueba íntegra de un único binario final. No se han
+inyectado las carreras de instantánea y backup de extremo a extremo.
+
 Un regtest dedicado desechable arrancó con `--core-dbcache-mib 256`; se verificó
 en los argumentos del proceso Core `-dbcache=256` y se detuvo limpiamente. Este
 ajuste limita esa caché de Core, no la RAM total, y no es una medición de velocidad.

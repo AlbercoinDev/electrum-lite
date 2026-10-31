@@ -77,7 +77,24 @@ struct Args {
     #[arg(value_parser=["sync","serve","managed-serve","health","backup","audit","prune"], default_value="serve")]
     command: String,
 }
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            if error
+                .downcast_ref::<electrum_lite::index::AuditTipChanged>()
+                .is_some()
+            {
+                std::process::ExitCode::from(electrum_lite::AUDIT_STALE_EXIT_CODE)
+            } else {
+                std::process::ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let mut command = Args::command();
     if electrum_lite::i18n::language() == electrum_lite::i18n::Language::Spanish {
         command = command
