@@ -84,6 +84,20 @@ electrum-lite --network mainnet \
 - No ejecutes dos instancias sobre el mismo `--data-dir`: RocksDB y el índice
   solo admiten un escritor.
 
+Ejemplo Signet con todo en `/media/albit/data/electrum-lite`:
+
+```sh
+mkdir -p /media/albit/data/electrum-lite/{bin,data,core}
+/media/albit/data/electrum-lite/bin/electrum-lite --network signet \
+  --data-dir /media/albit/data/electrum-lite/data \
+  --core-dir /media/albit/data/electrum-lite/core \
+  --bitcoind "$HOME/.local/bin/bitcoind" \
+  --core-rpc http://127.0.0.1:38332 \
+  --core-p2p-port 38333 \
+  --listen 127.0.0.1:50001 \
+  --confirm-dedicated --storage hdd --tor managed-serve
+```
+
 `contrib/electrum-lite.service` es una referencia opcional. No se instala ni se
 habilita; si algún día quieres usarlo, tendrás que copiarlo y ajustarlo tú.
 

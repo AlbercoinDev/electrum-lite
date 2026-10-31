@@ -85,6 +85,26 @@ queda desactivada salvo que añadas `--esplora` y `--allow-public-data` (esto
 último expone tu IP al proveedor). `--storage hdd` es el perfil recomendado para
 HDD; usa `--storage ssd` en SSD.
 
+Ejemplo Signet con datos en `/media/albit/data`:
+
+```sh
+mkdir -p /media/albit/data/electrum-lite/{bin,data,core}
+
+/media/albit/data/electrum-lite/bin/electrum-lite --network signet \
+  --data-dir /media/albit/data/electrum-lite/data \
+  --core-dir /media/albit/data/electrum-lite/core \
+  --bitcoind "$HOME/.local/bin/bitcoind" \
+  --core-rpc http://127.0.0.1:38332 \
+  --core-p2p-port 38333 \
+  --listen 127.0.0.1:50001 \
+  --confirm-dedicated \
+  --storage hdd \
+  --tor \
+  managed-serve
+```
+
+No añadas `--confirm-pruned-mainnet` en Signet.
+
 Para dejarlo corriendo al cerrar la terminal, usa `tmux` o `screen`:
 
 ```sh
