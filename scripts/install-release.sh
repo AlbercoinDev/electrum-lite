@@ -2,9 +2,9 @@
 set -eu
 
 # This installer is pinned to one experimental build, not the historical tag.
-version=thin-online-backup-2026-10-31
+version=thin-live-prune-2026-10-31
 asset=electrum-lite-linux-x86_64
-sha256=cf71307f3a72ac55ae7006aa582d137d42e3ff5f04b3f925c11a1c7d28b4d345
+sha256=1482cc732da73b83a171fdf31e7f9d65a9352965e98c95182e98f6b406609e17
 url="https://github.com/AlbercoinDev/electrum-lite/releases/download/$version/$asset"
 
 test "$(uname -s)" = Linux && test "$(uname -m)" = x86_64 || {
