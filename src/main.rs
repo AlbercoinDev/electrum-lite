@@ -31,6 +31,27 @@ struct Args {
     /// Storage profile: auto, hdd (default) or ssd.
     #[arg(long, default_value = "auto", value_parser = ["auto", "hdd", "ssd"])]
     storage: String,
+    /// Initial-sync mode: WAL/compactions off, batched writes, hash-only Core verification.
+    #[arg(long)]
+    fast_sync: bool,
+    /// Verify Merkle/witness for Core blocks: hash (default in fast-sync) or full.
+    #[arg(long, default_value = "hash", value_parser = ["hash", "full"])]
+    verify_core: String,
+    /// Generate transaction offsets (txpos) during indexing.
+    #[arg(long, default_value = "off", value_parser = ["off", "on"])]
+    txpos: String,
+    /// Spent-output source: auto (C on Signet/regtest, REST on mainnet), always or never.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "always", "never"])]
+    spent_txouts: String,
+    /// Override detected index workers.
+    #[arg(long)]
+    index_threads: Option<usize>,
+    /// Override detected CPU count for budgeting.
+    #[arg(long)]
+    cpu_budget: Option<usize>,
+    /// Override detected RAM in MiB for budgeting.
+    #[arg(long)]
+    memory_budget_mib: Option<u64>,
     /// Optional Esplora endpoint(s), comma-separated; only block hashes are sent.
     #[arg(long)]
     esplora: Option<String>,
@@ -59,9 +80,12 @@ struct Args {
     bitcoind: PathBuf,
     #[arg(long, default_value_t = 18444)]
     core_p2p_port: u16,
-    /// Dedicated Bitcoin Core database cache in MiB; does not limit total RAM.
-    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(64..=1024))]
-    core_dbcache_mib: u32,
+    /// Dedicated Bitcoin Core database cache in MiB; defaults to the RAM budget.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(64..=1024))]
+    core_dbcache_mib: Option<u32>,
+    /// Dedicated Core script-verification threads; defaults to the CPU budget.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=16))]
+    core_par: Option<u32>,
     #[arg(long)]
     confirm_dedicated: bool,
     #[arg(long)]
@@ -211,6 +235,52 @@ fn run() -> Result<()> {
     if a.storage != "auto" {
         std::env::set_var("ELECTRUM_LITE_STORAGE", &a.storage);
     }
+    let storage_arg = if a.storage == "auto" {
+        std::env::var("ELECTRUM_LITE_STORAGE").unwrap_or_else(|_| "auto".to_owned())
+    } else {
+        a.storage.clone()
+    };
+    let storage = match storage_arg.as_str() {
+        "ssd" => electrum_lite::index::StorageProfile::Ssd,
+        "hdd" => electrum_lite::index::StorageProfile::Hdd,
+        _ => electrum_lite::index::detect_storage_profile(&a.data_dir),
+    };
+    let mut budget = electrum_lite::budget::Budget::detect_or_default(&a.data_dir, storage);
+    budget.override_resources(
+        a.cpu_budget,
+        a.memory_budget_mib,
+        a.index_threads,
+        a.core_par,
+    );
+    budget.validate()?;
+    budget.log();
+    if let Err(error) = budget.ensure_fits_disk(&a.data_dir) {
+        eprintln!("budget warning: {error:#}");
+    }
+    let fast_sync = a.fast_sync
+        || electrum_lite::budget::parse_bool_env("ELECTRUM_LITE_FAST_SYNC").unwrap_or(false);
+    let verify_core =
+        std::env::var("ELECTRUM_LITE_VERIFY_CORE").unwrap_or_else(|_| a.verify_core.clone());
+    let txpos = std::env::var("ELECTRUM_LITE_TXPOS").unwrap_or_else(|_| a.txpos.clone());
+    let spent_mode =
+        std::env::var("ELECTRUM_LITE_SPENT_TXOUTS").unwrap_or_else(|_| a.spent_txouts.clone());
+    let index_workers = std::env::var("ELECTRUM_LITE_INDEX_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| a.index_threads.unwrap_or(budget.index_workers));
+    if fast_sync {
+        std::env::set_var("ELECTRUM_LITE_FAST_SYNC", "1");
+    }
+    std::env::set_var("ELECTRUM_LITE_VERIFY_CORE", &verify_core);
+    std::env::set_var("ELECTRUM_LITE_TXPOS", &txpos);
+    std::env::set_var("ELECTRUM_LITE_SPENT_TXOUTS", &spent_mode);
+    std::env::set_var("ELECTRUM_LITE_INDEX_THREADS", index_workers.to_string());
+    if let Some(cpu) = a.cpu_budget {
+        std::env::set_var("ELECTRUM_LITE_CPU_BUDGET", cpu.to_string());
+    }
+    if let Some(ram) = a.memory_budget_mib {
+        std::env::set_var("ELECTRUM_LITE_MEMORY_BUDGET_MIB", ram.to_string());
+    }
     if a.command == "managed-serve" {
         ensure!(
             a.control_socket.is_none(),
@@ -243,10 +313,12 @@ fn run() -> Result<()> {
                 core_rpc: a.core_rpc,
                 listen: a.listen,
                 p2p_port: a.core_p2p_port,
-                core_dbcache_mib: a.core_dbcache_mib,
+                core_dbcache_mib: a.core_dbcache_mib.unwrap_or(budget.core_dbcache_mib),
+                core_par: a.core_par.unwrap_or(budget.core_par),
+                core_mempool_mib: budget.core_mempool_mib,
                 high: a.pause_lag,
                 low: a.resume_lag,
-                min_free_mib: a.min_free_mib,
+                min_free_mib: a.min_free_mib.max(budget.min_free_mib as u32),
                 auto_prune: a.auto_prune,
                 prune_interval: a.prune_interval,
                 confirm_pruned_mainnet: a.confirm_pruned_mainnet,
@@ -273,15 +345,26 @@ fn run() -> Result<()> {
         a.prepared_snapshot.is_none() || a.command == "prune",
         "prepared snapshot only applies to prune"
     );
-    let storage_arg = if a.storage == "auto" {
-        std::env::var("ELECTRUM_LITE_STORAGE").unwrap_or_else(|_| "auto".to_owned())
-    } else {
-        a.storage.clone()
-    };
-    let storage = match storage_arg.as_str() {
-        "ssd" => electrum_lite::index::StorageProfile::Ssd,
-        "hdd" => electrum_lite::index::StorageProfile::Hdd,
-        _ => electrum_lite::index::detect_storage_profile(&a.data_dir),
+    let options = electrum_lite::index::IndexOptions {
+        storage,
+        block_cache_mib: budget.block_cache_mib,
+        write_buffer_mib: budget.write_buffer_mib,
+        memtables: budget.memtables,
+        rocks_jobs: budget.rocks_jobs,
+        rocks_subcompactions: budget.rocks_subcompactions,
+        index_workers,
+        fast_sync,
+        verify_core: if verify_core == "full" {
+            electrum_lite::index::VerifyCore::Full
+        } else {
+            electrum_lite::index::VerifyCore::Hash
+        },
+        txpos: txpos == "on",
+        spent_mode: match spent_mode.as_str() {
+            "always" => electrum_lite::index::SpentMode::Always,
+            "never" => electrum_lite::index::SpentMode::Never,
+            _ => electrum_lite::index::SpentMode::Auto,
+        },
     };
     let mut index = if let Some(snapshot) = &a.snapshot_dir {
         let metadata = std::fs::symlink_metadata(snapshot)?;
@@ -330,14 +413,14 @@ fn run() -> Result<()> {
                 "snapshot name does not match its tip"
             );
         }
-        let checkpoint = Index::open_with_profile(snapshot, network, storage)?;
+        let checkpoint = Index::open_with_options(snapshot, network, options)?;
         ensure!(
             checkpoint.tip()? == Some(height),
             "snapshot name does not match its tip"
         );
         checkpoint
     } else {
-        Index::open_with_profile(&root.join("index"), network, storage)?
+        Index::open_with_options(&root.join("index"), network, options)?
     };
     index.fetcher.peers = a.block_peer;
     index.fetcher.proxy = proxy.clone();

@@ -1,7 +1,7 @@
 # Electrum Lite — servidor thin experimental
 
 **Versión `0.0.1-beta.1`.** Release experimental actual:
-[**`thin-v3-txnum-2026-10-31`**](https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-2026-10-31).
+[**`thin-v3-txnum-fast-2026-10-31`**](https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31).
 Servidor Electrum en Rust construido desde cero:
 Core valida, RocksDB conserva índices y los bloques históricos ausentes se obtienen
 completos por P2P. Tor opcional. Para bloques que Core ya podó, Lite pide el bloque crudo a Esplora/onion: nunca envía scripthashes ni TXID.
@@ -75,6 +75,7 @@ electrum-lite --network mainnet \
   --confirm-dedicated \
   --confirm-pruned-mainnet \
   --storage hdd \
+  --fast-sync \
   --tor \
   managed-serve
 ```
@@ -99,6 +100,7 @@ mkdir -p /media/albit/data/electrum-lite/{bin,data,core}
   --listen 127.0.0.1:50001 \
   --confirm-dedicated \
   --storage hdd \
+  --fast-sync \
   --tor \
   managed-serve
 ```

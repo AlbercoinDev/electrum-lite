@@ -1,4 +1,5 @@
 //! Original thin Electrum indexer. Experimental; Core owns consensus.
+pub mod budget;
 pub mod core;
 pub mod core_blockfile;
 pub mod i18n;

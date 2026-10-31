@@ -49,6 +49,23 @@ hdparm -B 254 -S 0 /dev/sdX
 echo mq-deadline > /sys/block/sdX/queue/scheduler
 ```
 
+## Presupuesto automático y fast-sync
+
+Lite calcula CPU, RAM y disco disponibles (incluidos cgroup) y reserva al menos
+un núcleo y ~20 % de RAM para el sistema, Core y Tor. Ajusta automáticamente:
+
+- `core_par`, `core_dbcache`, `core_mempool`
+- workers de índice y jobs de RocksDB
+- block cache, write buffers, pipeline y reserva de disco
+
+Puedes sobrescribirlo con `--cpu-budget`, `--memory-budget-mib`,
+`--index-threads` y `--core-par`.
+
+`--fast-sync` usa lotes de 32 bloques, WAL/compacciones off, flush periódico,
+verificación hash-only para bloques de Core, `txpos` off y
+`spenttxouts=auto` (C en Signet/regtest, REST en mainnet). Al alcanzar el tip
+vuelve al modo normal. El sufijo no flusheado se recupera desde Core.
+
 ## Perfil de almacenamiento
 
 `--storage hdd` (por defecto) usa 64 MiB de write buffer, 3 memtables, 256 MiB
@@ -73,6 +90,7 @@ electrum-lite --network mainnet \
   --confirm-dedicated \
   --confirm-pruned-mainnet \
   --storage hdd \
+  --fast-sync \
   --tor \
   managed-serve
 ```
@@ -95,7 +113,7 @@ mkdir -p /media/albit/data/electrum-lite/{bin,data,core}
   --core-rpc http://127.0.0.1:38332 \
   --core-p2p-port 38333 \
   --listen 127.0.0.1:50001 \
-  --confirm-dedicated --storage hdd --tor managed-serve
+  --confirm-dedicated --storage hdd --fast-sync --tor managed-serve
 ```
 
 `contrib/electrum-lite.service` es una referencia opcional. No se instala ni se

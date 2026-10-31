@@ -448,10 +448,10 @@ La matriz de scripts, comandos y límites de ejecución está en
 [`testing.md`](testing.md). La disponibilidad de una herramienta no equivale a
 haber ejecutado o aprobado una prueba.
 
-## Revisión `thin-v3-txnum` (release `thin-v3-txnum-2026-10-31`)
+## Revisión `thin-v3-txnum` (release `thin-v3-txnum-fast-2026-10-31`)
 
 Release publicada:
-<https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-2026-10-31>.
+<https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31>.
 Assets: binario `electrum-lite-linux-x86_64`, paquete tar.gz, checksum e
 `install-release.sh`. SHA256 del binario:
 `d0383494efe244493e32248fb8ce424ccde66f2e4f7ae7db375238ae2897a14f`.
@@ -463,7 +463,7 @@ ejecutada en este árbol de trabajo:
 ```text
 cargo fmt --check                                      OK
 cargo clippy --locked --all-targets -- -D warnings      OK
-cargo test --locked                                    34 passed; 0 failed
+cargo test --locked                                    38 passed; 0 failed
 cargo build --release --locked                         OK
 scripts/smoke_regtest.py con Core 31.0                  PASS
 scripts/managed_prune_smoke.py con Core 31.0            PASS
@@ -475,10 +475,20 @@ gestionado verificó arranque/parada de Core, backpressure, auditoría/backup/po
 en línea, retención, poda física durante IBD, recuperación de una transacción
 antigua tras la poda y una segunda poda incremental sin hacer crecer la caché.
 
+Se añadieron pruebas de presupuesto automático, equivalencia entre commit por
+lote y commit individual, y reorg en fast-sync reindexando el bloque obsoleto
+con un Core REST simulado (`fast_sync_reorg_reindexes_stale_block`).
+
 La prueba unitaria `spent_txouts_avoid_prevout_reads_and_restore_on_rewind`
 borra la fila `C` del prevout antes del commit, indexa un gasto usando
 `SpentOut`, comprueba `tx_position` y revierte el bloque: el UTXO se restaura
 desde el marcador de undo sin haber leído `C`.
+
+El smoke gestionado se ejecutó tanto con el modo normal como con
+`ELECTRUM_LITE_FAST_SYNC=1 ELECTRUM_LITE_VERIFY_CORE=hash ELECTRUM_LITE_TXPOS=off
+ELECTRUM_LITE_SPENT_TXOUTS=auto`; ambos pasaron. El presupuesto detectado en el
+entorno de prueba fue 8 CPU / 7909 MiB, con 3 workers, 2095 MiB de caché y
+632 MiB de Core dbcache.
 
 No se dispone de un servidor físico con 4 GB, 2 vCPU y HDD 2,5" 5400 rpm, ni de
 un Core mainnet sincronizado. El perfil `--storage hdd`, los límites de memoria y

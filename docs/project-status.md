@@ -1,6 +1,6 @@
 # Electrum Lite — diseño y estado
 
-Versión `0.0.1-beta.1`, release `thin-v3-txnum-2026-10-31`, formato de
+Versión `0.0.1-beta.1`, release `thin-v3-txnum-fast-2026-10-31`, formato de
 almacenamiento `thin-v3-txnum`. Aplicación nueva,
 desarrollada desde cero en Rust como un único paquete y con RocksDB como biblioteca
 genérica de almacenamiento.
@@ -120,6 +120,18 @@ conserva esos bloques y el siguiente arranque los vuelve a leer. Nunca se poda
 automáticamente basándose en un cursor aún no sincronizado a disco.
 Una corrupción de índice requiere preservar la raíz y restaurar un checkpoint o
 reconstruir en otra raíz. No hay reparación silenciosa ni compatibilidad con SQLite.
+
+## Modo rápido y presupuesto
+
+Lite detecta CPU/RAM/cgroup/disco y reserva margen para el sistema, Core y Tor.
+`--fast-sync` agrupa 32 bloques por `WriteBatch`, desactiva WAL/autocompacciones,
+hace flush periódico, omite Merkle/witness de bloques de Core, no genera `txpos`
+y usa `spenttxouts=auto` (C en Signet/regtest, REST en mainnet). Al alcanzar el
+tip hace flush y vuelve al modo normal.
+
+La reorg en fast-sync no usa undo: reindexa el bloque obsoleto, borra sus claves
+y restaura UTXO desde `spenttxouts`; requiere Core REST. `server.health` publica
+`index_rate`, `bulk`, `durable_height` y el último lote.
 
 ## Concurrencia inicial
 

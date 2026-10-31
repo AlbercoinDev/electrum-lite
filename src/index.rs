@@ -84,6 +84,57 @@ pub struct SpentOut {
     pub script: ScriptHash,
     pub value: u64,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifyCore {
+    Hash,
+    Full,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpentMode {
+    Auto,
+    Always,
+    Never,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct IndexOptions {
+    pub storage: StorageProfile,
+    pub block_cache_mib: u64,
+    pub write_buffer_mib: u64,
+    pub memtables: u32,
+    pub rocks_jobs: u32,
+    pub rocks_subcompactions: u32,
+    pub index_workers: usize,
+    pub fast_sync: bool,
+    pub verify_core: VerifyCore,
+    pub txpos: bool,
+    pub spent_mode: SpentMode,
+}
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            storage: StorageProfile::Hdd,
+            block_cache_mib: 512,
+            write_buffer_mib: 64,
+            memtables: 3,
+            rocks_jobs: 1,
+            rocks_subcompactions: 1,
+            index_workers: 1,
+            fast_sync: false,
+            verify_core: VerifyCore::Full,
+            txpos: true,
+            spent_mode: SpentMode::Auto,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndexStats {
+    pub last_batch_blocks: u32,
+    pub last_batch_millis: u64,
+    pub blocks_per_second: f64,
+    pub mib_per_second: f64,
+    pub bulk: bool,
+    pub durable_height: Option<u32>,
+}
 pub struct Index {
     pub db: DB,
     pub network: Network,
@@ -93,6 +144,10 @@ pub struct Index {
     pub storage: StorageProfile,
     tip_cache: std::sync::Mutex<Option<(u32, bitcoin::BlockHash)>>,
     txnum_index: std::sync::RwLock<Vec<TxNumMeta>>,
+    options: IndexOptions,
+    bulk: std::sync::atomic::AtomicBool,
+    durable_tip: std::sync::Mutex<Option<u32>>,
+    stats: std::sync::RwLock<IndexStats>,
 }
 #[derive(Default)]
 struct CommitTimings {
@@ -101,6 +156,13 @@ struct CommitTimings {
     undo: std::time::Duration,
     write: std::time::Duration,
     reused_preimages: u64,
+}
+struct PreparedBlock {
+    height: u32,
+    hash: bitcoin::BlockHash,
+    delta: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    undo: Vec<u8>,
+    meta: TxNumMeta,
 }
 pub fn script_hash(script: &[u8]) -> ScriptHash {
     let digest = sha256::Hash::hash(script).to_byte_array();
@@ -294,6 +356,9 @@ impl Index {
         );
         let height = self.tip()?.context("empty index")?;
         let hash = self.header(height)?.block_hash();
+        // A checkpoint must contain everything visible through `tip`, even
+        // when fast-sync has WAL disabled and rows are still in memtables.
+        self.db.flush()?;
         rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)?;
         std::fs::File::open(path)?.sync_all()?;
         if let Some(parent) = path.parent() {
@@ -504,7 +569,7 @@ impl Index {
                 }
             }
         }
-        let other = Self::open(path, self.network)?;
+        let other = Self::open_with_options(path, self.network, self.options)?;
         for h in first.into_iter().flat_map(|h| h..=tip) {
             ensure!(
                 !cancel.load(std::sync::atomic::Ordering::Relaxed),
@@ -533,15 +598,25 @@ impl Index {
             match (a.next(), b.next()) {
                 (None, None) => break,
                 (Some(x), Some(y)) => {
-                    ensure!(x? == y?, "semantic replay differs from index");
+                    let x = x?;
+                    let y = y?;
+                    if x != y {
+                        anyhow::bail!(
+                            "semantic replay differs from index at key {:02x?} (live value {} B, replay {} B)",
+                            x.0.iter().take(6).collect::<Vec<_>>(),
+                            x.1.len(),
+                            y.1.len()
+                        );
+                    }
                 }
                 _ => anyhow::bail!("semantic replay key count mismatch"),
             }
         }
         for (k, v) in self.rows(b"U", WINDOW as usize)? {
             ensure!(
-                other.db.get(k)?.as_deref() == Some(v.as_slice()),
-                "retained undo differs from semantic replay"
+                other.db.get(&k)?.as_deref() == Some(v.as_slice()),
+                "retained undo differs at height {}",
+                u32::from_be_bytes(k[1..5].try_into()?)
             );
         }
         let message = if incremental {
@@ -560,6 +635,7 @@ impl Index {
     }
     pub fn backup(&self, path: &Path) -> Result<()> {
         ensure!(!path.exists(), "backup destination must be NEW");
+        self.db.flush()?;
         rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)?;
         let check = DB::open_for_read_only(&Options::default(), path, false)?;
         ensure!(
@@ -595,33 +671,38 @@ impl Index {
         Ok(())
     }
     pub fn open(path: &Path, network: Network) -> Result<Self> {
-        Self::open_with_profile(path, network, StorageProfile::Hdd)
+        Self::open_with_options(path, network, IndexOptions::default())
     }
     pub fn open_with_profile(
         path: &Path,
         network: Network,
         storage: StorageProfile,
     ) -> Result<Self> {
+        Self::open_with_options(
+            path,
+            network,
+            IndexOptions {
+                storage,
+                ..IndexOptions::default()
+            },
+        )
+    }
+    pub fn open_with_options(path: &Path, network: Network, options: IndexOptions) -> Result<Self> {
+        let storage = options.storage;
         ensure!(!path.is_symlink(), "index symlink refused");
         std::fs::create_dir_all(path)?;
         let mut o = Options::default();
         o.create_if_missing(true);
         o.set_compaction_style(rocksdb::DBCompactionStyle::Level);
-        o.set_write_buffer_size(64 * 1024 * 1024);
-        o.set_max_write_buffer_number(3);
+        o.set_write_buffer_size((options.write_buffer_mib * 1024 * 1024) as usize);
+        o.set_max_write_buffer_number(options.memtables as i32);
         o.set_target_file_size_base(match storage {
             StorageProfile::Hdd => 256 * 1024 * 1024,
             StorageProfile::Ssd => 128 * 1024 * 1024,
         });
         o.set_max_open_files(128);
-        o.set_max_background_jobs(match storage {
-            StorageProfile::Hdd => 1,
-            StorageProfile::Ssd => 2,
-        });
-        o.set_max_subcompactions(match storage {
-            StorageProfile::Hdd => 1,
-            StorageProfile::Ssd => 2,
-        });
+        o.set_max_background_jobs(options.rocks_jobs as i32);
+        o.set_max_subcompactions(options.rocks_subcompactions);
         o.set_compaction_readahead_size(match storage {
             StorageProfile::Hdd => 8 * 1024 * 1024,
             StorageProfile::Ssd => 2 * 1024 * 1024,
@@ -630,7 +711,9 @@ impl Index {
         o.set_advise_random_on_open(false);
         o.set_level_compaction_dynamic_level_bytes(true);
         let mut block = rocksdb::BlockBasedOptions::default();
-        block.set_block_cache(&rocksdb::Cache::new_lru_cache(512 * 1024 * 1024));
+        block.set_block_cache(&rocksdb::Cache::new_lru_cache(
+            (options.block_cache_mib * 1024 * 1024) as usize,
+        ));
         block.set_bloom_filter(10.0, true);
         block.set_block_restart_interval(32);
         block.set_cache_index_and_filter_blocks(true);
@@ -660,6 +743,10 @@ impl Index {
             storage,
             tip_cache: std::sync::Mutex::new(None),
             txnum_index: std::sync::RwLock::new(Vec::new()),
+            options,
+            bulk: std::sync::atomic::AtomicBool::new(false),
+            durable_tip: std::sync::Mutex::new(None),
+            stats: std::sync::RwLock::new(IndexStats::default()),
         })
         .and_then(|index| {
             let loaded = load_txnum_index(&index.db, index.tip()?)?;
@@ -667,6 +754,10 @@ impl Index {
                 .txnum_index
                 .write()
                 .map_err(|_| anyhow::anyhow!("txnum index poisoned"))? = loaded;
+            *index
+                .durable_tip
+                .lock()
+                .map_err(|_| anyhow::anyhow!("durable tip poisoned"))? = index.tip()?;
             Ok(index)
         })
     }
@@ -741,6 +832,77 @@ impl Index {
         }
         anyhow::bail!("funding transaction not indexed")
     }
+    pub fn set_bulk(&self, bulk: bool) -> Result<()> {
+        if self.bulk.load(std::sync::atomic::Ordering::Relaxed) == bulk {
+            return Ok(());
+        }
+        if bulk {
+            self.db
+                .set_options(&[("disable_auto_compactions", "true")])?;
+            self.bulk.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.db.flush()?;
+            self.db
+                .set_options(&[("disable_auto_compactions", "false")])?;
+            self.bulk.store(false, std::sync::atomic::Ordering::Relaxed);
+            let tip = self.tip()?;
+            *self
+                .durable_tip
+                .lock()
+                .map_err(|_| anyhow::anyhow!("durable tip poisoned"))? = tip;
+        }
+        if let Ok(mut stats) = self.stats.write() {
+            stats.bulk = bulk;
+            stats.durable_height = self.durable_tip()?;
+        }
+        Ok(())
+    }
+    pub fn durable_tip(&self) -> Result<Option<u32>> {
+        if self.bulk.load(std::sync::atomic::Ordering::Relaxed) {
+            Ok(*self
+                .durable_tip
+                .lock()
+                .map_err(|_| anyhow::anyhow!("durable tip poisoned"))?)
+        } else {
+            self.tip()
+        }
+    }
+    pub fn flush(&self) -> Result<()> {
+        self.db.flush()?;
+        let tip = self.tip()?;
+        *self
+            .durable_tip
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable tip poisoned"))? = tip;
+        if let Ok(mut stats) = self.stats.write() {
+            stats.durable_height = tip;
+        }
+        Ok(())
+    }
+    pub fn stats(&self) -> IndexStats {
+        self.stats.read().map(|s| *s).unwrap_or_default()
+    }
+    pub fn options(&self) -> IndexOptions {
+        self.options
+    }
+    fn record_stats(&self, blocks: u32, elapsed: std::time::Duration, mib: f64) {
+        if let Ok(mut stats) = self.stats.write() {
+            stats.last_batch_blocks = blocks;
+            stats.last_batch_millis = elapsed.as_millis() as u64;
+            stats.blocks_per_second = if elapsed.as_secs_f64() > 0.0 {
+                f64::from(blocks) / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            stats.mib_per_second = if elapsed.as_secs_f64() > 0.0 {
+                mib / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            stats.bulk = self.bulk.load(std::sync::atomic::Ordering::Relaxed);
+            stats.durable_height = self.durable_tip().ok().flatten();
+        }
+    }
     pub fn tip(&self) -> Result<Option<u32>> {
         self.db
             .get(b"tip")?
@@ -777,47 +939,35 @@ impl Index {
         Ok(deserialize(&self.block_meta(h)?[..80])?)
     }
     pub fn commit(&self, h: u32, block: &Block) -> Result<()> {
-        self.commit_with_sync(h, block, true, true, None, &mut CommitTimings::default())
+        let mut overlay = std::collections::HashMap::new();
+        self.commit_with_sync(
+            h,
+            block,
+            true,
+            true,
+            None,
+            &mut overlay,
+            &mut CommitTimings::default(),
+        )
     }
-    fn commit_with_sync(
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_block(
         &self,
         h: u32,
         block: &Block,
-        durable: bool,
         verify: bool,
         spent: Option<&[Vec<SpentOut>]>,
+        first_txnum: u32,
+        old_tip: Option<u32>,
+        overlay: &mut std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
         timings: &mut CommitTimings,
-    ) -> Result<()> {
+    ) -> Result<PreparedBlock> {
         let started = std::time::Instant::now();
         if verify {
             crate::net::verify_at(block, block.block_hash(), self.network, h)?;
         }
         timings.verify += started.elapsed();
         let started = std::time::Instant::now();
-        let mut cached = self
-            .tip_cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("tip cache poisoned"))?;
-        let old_tip = match *cached {
-            Some((t, hash)) => Some((t, hash)),
-            None => match self.tip()? {
-                Some(t) => Some((t, self.header(t)?.block_hash())),
-                None => None,
-            },
-        };
-        match old_tip {
-            Some((t, tip_hash)) => ensure!(
-                h == t + 1 && block.header.prev_blockhash == tip_hash,
-                "chain discontinuity"
-            ),
-            None => ensure!(
-                h == 0
-                    && block.block_hash()
-                        == bitcoin::blockdata::constants::genesis_block(self.network).block_hash(),
-                "wrong genesis"
-            ),
-        }
-        let first_txnum = self.next_txnum(h)?;
         let tx_count = block.txdata.len() as u32;
         let mut delta: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         let mut preimages: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
@@ -829,19 +979,25 @@ impl Index {
         remember(
             &mut preimages,
             b"tip",
-            old_tip.map(|(t, _)| t.to_be_bytes().to_vec()),
+            old_tip.map(|t| t.to_be_bytes().to_vec()),
         );
         let mut meta = serialize(&block.header);
         let duplicate_check = match self.network {
             Network::Bitcoin => h < bip34_height(self.network),
-            _ => true,
+            Network::Testnet => h < bip34_height(self.network),
+            // Regtest fixtures may deliberately re-mine identical coinbases;
+            // those tests use the single-block commit path with an overlay.
+            Network::Regtest => true,
+            _ => false,
         };
-        let mut positions = Vec::with_capacity(block.txdata.len());
+        let mut positions = Vec::new();
         let mut offset = 80 + varint_len(tx_count) as u32;
         for (pos, tx) in block.txdata.iter().enumerate() {
-            let size = serialize(tx).len() as u32;
-            positions.push((offset, size));
-            offset = offset.checked_add(size).context("block size overflow")?;
+            if self.options.txpos {
+                let size = serialize(tx).len() as u32;
+                positions.push((offset, size));
+                offset = offset.checked_add(size).context("block size overflow")?;
+            }
             let txid = tx.compute_txid();
             let txnum = first_txnum + pos as u32;
             meta.extend(txid.as_byte_array());
@@ -853,7 +1009,7 @@ impl Index {
             if !tx.is_coinbase() {
                 for (input_index, input) in tx.input.iter().enumerate() {
                     let ck = key(b'C', &serialize(&input.previous_output));
-                    let (script, value, new_in_block) = if let Some(spent) = spent_tx {
+                    let (script, value, in_same_block) = if let Some(spent) = spent_tx {
                         let spent = spent
                             .get(input_index)
                             .context("spenttxouts missing input")?;
@@ -873,28 +1029,39 @@ impl Index {
                                 )
                             }
                             Some(None) => anyhow::bail!("prevout spent twice in block"),
-                            None => {
-                                let v = self.db.get(&ck)?.context("missing prevout")?;
-                                ensure!(v.len() == 32, "corrupt coin");
-                                remember(&mut preimages, &ck, Some(v.clone()));
-                                (
-                                    v[..SCRIPT_HASH_LEN].try_into()?,
-                                    u64::from_le_bytes(v[SCRIPT_HASH_LEN..].try_into()?),
-                                    false,
-                                )
-                            }
+                            None => match overlay.get(&ck) {
+                                Some(Some(v)) => {
+                                    ensure!(v.len() == 32, "corrupt coin");
+                                    (
+                                        v[..SCRIPT_HASH_LEN].try_into()?,
+                                        u64::from_le_bytes(v[SCRIPT_HASH_LEN..].try_into()?),
+                                        false,
+                                    )
+                                }
+                                Some(None) => anyhow::bail!("prevout spent twice in batch"),
+                                None => {
+                                    let v = self.db.get(&ck)?.context("missing prevout")?;
+                                    ensure!(v.len() == 32, "corrupt coin");
+                                    remember(&mut preimages, &ck, Some(v.clone()));
+                                    (
+                                        v[..SCRIPT_HASH_LEN].try_into()?,
+                                        u64::from_le_bytes(v[SCRIPT_HASH_LEN..].try_into()?),
+                                        false,
+                                    )
+                                }
+                            },
                         }
                     };
                     scripts.insert(script);
                     let mut coin = script.to_vec();
                     coin.extend(value.to_le_bytes());
                     let sk = spent_key(&script, &input.previous_output);
-                    if new_in_block || delta.contains_key(&sk) {
+                    if in_same_block || delta.contains_key(&sk) {
                         remember(&mut preimages, &sk, None);
                     } else {
                         remember(&mut preimages, &sk, Some(spent_marker(value)));
                     }
-                    if new_in_block {
+                    if in_same_block {
                         remember(&mut preimages, &ck, None);
                     } else if !preimages.contains_key(&ck) {
                         remember(&mut preimages, &ck, Some(coin));
@@ -912,19 +1079,25 @@ impl Index {
                 {
                     continue;
                 }
-                let ck = key(b'C', &serialize(&bitcoin::OutPoint::new(txid, vout as u32)));
+                let outpoint = bitcoin::OutPoint::new(txid, vout as u32);
+                let ck = key(b'C', &serialize(&outpoint));
                 let mut previous = None;
                 if duplicate_check && !delta.contains_key(&ck) {
-                    let old = self.db.get(&ck)?;
-                    remember(&mut preimages, &ck, old.clone());
-                    previous = old;
+                    if let Some(old) = overlay.get(&ck).cloned().flatten() {
+                        remember(&mut preimages, &ck, Some(old.clone()));
+                        previous = Some(old);
+                    } else {
+                        let old = self.db.get(&ck)?;
+                        remember(&mut preimages, &ck, old.clone());
+                        previous = old;
+                    }
                 } else if !preimages.contains_key(&ck) {
                     remember(&mut preimages, &ck, None);
                 }
                 if let Some(old) = previous {
                     ensure!(old.len() == 32, "corrupt previous coin");
                     let old_script: ScriptHash = old[..SCRIPT_HASH_LEN].try_into()?;
-                    let old_s = spent_key(&old_script, &bitcoin::OutPoint::new(txid, vout as u32));
+                    let old_s = spent_key(&old_script, &outpoint);
                     let old_s_value = self.db.get(&old_s)?;
                     remember(&mut preimages, &old_s, old_s_value);
                     delta.insert(old_s, None);
@@ -932,7 +1105,7 @@ impl Index {
                 let mut coin = script.to_vec();
                 coin.extend(output.value.to_sat().to_le_bytes());
                 delta.insert(ck, Some(coin));
-                let sk = spent_key(&script, &bitcoin::OutPoint::new(txid, vout as u32));
+                let sk = spent_key(&script, &outpoint);
                 let mut s_value = h.to_be_bytes().to_vec();
                 s_value.extend(output.value.to_sat().to_le_bytes());
                 delta.insert(sk, Some(s_value));
@@ -949,17 +1122,27 @@ impl Index {
         let mut n = first_txnum.to_be_bytes().to_vec();
         n.extend(tx_count.to_be_bytes());
         delta.insert(height_key(b'N', h), Some(n));
-        for (chunk_index, chunk) in positions.chunks(64).enumerate() {
-            let last_txnum = first_txnum + (chunk_index * 64 + chunk.len() - 1) as u32;
-            let mut pk = vec![b'P'];
-            pk.extend(last_txnum.to_be_bytes());
-            delta.insert(pk, Some(encode_txpos(chunk)));
+        if self.options.txpos {
+            for (chunk_index, chunk) in positions.chunks(64).enumerate() {
+                let last_txnum = first_txnum + (chunk_index * 64 + chunk.len() - 1) as u32;
+                let mut pk = vec![b'P'];
+                pk.extend(last_txnum.to_be_bytes());
+                delta.insert(pk, Some(encode_txpos(chunk)));
+            }
         }
         delta.insert(b"tip".to_vec(), Some(h.to_be_bytes().to_vec()));
+        for (k, v) in &delta {
+            if k.first() == Some(&b'C') {
+                overlay.insert(k.clone(), v.clone());
+            }
+        }
         timings.prepare += started.elapsed();
         let started = std::time::Instant::now();
         let mut undo = Vec::new();
         for k in delta.keys() {
+            if self.options.fast_sync {
+                continue;
+            }
             undo.extend((k.len() as u32).to_le_bytes());
             undo.extend(k);
             let previous = preimages.get(k).cloned().flatten();
@@ -975,34 +1158,103 @@ impl Index {
             }
         }
         timings.undo += started.elapsed();
+        Ok(PreparedBlock {
+            height: h,
+            hash: block.block_hash(),
+            delta,
+            undo,
+            meta: TxNumMeta {
+                first: first_txnum,
+                count: tx_count,
+            },
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn commit_with_sync(
+        &self,
+        h: u32,
+        block: &Block,
+        durable: bool,
+        verify: bool,
+        spent: Option<&[Vec<SpentOut>]>,
+        overlay: &mut std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
+        timings: &mut CommitTimings,
+    ) -> Result<()> {
+        let old_tip = self.tip()?;
+        match old_tip {
+            Some(t) => ensure!(
+                h == t + 1 && block.header.prev_blockhash == self.header(t)?.block_hash(),
+                "chain discontinuity"
+            ),
+            None => ensure!(
+                h == 0
+                    && block.block_hash()
+                        == bitcoin::blockdata::constants::genesis_block(self.network).block_hash(),
+                "wrong genesis"
+            ),
+        }
+        let first_txnum = self.next_txnum(h)?;
+        let prepared = self.prepare_block(
+            h,
+            block,
+            verify,
+            spent,
+            first_txnum,
+            old_tip,
+            overlay,
+            timings,
+        )?;
+        self.apply_prepared(&[prepared], durable, timings)
+    }
+    fn apply_prepared(
+        &self,
+        prepared: &[PreparedBlock],
+        durable: bool,
+        timings: &mut CommitTimings,
+    ) -> Result<()> {
+        ensure!(!prepared.is_empty(), "empty prepared batch");
         let started = std::time::Instant::now();
         let mut batch = WriteBatch::default();
-        for (k, v) in delta {
-            match v {
-                Some(v) => batch.put(k, v),
-                None => batch.delete(k),
+        for block in prepared {
+            for (k, v) in &block.delta {
+                match v {
+                    Some(v) => batch.put(k, v),
+                    None => batch.delete(k),
+                }
+            }
+            if !self.options.fast_sync {
+                batch.put(height_key(b'U', block.height), &block.undo);
+                if block.height >= WINDOW {
+                    batch.delete(height_key(b'U', block.height - WINDOW));
+                }
             }
         }
-        batch.put(height_key(b'U', h), undo);
-        if h >= WINDOW {
-            batch.delete(height_key(b'U', h - WINDOW));
-        }
         let mut options = write_options();
-        options.set_sync(durable);
+        if self.bulk.load(std::sync::atomic::Ordering::Relaxed) {
+            options.disable_wal(true);
+            options.set_sync(false);
+        } else {
+            options.set_sync(durable);
+        }
         self.db.write_opt(batch, &options)?;
         {
             let mut index = self
                 .txnum_index
                 .write()
                 .map_err(|_| anyhow::anyhow!("txnum index poisoned"))?;
-            ensure!(index.len() == h as usize, "txnum index height mismatch");
-            index.push(TxNumMeta {
-                first: first_txnum,
-                count: tx_count,
-            });
+            for block in prepared {
+                ensure!(
+                    index.len() == block.height as usize,
+                    "txnum index height mismatch"
+                );
+                index.push(block.meta);
+            }
         }
-        *cached = Some((h, block.block_hash()));
-        drop(cached);
+        if let Ok(mut cached) = self.tip_cache.lock() {
+            if let Some(last) = prepared.last() {
+                *cached = Some((last.height, last.hash));
+            }
+        }
         timings.write += started.elapsed();
         Ok(())
     }
@@ -1065,11 +1317,120 @@ impl Index {
         }
         Ok(())
     }
+    /// Reorg in fast-sync mode. Instead of reading per-key undo, re-read the
+    /// stale block + spenttxouts, delete the rows it created and restore the
+    /// UTXOs it consumed. Requires Core REST for the undo data.
+    pub fn rewind_reindex(&self, core: &Core) -> Result<()> {
+        let h = self.tip()?.context("empty index")?;
+        let meta = *self
+            .txnum_index
+            .read()
+            .map_err(|_| anyhow::anyhow!("txnum index poisoned"))?
+            .get(h as usize)
+            .context("txnum index missing height")?;
+        let block = self.block_source(core, h, true)?;
+        ensure!(
+            block.txdata.len() as u32 == meta.count,
+            "txnum count mismatch"
+        );
+        let rest = core.rest().context("fast-sync reorg requires Core REST")?;
+        let bytes = rest.spent_txouts(block.block_hash())?;
+        let spent = parse_spent(&block, &bytes)?;
+        let mut batch = WriteBatch::default();
+        for (pos, tx) in block.txdata.iter().enumerate() {
+            let txid = tx.compute_txid();
+            let txnum = meta.first + pos as u32;
+            let mut tk = key(b'T', &txid.as_byte_array()[..8]);
+            tk.extend(txnum.to_be_bytes());
+            batch.delete(tk);
+            let mut scripts = std::collections::BTreeSet::new();
+            if !tx.is_coinbase() {
+                for (input_index, input) in tx.input.iter().enumerate() {
+                    let spent = spent
+                        .get(pos)
+                        .and_then(|s| s.get(input_index))
+                        .context("spenttxouts missing reorg input")?;
+                    scripts.insert(spent.script);
+                    let funding = self.funding_height(input.previous_output.txid)?;
+                    if funding < h {
+                        let mut ck = key(b'C', &serialize(&input.previous_output));
+                        let mut coin = spent.script.to_vec();
+                        coin.extend(spent.value.to_le_bytes());
+                        batch.put(&ck, &coin);
+                        ck = spent_key(&spent.script, &input.previous_output);
+                        let mut s_value = funding.to_be_bytes().to_vec();
+                        s_value.extend(spent.value.to_le_bytes());
+                        batch.put(ck, s_value);
+                    }
+                }
+            }
+            for (vout, output) in tx.output.iter().enumerate() {
+                let script = script_hash(output.script_pubkey.as_bytes());
+                scripts.insert(script);
+                if h == 0
+                    || output.script_pubkey.is_op_return()
+                    || output.script_pubkey.len() > 10_000
+                {
+                    continue;
+                }
+                let outpoint = bitcoin::OutPoint::new(txid, vout as u32);
+                batch.delete(key(b'C', &serialize(&outpoint)));
+                batch.delete(spent_key(&script, &outpoint));
+            }
+            if h > 0 {
+                for script in scripts {
+                    let mut hk = key(b'H', &script);
+                    hk.extend(txnum.to_be_bytes());
+                    batch.delete(hk);
+                }
+            }
+        }
+        batch.delete(height_key(b'B', h));
+        batch.delete(height_key(b'N', h));
+        batch.delete(height_key(b'U', h));
+        batch.put(b"tip", (h - 1).to_be_bytes());
+        let p_iter = self.db.iterator(IteratorMode::From(
+            &key(b'P', &meta.first.to_be_bytes()),
+            Direction::Forward,
+        ));
+        for row in p_iter {
+            let (k, _) = row?;
+            if !k.starts_with(b"P") {
+                break;
+            }
+            let last = u32::from_be_bytes(k[1..5].try_into()?);
+            if last >= meta.first + meta.count {
+                break;
+            }
+            if last >= meta.first {
+                batch.delete(k);
+            }
+        }
+        self.db.write_opt(batch, &write_options())?;
+        if let Ok(mut index) = self.txnum_index.write() {
+            ensure!(index.len() == h as usize + 1, "txnum index height mismatch");
+            index.truncate(h as usize);
+        }
+        if let Ok(mut cached) = self.tip_cache.lock() {
+            *cached = h
+                .checked_sub(1)
+                .map(|previous| self.header(previous).map(|h| (previous, h.block_hash())))
+                .transpose()?;
+        }
+        *self
+            .durable_tip
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable tip poisoned"))? = h.checked_sub(1);
+        Ok(())
+    }
     pub fn sync(&self, core: &Core) -> Result<()> {
         loop {
             let before = self.tip()?;
             self.sync_batch(core, 512)?;
             if self.tip()? == before {
+                if self.options.fast_sync {
+                    self.set_bulk(false)?;
+                }
                 return Ok(());
             }
         }
@@ -1107,14 +1468,25 @@ impl Index {
             ancestor = h.checked_sub(1);
         }
         while self.tip()? != ancestor {
-            self.rewind_one()?;
+            let h = self.tip()?.context("empty index")?;
+            if self.options.fast_sync || self.db.get(height_key(b'U', h))?.is_none() {
+                self.rewind_reindex(core)?;
+            } else {
+                self.rewind_one()?;
+            }
         }
         let core_height = info["blocks"].as_u64().context("missing height")? as u32;
         let limit = limit.min(512);
         let start = self.tip()?.map_or(0, |h| h + 1);
         let end = core_height.min(start.saturating_add(limit.saturating_sub(1)));
         if start > end {
+            if self.options.fast_sync {
+                self.set_bulk(false)?;
+            }
             return Ok(());
+        }
+        if self.options.fast_sync {
+            self.set_bulk(true)?;
         }
         // Bounded two-worker fetch pipeline. Blocks may arrive out of order;
         // the single writer reorders them and remains the only DB writer.
@@ -1126,7 +1498,8 @@ impl Index {
             next += count;
         }
         ensure!(hashes.len() == (end - start + 1) as usize, "hash count");
-        let workers = if end - start >= 3 { 2 } else { 1 };
+        let workers = self.options.index_workers.max(1);
+        let mut total_bytes = 0usize;
         std::thread::scope(|scope| -> Result<()> {
             let (tx, rx) = std::sync::mpsc::sync_channel::<(
                 u32,
@@ -1156,14 +1529,30 @@ impl Index {
                                 "Core pruned required history: stop and recover missing blocks; never skip heights",
                             )?;
                             ensure!(block.block_hash() == hash, "RPC block hash mismatch");
-                            crate::net::verify_at(&block, hash, self.network, h)?;
-                            let spent = match core.rest() {
-                                Some(rest) => {
-                                    let bytes = rest.spent_txouts(hash)?;
-                                    Some(parse_spent(&block, &bytes)?)
-                                }
-                                None => None,
+                            let use_spent = match self.options.spent_mode {
+                                SpentMode::Always => true,
+                                SpentMode::Never => false,
+                                SpentMode::Auto => matches!(
+                                    self.network,
+                                    Network::Bitcoin | Network::Testnet
+                                ),
                             };
+                            let spent = if use_spent {
+                                match core.rest() {
+                                    Some(rest) => {
+                                        let bytes = rest.spent_txouts(hash)?;
+                                        Some(parse_spent(&block, &bytes)?)
+                                    }
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
+                            if !(self.options.verify_core == VerifyCore::Hash
+                                && core.rest().is_some())
+                            {
+                                crate::net::verify_at(&block, hash, self.network, h)?;
+                            }
                             Ok((block, spent))
                         })();
                         let failed = result.is_err();
@@ -1182,6 +1571,13 @@ impl Index {
             let result = (|| -> Result<()> {
                 let mut buffered = BTreeMap::new();
                 let mut expected = start;
+                let mut pending = Vec::new();
+                let mut overlay = std::collections::HashMap::new();
+                let mut next_txnum = self.next_txnum(start)?;
+                let mut previous_tip = self.tip()?;
+                let mut previous_hash = previous_tip
+                    .map(|height| self.header(height).map(|h| h.block_hash()))
+                    .transpose()?;
                 while expected <= end {
                     ensure!(
                         !cancel.load(std::sync::atomic::Ordering::Relaxed),
@@ -1193,18 +1589,59 @@ impl Index {
                     buffered.insert(h, block);
                     while let Some(block) = buffered.remove(&expected) {
                         let (block, spent) = block?;
-                        let writing = std::time::Instant::now();
-                        self.commit_with_sync(
+                        total_bytes = total_bytes.saturating_add(block.total_size());
+                        match previous_tip {
+                            Some(tip) => ensure!(
+                                expected == tip + 1
+                                    && Some(block.header.prev_blockhash) == previous_hash,
+                                "chain discontinuity"
+                            ),
+                            None => ensure!(
+                                expected == 0
+                                    && block.block_hash()
+                                        == bitcoin::blockdata::constants::genesis_block(
+                                            self.network
+                                        )
+                                        .block_hash(),
+                                "wrong genesis"
+                            ),
+                        }
+                        let prepared = self.prepare_block(
                             expected,
                             &block,
-                            expected == end || (expected - start + 1) % 64 == 0,
                             false,
                             spent.as_deref(),
+                            next_txnum,
+                            previous_tip,
+                            &mut overlay,
                             &mut timings,
                         )?;
-                        write_time += writing.elapsed();
+                        next_txnum = next_txnum
+                            .checked_add(block.txdata.len() as u32)
+                            .context("txnum overflow")?;
+                        previous_tip = Some(expected);
+                        previous_hash = Some(block.block_hash());
+                        pending.push(prepared);
+                        if pending.len() >= 32 {
+                            let writing = std::time::Instant::now();
+                            self.apply_prepared(&pending, expected == end, &mut timings)?;
+                            write_time += writing.elapsed();
+                            pending.clear();
+                            overlay.clear();
+                        }
+                        if self.options.fast_sync
+                            && (expected - start + 1) % 64 == 0
+                            && expected < end
+                        {
+                            self.flush()?;
+                        }
                         expected += 1;
                     }
+                }
+                if !pending.is_empty() {
+                    let writing = std::time::Instant::now();
+                    self.apply_prepared(&pending, true, &mut timings)?;
+                    write_time += writing.elapsed();
                 }
                 Ok(())
             })();
@@ -1215,6 +1652,7 @@ impl Index {
                     .map_err(|_| anyhow::anyhow!("block reader panicked"))?;
             }
             result?;
+            self.record_stats(end - start + 1, begun.elapsed(), 0.0);
             if start / 1000 != end / 1000 || start == 0 {
                 let completed = u64::from(end) + 1;
                 let total = u64::from(core_height) + 1;
@@ -1251,6 +1689,17 @@ impl Index {
                     timings.write.as_millis(),
                     crate::i18n::text("preimages reused", "preimágenes reutilizadas"),
                     timings.reused_preimages
+                );
+                let stats = self.stats();
+                eprintln!(
+                    "  {}: {:.1} | {}: {:.1} | {}: {:.1} MiB/s | bulk: {}",
+                    crate::i18n::text("blocks/s", "bloques/s"),
+                    stats.blocks_per_second,
+                    crate::i18n::text("batch ms", "lote ms"),
+                    stats.last_batch_millis,
+                    crate::i18n::text("throughput", "rendimiento"),
+                    stats.mib_per_second,
+                    stats.bulk
                 );
             }
             Ok(())
@@ -1720,6 +2169,265 @@ mod tests {
     }
 
     #[test]
+    fn fast_sync_reorg_reindexes_stale_block() -> Result<()> {
+        use crate::core::Core;
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
+            Transaction, TxIn, TxOut,
+        };
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let root = std::env::temp_dir().join(format!(
+            "el-reindex-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let options = IndexOptions {
+            fast_sync: true,
+            txpos: false,
+            ..IndexOptions::default()
+        };
+        let index = Index::open_with_options(&root.join("index"), Network::Regtest, options)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        index.commit(0, &genesis)?;
+        let genesis_out = OutPoint::new(genesis.txdata[0].compute_txid(), 0);
+        let genesis_script = genesis.txdata[0].output[0].script_pubkey.clone();
+        let new_script = ScriptBuf::from_bytes(vec![0x51]);
+        let spend = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: genesis_out,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_0000_0000),
+                script_pubkey: new_script.clone(),
+            }],
+        };
+        let coinbase = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![1, 2]),
+                sequence: Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::TWO,
+                prev_blockhash: genesis.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: genesis.header.time + 1,
+                bits: genesis.header.bits,
+                nonce: 0,
+            },
+            txdata: vec![coinbase, spend],
+        };
+        block.header.merkle_root = block.compute_merkle_root().expect("merkle");
+        let spent = vec![
+            Vec::new(),
+            vec![SpentOut {
+                script: script_hash(genesis_script.as_bytes()),
+                value: 50_0000_0000,
+            }],
+        ];
+        index.commit_with_sync(
+            1,
+            &block,
+            true,
+            true,
+            Some(&spent),
+            &mut std::collections::HashMap::new(),
+            &mut CommitTimings::default(),
+        )?;
+        std::fs::create_dir_all(&index.cache)?;
+        std::fs::write(
+            index.cache.join(format!("{}.blk", block.block_hash())),
+            serialize(&block),
+        )?;
+        let mut undo = Vec::new();
+        undo.push(2u8);
+        undo.push(0u8);
+        undo.push(1u8);
+        undo.extend(50_0000_0000u64.to_le_bytes());
+        undo.push(genesis_script.len() as u8);
+        undo.extend(genesis_script.as_bytes());
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let worker = std::thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte)?;
+                    request.push(byte[0]);
+                    ensure!(request.len() < 8192, "request too large");
+                }
+                let request = std::str::from_utf8(&request)?;
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .context("request path")?;
+                if path.ends_with("/rest/chaininfo.json") {
+                    let body = br#"{"chain":"regtest"}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )?;
+                    stream.write_all(body)?;
+                } else if path.contains("/rest/spenttxouts/") {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        undo.len()
+                    )?;
+                    stream.write_all(&undo)?;
+                } else {
+                    return Err(anyhow::anyhow!("unexpected REST path {path}"));
+                }
+            }
+            Ok(())
+        });
+        let cookie = root.join("cookie");
+        std::fs::write(&cookie, "user:pass")?;
+        let mut core = Core::new(format!("http://{address}"), cookie)?;
+        core.enable_rest()?;
+        index.rewind_reindex(&core)?;
+        assert_eq!(index.tip()?, Some(0));
+        let restored = index.unspent(&script_hash(genesis_script.as_bytes()))?;
+        assert_eq!(restored.as_array().expect("array").len(), 1);
+        assert!(index.db.get(key(b'C', &serialize(&genesis_out)))?.is_some());
+        worker.join().expect("mock REST")?;
+        drop(index);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn batched_and_single_commits_produce_identical_rows() -> Result<()> {
+        use bitcoin::{
+            absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
+            Transaction, TxIn, TxOut,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "el-batch-eq-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let options = IndexOptions {
+            txpos: false,
+            ..IndexOptions::default()
+        };
+        let single = Index::open_with_options(&root.join("single"), Network::Regtest, options)?;
+        let batched = Index::open_with_options(&root.join("batched"), Network::Regtest, options)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let mut blocks = vec![genesis.clone()];
+        let mut prev = genesis.clone();
+        let mut spendable = bitcoin::OutPoint::null();
+        for (i, script_byte) in [0x51u8, 0x53, 0x54].iter().enumerate() {
+            let coinbase = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes(vec![1, 2, i as u8]),
+                    sequence: Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x52, i as u8]),
+                }],
+            };
+            let mut txdata = vec![coinbase.clone()];
+            if i == 0 {
+                spendable = OutPoint::new(coinbase.compute_txid(), 0);
+            } else {
+                let spend = Transaction {
+                    version: Version::TWO,
+                    lock_time: LockTime::ZERO,
+                    input: vec![TxIn {
+                        previous_output: spendable,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: bitcoin::Witness::new(),
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(49_0000_0000 - i as u64),
+                        script_pubkey: ScriptBuf::from_bytes(vec![*script_byte]),
+                    }],
+                };
+                spendable = OutPoint::new(spend.compute_txid(), 0);
+                txdata.push(spend);
+            }
+            let mut block = bitcoin::Block {
+                header: bitcoin::block::Header {
+                    version: bitcoin::block::Version::TWO,
+                    prev_blockhash: prev.block_hash(),
+                    merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                    time: prev.header.time + 1,
+                    bits: prev.header.bits,
+                    nonce: i as u32,
+                },
+                txdata,
+            };
+            block.header.merkle_root = block.compute_merkle_root().expect("merkle");
+            prev = block.clone();
+            blocks.push(block);
+        }
+        for (h, block) in blocks.iter().enumerate() {
+            single.commit(h as u32, block)?;
+        }
+        let mut overlay = std::collections::HashMap::new();
+        let mut prepared = Vec::new();
+        let mut first_txnum = 0u32;
+        for (h, block) in blocks.iter().enumerate() {
+            prepared.push(batched.prepare_block(
+                h as u32,
+                block,
+                true,
+                None,
+                first_txnum,
+                h.checked_sub(1).map(|v| v as u32),
+                &mut overlay,
+                &mut CommitTimings::default(),
+            )?);
+            first_txnum += block.txdata.len() as u32;
+        }
+        batched.apply_prepared(&prepared, true, &mut CommitTimings::default())?;
+        let collect = |index: &Index| -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+            let mut rows = BTreeMap::new();
+            for row in index.db.iterator(IteratorMode::Start) {
+                let (k, v) = row?;
+                rows.insert(k.to_vec(), v.to_vec());
+            }
+            Ok(rows)
+        };
+        assert_eq!(collect(&single)?, collect(&batched)?);
+        drop(single);
+        drop(batched);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
     fn spent_txouts_avoid_prevout_reads_and_restore_on_rewind() -> Result<()> {
         use bitcoin::{
             absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
@@ -1793,6 +2501,7 @@ mod tests {
             true,
             true,
             Some(&spent),
+            &mut std::collections::HashMap::new(),
             &mut CommitTimings::default(),
         )?;
         assert_eq!(

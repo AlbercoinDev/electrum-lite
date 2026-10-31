@@ -93,7 +93,13 @@ pub fn dispatch(
             json!({"genesis_hash":bitcoin::blockdata::constants::genesis_block(index.network).block_hash().to_string(),"protocol_min":"1.4","protocol_max":"1.4","hash_function":"sha256","hosts":{}}),
         ),
         "server.peers.subscribe" => Ok(json!([])),
-        "server.health" => Ok(json!({"indexed_height":index.tip()?,"experimental":true})),
+        "server.health" => Ok(json!({
+            "indexed_height":index.tip()?,
+            "durable_height":index.durable_tip()?,
+            "index_rate":index.stats().blocks_per_second,
+            "bulk":index.stats().bulk,
+            "experimental":true
+        })),
         "blockchain.headers.subscribe" => header(index),
         "blockchain.block.header" => {
             ensure!(
@@ -574,7 +580,7 @@ pub fn serve(
                 && synced.elapsed() >= Duration::from_secs(1)
             {
                 ready = match index
-                    .sync_batch_with_cancel(&core, 512, &worker_stop)
+                    .sync_batch_with_cancel(&core, 64, &worker_stop)
                     .and_then(|()| {
                         let h = index.tip()?.context("empty index")?;
                         ensure!(
@@ -605,6 +611,9 @@ pub fn serve(
                         }
                     }) {
                     Ok(()) => {
+                        if index.options().fast_sync {
+                            index.set_bulk(false)?;
+                        }
                         if sync_warning.take().is_some() {
                             eprintln!(
                                 "{}",
@@ -676,7 +685,8 @@ pub fn serve(
                 } else {
                     Instant::now() - Duration::from_secs(1)
                 };
-                let state = json!({"pid":std::process::id(),"ready":ready,"indexed_height":index.tip()?,"network":index.network.to_string(),"transport":if index.fetcher.proxy.is_some(){"socks5"}else{"direct"},"mempool_transactions":mempool.raw.len(),"experimental":true});
+                let stats = index.stats();
+                let state = json!({"pid":std::process::id(),"ready":ready,"indexed_height":index.tip()?,"durable_height":index.durable_tip()?,"index_rate":stats.blocks_per_second,"bulk":stats.bulk,"last_batch_blocks":stats.last_batch_blocks,"mempool_transactions":mempool.raw.len(),"network":index.network.to_string(),"transport":if index.fetcher.proxy.is_some(){"socks5"}else{"direct"},"experimental":true});
                 *published
                     .lock()
                     .map_err(|_| anyhow::anyhow!("health publication poisoned"))? = state;
@@ -918,7 +928,7 @@ pub fn serve(
                         }
                         if method == "server.health" {
                             return Ok(
-                                json!({"pid":std::process::id(),"ready":ready,"indexed_height":index.tip()?,"network":index.network.to_string(),"transport":if index.fetcher.proxy.is_some(){"socks5"}else{"direct"},"mempool_transactions":mempool.raw.len(),"experimental":true}),
+                                json!({"pid":std::process::id(),"ready":ready,"indexed_height":index.tip()?,"durable_height":index.durable_tip()?,"index_rate":index.stats().blocks_per_second,"bulk":index.stats().bulk,"mempool_transactions":mempool.raw.len(),"network":index.network.to_string(),"transport":if index.fetcher.proxy.is_some(){"socks5"}else{"direct"},"experimental":true}),
                             );
                         }
                         ensure!(

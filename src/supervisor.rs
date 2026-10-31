@@ -39,7 +39,7 @@ fn available_bytes(path: &Path) -> Result<u64> {
 
 fn pause_needed(paused: bool, lag: u64, high: u32, low: u32, free: u64, minimum: u64) -> bool {
     if paused {
-        lag > u64::from(low) || free < minimum.saturating_add(512 * 1024 * 1024)
+        lag > u64::from(low) || free < minimum
     } else {
         lag >= u64::from(high) || free < minimum
     }
@@ -77,6 +77,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub p2p_port: u16,
     pub core_dbcache_mib: u32,
+    pub core_par: u32,
+    pub core_mempool_mib: u32,
     pub high: u32,
     pub low: u32,
     pub min_free_mib: u32,
@@ -476,13 +478,13 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             "-disablewallet=1",
             "-listenonion=0",
             "-discover=0",
-            "-maxmempool=50",
-            "-par=1",
             "-maxconnections=32",
             "-rpcworkqueue=64",
             "-rpcthreads=4",
         ])
         .arg(format!("-dbcache={}", c.core_dbcache_mib))
+        .arg(format!("-maxmempool={}", c.core_mempool_mib))
+        .arg(format!("-par={}", c.core_par))
         .arg(format!("-rpcport={}", rpc_address.port()))
         // Bind exactly the loopback address Lite will use. With the default
         // (127.0.0.1 and ::1), Core can keep running when only IPv4 is taken,
@@ -622,7 +624,9 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 }
             }
         }
-        let indexed = state["indexed_height"].as_u64();
+        let indexed = state["durable_height"]
+            .as_u64()
+            .or_else(|| state["indexed_height"].as_u64());
         // Core's automatic pruning must never overtake Lite's durable tip.
         if let (Some(pruneheight), Some(indexed)) = (info["pruneheight"].as_u64(), indexed) {
             // `pruneheight` is the lowest complete block Core still stores.
@@ -1150,6 +1154,8 @@ mod tests {
             listen: "127.0.0.1:50001".parse().expect("address"),
             p2p_port: 18444,
             core_dbcache_mib: 64,
+            core_par: 1,
+            core_mempool_mib: 50,
             high: 200,
             low: 20,
             min_free_mib: 2048,
@@ -1208,7 +1214,8 @@ mod tests {
         assert!(!pause_needed(false, 1999, 2000, 200, minimum, minimum));
         assert!(pause_needed(false, 2000, 2000, 200, minimum, minimum));
         assert!(pause_needed(false, 0, 2000, 200, minimum - 1, minimum));
-        assert!(pause_needed(true, 0, 2000, 200, minimum, minimum));
+        assert!(!pause_needed(true, 0, 2000, 200, minimum, minimum));
+        assert!(pause_needed(true, 0, 2000, 200, minimum - 1, minimum));
         assert!(pause_needed(
             true,
             201,
