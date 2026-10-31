@@ -141,6 +141,12 @@ Una compilación se efectuó mientras un smoke físico estaba en curso, por lo q
 ese resultado no se considera prueba íntegra de un único binario final. No se han
 inyectado las carreras de instantánea y backup de extremo a extremo.
 
+La investigación de poda con pares conectados está en
+`docs/p2p-pruning-investigation.md`. Un test RPC simulado adicional comprobó que,
+con P2P activo, la fase irreversible rechaza la operación antes de llamar a
+`pruneblockchain` y conserva la intención pendiente. No se ha implementado poda
+conectada ni se han relajado las comprobaciones existentes.
+
 Un regtest dedicado desechable arrancó con `--core-dbcache-mib 256`; se verificó
 en los argumentos del proceso Core `-dbcache=256` y se detuvo limpiamente. Este
 ajuste limita esa caché de Core, no la RAM total, y no es una medición de velocidad.

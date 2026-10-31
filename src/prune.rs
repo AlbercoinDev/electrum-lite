@@ -111,6 +111,104 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn active_p2p_is_rejected_before_irreversible_rpc() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "el-prune-active-network-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let index = Index::open(&root.join("index"), Network::Regtest)?;
+        let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
+        let hash = genesis.block_hash().to_string();
+        let mut meta = bitcoin::consensus::serialize(&genesis.header);
+        meta.extend(bitcoin::consensus::serialize(
+            &genesis.txdata[0].compute_txid(),
+        ));
+        index.db.put(crate::index::height_key(b'B', 1000), meta)?;
+        index.db.put(b"tip", 1000u32.to_be_bytes())?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let worker = std::thread::spawn(move || -> Result<Vec<String>> {
+            let mut methods = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte)?;
+                    headers.push(byte[0]);
+                    ensure!(headers.len() < 16384, "oversized request");
+                }
+                let headers = std::str::from_utf8(&headers)?;
+                let len: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then_some(value.trim())
+                    })
+                    .context("missing content length")?
+                    .parse()?;
+                let mut body = vec![0; len];
+                stream.read_exact(&mut body)?;
+                let request: Value = serde_json::from_slice(&body)?;
+                let method = request["method"].as_str().context("missing method")?;
+                let result = match method {
+                    "getblockchaininfo" => {
+                        json!({"pruned":true,"automatic_pruning":false,"blocks":1000,"bestblockhash":hash})
+                    }
+                    "getnetworkinfo" => json!({"networkactive":true}),
+                    "getrawmempool" => json!([]),
+                    "getbestblockhash" => json!(hash),
+                    _ => anyhow::bail!("unexpected RPC: {method}"),
+                };
+                methods.push(method.to_owned());
+                let response = json!({"id":1,"result":result,"error":null}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )?;
+            }
+            Ok(methods)
+        });
+        let cookie = root.join("cookie");
+        std::fs::write(&cookie, "user:password")?;
+        let core = Core::new(format!("http://{address}"), cookie)?;
+        let result = commit_verified_prune(
+            &index,
+            &core,
+            &root,
+            &root.join("audit"),
+            &root.join("backup"),
+            &AtomicBool::new(false),
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("network became active"));
+        assert_eq!(
+            worker.join().expect("mock RPC thread")?,
+            [
+                "getblockchaininfo",
+                "getnetworkinfo",
+                "getrawmempool",
+                "getbestblockhash"
+            ]
+        );
+        assert!(root.join("prune-pending").is_file());
+        assert!(!root.join("prune-complete-1000").exists());
+        drop(index);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn rpc_failure_preserves_durable_intent_before_prune() -> Result<()> {
         let root = std::env::temp_dir().join(format!(
             "el-prune-rpc-failure-{}-{}",
