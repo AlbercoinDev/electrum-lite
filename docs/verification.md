@@ -397,6 +397,86 @@ básico anterior no se sobrescribe. Son artefactos locales sin firma.
 Interoperabilidad GUI, IBD público sostenido, recuperación profunda, fuentes
 públicas sostenidas, tamaño mainnet, presupuestos RSS y cortes físicos de energía.
 La prueba física anterior es regtest; no acredita poda segura en mainnet ni
-co-sincronización sostenida en Signet/Testnet4. La poda mainnet sigue bloqueada.
+co-sincronización sostenida en Signet/Testnet4. La poda mainnet coordinada está
+implementada, pero no se ha probado en un Core mainnet real.
 La evidencia acredita una **versión para probar**, no la finalización de todas
 las optimizaciones ni aptitud para fondos reales.
+
+## Inventario del entorno revisado (31 de octubre de 2026)
+
+Este inventario describe el entorno local de revisión, no requisitos universales
+ni una prueba funcional completa:
+
+- Python 3.13.5 disponible; los 11 scripts Python pasaron análisis sintáctico
+  (`ast.parse`). El smoke regtest offline también pasó con Core 31.0.
+- pytest 9.0.3 está instalado, pero el proyecto no lo usa como runner.
+- Bitcoin Core 32.1 está en `~/.local/bin`; Core 31.0 también está disponible
+  explícitamente en `/tmp/opencode/bitcoin-31.0/bin`. La evidencia histórica de
+  esta página indica la versión concreta usada por cada prueba; la disponibilidad
+  de Core 32.1 no implica que los smokes se hayan validado con ella.
+- Tor 0.4.9.15 está disponible en `/tmp/opencode/tor-runtime/usr/bin/tor`, fuera
+  de `PATH`.
+- Rust 1.99.1 está instalado bajo `/tmp/opencode/electrum-rustup`, aunque no está
+  en `PATH`. Cargo y `rustc` reportaron versión 1.99.1. RocksDB requirió el
+  libclang extraído en `/tmp/opencode/clang` y argumentos de resource-dir; los
+  comandos reproducibles están en [`testing.md`](testing.md).
+- Electrum GUI, Sparrow, ShellCheck, shfmt, Ruff y Mypy no se encontraron en
+  `PATH`. La prueba TCP existente no acredita interoperabilidad con GUI.
+- Los hashes del binario de `~/.local/bin/electrum-lite` y del build local no
+  coinciden; no se trataron como la misma compilación.
+
+En esta revisión se repitieron las comprobaciones sobre el árbol de trabajo
+actual (incluidos cambios locales no confirmados):
+
+```text
+cargo fmt --check                                      OK
+cargo clippy --locked --all-targets -- -D warnings      OK
+cargo test --locked                                    30 passed; 0 failed
+cargo build --release --locked                         OK
+scripts/smoke_regtest.py con Core 31.0                  PASS
+scripts/tor_smoke.py con Core 31.0 y Tor 0.4.9.15       PASS
+```
+
+El smoke creó su propio regtest desechable offline, verificó protocolo, reorg,
+backup/auditoría y recuperación P2P simulada; no tocó nodos existentes ni hizo
+poda física. El target externo preexistente bajo `/tmp/opencode` era propiedad
+de root, así que se usó el target local del repositorio.
+El smoke Tor verificó control privado y fallo cerrado con el proceso Tor local;
+su caso directo se limitó al peer regtest local. No se hizo bootstrap público.
+
+La matriz de scripts, comandos y límites de ejecución está en
+[`testing.md`](testing.md). La disponibilidad de una herramienta no equivale a
+haber ejecutado o aprobado una prueba.
+
+## Revisión `thin-v3-txnum` (release `thin-v3-txnum-2026-10-31`)
+
+Se implementaron el motor local, el esquema de 24 B, la reconstrucción por
+ventana ciega, el perfil HDD/4 GB y la coordinación de poda mainnet. Evidencia
+ejecutada en este árbol de trabajo:
+
+```text
+cargo fmt --check                                      OK
+cargo clippy --locked --all-targets -- -D warnings      OK
+cargo test --locked                                    34 passed; 0 failed
+cargo build --release --locked                         OK
+scripts/smoke_regtest.py con Core 31.0                  PASS
+scripts/managed_prune_smoke.py con Core 31.0            PASS
+```
+
+El smoke básico verificó sincronización, mempool/RBF, consultas, UTXO, Merkle,
+reorg, reinicio, backup, auditoría semántica y recuperación P2P. El smoke
+gestionado verificó arranque/parada de Core, backpressure, auditoría/backup/poda
+en línea, retención, poda física durante IBD, recuperación de una transacción
+antigua tras la poda y una segunda poda incremental sin hacer crecer la caché.
+
+La prueba unitaria `spent_txouts_avoid_prevout_reads_and_restore_on_rewind`
+borra la fila `C` del prevout antes del commit, indexa un gasto usando
+`SpentOut`, comprueba `tx_position` y revierte el bloque: el UTXO se restaura
+desde el marcador de undo sin haber leído `C`.
+
+No se dispone de un servidor físico con 4 GB, 2 vCPU y HDD 2,5" 5400 rpm, ni de
+un Core mainnet sincronizado. El perfil `--storage hdd`, los límites de memoria y
+la ventana pública están implementados y compilados, pero **no se ha medido** su
+rendimiento en ese hardware ni una sincronización mainnet completa. Tampoco se
+probó una consulta pública real por Tor/onion ni un endpoint Esplora externo; la
+ventana se validó contra un servidor HTTP local que sirve bloques regtest reales.

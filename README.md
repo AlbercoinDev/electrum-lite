@@ -1,14 +1,16 @@
 # Electrum Lite — servidor thin experimental
 
-**Versión `0.0.1-beta.1`.** Servidor Electrum en Rust construido desde cero:
+**Versión `0.0.1-beta.1`.** Release experimental actual: **`thin-v3-txnum-2026-10-31`**.
+Servidor Electrum en Rust construido desde cero:
 Core valida, RocksDB conserva índices y los bloques históricos ausentes se obtienen
-completos por P2P. Tor opcional. Sin APIs públicas ni servidores Electrum externos.
+completos por P2P. Tor opcional. Para bloques que Core ya podó, Lite pide el bloque crudo a Esplora/onion: nunca envía scripthashes ni TXID.
 
 **Solo pruebas iniciales, sin fondos reales.** No está demostrada la velocidad de
 IBD ni la capacidad mainnet. El supervisor de Core y la poda coordinada son experimentales.
-No usar `prune=550` automático: usar un **Core nuevo dedicado con `prune=1`**.
+Usar un **Core nuevo dedicado con `prune=1`**; en modo gestionado Lite lo arranca y evita que pode por delante del índice.
 No se ha probado una GUI de cartera; el smoke comprueba el protocolo TCP.
 Diseño, estado y límites: [docs/project-status.md](docs/project-status.md).
+Operación en 4 GB/HDD y privacidad: [docs/operations.md](docs/operations.md).
 Evidencia y alcance de las pruebas: [docs/verification.md](docs/verification.md).
 
 Los mensajes de progreso y supervisor detectan `LC_ALL`, `LC_MESSAGES` y `LANG`,
@@ -50,6 +52,41 @@ distribuciones antiguas. Core se instala en el prefijo de usuario de la sección
 export PATH="$HOME/.local/bin:$PATH"
 electrum-lite --version
 ```
+
+### Actualizar desde `thin-v1` o `thin-v2`
+
+La release actual usa **`thin-v3-txnum`** (TxNum/txpos y commit con
+`/rest/spenttxouts`). **No hay migración in-place**: un índice antiguo se rechaza
+con `wrong network or database format`. No borres el índice anterior; muévelo a
+otra ruta y conserva el binario antiguo junto a él.
+
+Si el servicio es gestionado y el Core anterior está podado:
+
+```sh
+sudo systemctl stop electrum-lite
+sudo install -d -o electrum-lite -g electrum-lite /srv/electrum-lite-nuevo /srv/electrum-lite-core-nuevo
+# Instala el binario nuevo con el instalador o con install.sh.
+sudo mv /srv/electrum-lite /srv/electrum-lite.thin-v2
+sudo mv /srv/electrum-lite-core /srv/electrum-lite-core.thin-v2
+sudo mv /srv/electrum-lite-nuevo /srv/electrum-lite
+sudo mv /srv/electrum-lite-core-nuevo /srv/electrum-lite-core
+sudo systemctl start electrum-lite
+```
+
+Ajusta las rutas a tu unidad systemd. El Core nuevo empieza desde génesis y Lite
+indexa en paralelo; un Core podado no puede reconstruir el índice antiguo. Si el
+Core anterior **no está podado y conserva todos los bloques**, puedes reutilizar su
+`core-dir`; Lite volverá a leer los bloques locales. Si no, la actualización exige
+una sincronización completa.
+
+En una instalación manual, usa un `--data-dir` NUEVO y un `--core-dir` NUEVO (o un
+Core no podado con todos los bloques). Comprueba después:
+
+```sh
+target/release/electrum-lite --data-dir /srv/electrum-lite --core-cookie ... health
+```
+
+La respuesta debe indicar `"engine":"thin-v3-txnum"`.
 
 ### Alternativa: compilar desde fuentes
 
@@ -309,9 +346,11 @@ La disponibilidad de esas fuentes no está garantizada.
 Los bloques recuperados solo para auditar se verifican y descartan en memoria:
 no llenan la caché persistente de consultas de cartera.
 
-Sin `--auto-prune` solo supervisa y controla el retraso: Core sigue acumulando
-bloques hasta que realices mantenimiento. La poda automática **mainnet está
-bloqueada**, sin excepción insegura. `prune-pending` bloquea su arranque automático.
+Sin `--auto-prune` solo supervisa y controla el retraso. En modo gestionado,
+Core puede podar mainnet con `prune=1`; Lite comprueba `pruneheight` y pausa la red
+si Core adelanta al índice. La poda manual mainnet exige `--confirm-pruned-mainnet`.
+Sin backup externo, la recuperación es un re-IBD completo. `prune-pending` bloquea
+el arranque automático.
 Los eventos están en `RED/supervisor/events.jsonl`, sin consultas de cartera.
 
 ### Si el arranque falla por un archivo inexistente
@@ -332,6 +371,24 @@ sección 2. Si el ejecutable funciona, revisa las rutas configuradas y, si exist
 `RED/supervisor/events.jsonl`. Antes de compartir diagnósticos, revisa si contienen
 rutas o direcciones privadas. No borres ni recrees los directorios de Core o Lite
 para intentar resolver el error, ni elimines `prune-pending`.
+
+### Si el arranque gestionado se queda esperando
+
+`managed-serve` solo usa loopback. Antes de arrancar comprueba que el puerto RPC
+elegido y el P2P estén libres:
+
+```sh
+ss -ltnp '( sport = :48332 or sport = :48333 )'
+```
+
+Si el puerto RPC está ocupado, Core no puede autenticar a Lite y el arranque no
+termina. Lite fija `-rpcbind` y `-rpcallowip` al loopback exacto de `--core-rpc`;
+si el puerto está ocupado, Core termina durante el arranque y Lite muestra el
+final de `RED/supervisor/core.log` con el error de bind. No esperes a que agote
+el tiempo: revisa ese archivo y el proceso que ocupa el puerto. Si es un Core
+dedicado que quedó vivo tras un `SIGKILL` del gestor, detén **solo ese** proceso;
+si es otro nodo, no lo toques: cambia `--core-rpc`, `--core-p2p-port` y
+`--listen` a puertos libres. No borres los directorios de datos para resolverlo.
 
 ### Con un Core arrancado por ti
 
@@ -436,20 +493,22 @@ electrum-lite --network regtest --data-dir /ruta/lite \
 El checkpoint es el directorio del índice, no el data root. Para restaurarlo,
 con Lite detenido, copia a **OTRA** raíz: `/otra-raiz/regtest/index`, conservando
 fuente y backup. Sirve con `--data-dir /otra-raiz`. Nunca mezcles generaciones ni
-abras thin-v1 con un binario incompatible. Conserva este binario con el backup.
+abras thin-v3-txnum con un binario incompatible. Conserva este binario con el backup.
 Los hardlinks de un checkpoint no protegen frente a fallo del disco: copia fuera.
 
-La poda es manual, experimental y **bloqueada en mainnet**. Solo un Core de pruebas
-dedicado, `prune=1`, P2P explícitamente apagado, mempool vacía, sin otros escritores.
+La poda manual con auditoría completa es experimental. Solo un Core dedicado,
+`prune=1`, P2P explícitamente apagado, mempool vacía y sin otros escritores.
 Necesita `--confirm-prune`, `--audit-dir` NUEVO para un replay semántico completo
-y `--backup-dir` NUEVO; nunca usar en datos valiosos. Auditoría/backup pueden
-necesitar otro índice completo y, tras una poda previa, descargas históricas.
+y `--backup-dir` NUEVO; en mainnet exige además `--confirm-pruned-mainnet`.
+Auditoría/backup pueden necesitar otro índice completo y, tras una poda previa,
+descargas históricas; sin backup externo no hay recuperación local.
 Si hay `prune-pending`, una operación anterior quedó incierta: conservar todo y
 revisar/recuperar antes de continuar. No borrar el marcador para eludir el bloqueo.
 
 ## Límites importantes
 
-- Un fsync por lote de hasta 64 bloques y mempool reconstruida: rendimiento aún por mejorar.
+- Índice `thin-v3-txnum` (hash de script de 24 B, TxNum y txpos), lotes de hasta 512 bloques, pipeline de dos lectores, REST binario local y commit con `/rest/spenttxouts` sin leer prevouts. Sin backup integrado obligatorio: la recuperación es re-IBD.
+- Reconstrucción histórica por ventana de 16 bloques, solo hashes de bloque, Tor/onion y verificación completa. Sin garantía de anonimato.
 - Mempool máximo 10000 transacciones / 32 MiB; fuera de presupuesto falla cerrado.
 - Historial/UTXO máximo 100000 resultados; error, nunca truncado.
 - Undo de 288 bloques. Reorg más profunda requiere reconstruir en raíz nueva.
@@ -466,3 +525,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --release --locked
 ```
+
+La matriz de smokes, sus dependencias y los límites de seguridad están en
+[docs/testing.md](docs/testing.md). Los resultados históricos y el inventario
+del entorno revisado están en [docs/verification.md](docs/verification.md).

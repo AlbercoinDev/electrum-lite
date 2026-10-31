@@ -9,6 +9,7 @@ pub struct Core {
     pub url: String,
     pub cookie: PathBuf,
     agent: ureq::Agent,
+    rest: Option<std::sync::Arc<crate::rest::Rest>>,
 }
 #[derive(Debug)]
 pub struct RpcError {
@@ -60,6 +61,7 @@ impl Core {
                 .redirects(0)
                 .timeout(Duration::from_secs(30))
                 .build(),
+            rest: None,
         })
     }
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -91,6 +93,26 @@ impl Core {
         }
         Ok(v["result"].clone())
     }
+    /// Probe and enable Core's binary REST interface. Kept opt-in so unit
+    /// tests that use a JSON-RPC-only mock are not affected.
+    pub fn enable_rest(&mut self) -> Result<()> {
+        let rest = crate::rest::Rest::new(&self.url);
+        rest.probe()?;
+        self.rest = Some(std::sync::Arc::new(rest));
+        Ok(())
+    }
+    pub fn rest(&self) -> Option<&crate::rest::Rest> {
+        self.rest.as_deref()
+    }
+    pub fn block_binary(&self, hash: &str) -> Result<Block> {
+        let parsed: bitcoin::BlockHash = hash.parse()?;
+        if let Some(rest) = &self.rest {
+            if let Ok(block) = rest.block(parsed) {
+                return Ok(block);
+            }
+        }
+        self.block(hash)
+    }
     pub fn block(&self, hash: &str) -> Result<Block> {
         let v = self.call("getblock", json!([hash, 0]))?;
         deserialize(&hex::decode(
@@ -105,6 +127,15 @@ impl Core {
     pub fn block_hashes(&self, start: u32, count: u32) -> Result<Vec<bitcoin::BlockHash>> {
         ensure!((1..=16).contains(&count), "invalid block hash batch size");
         ensure!(start.checked_add(count - 1).is_some(), "height overflow");
+        if let Some(rest) = &self.rest {
+            if let Ok(first) = rest.block_hash_by_height(start) {
+                if let Ok(headers) = rest.headers(first, count) {
+                    if headers.len() == count as usize {
+                        return Ok(headers.iter().map(|h| h.block_hash()).collect());
+                    }
+                }
+            }
+        }
         let requests: Vec<_> = (0..count)
             .map(|id| json!({"jsonrpc":"1.0", "id":id, "method":"getblockhash", "params":[start + id]}))
             .collect();

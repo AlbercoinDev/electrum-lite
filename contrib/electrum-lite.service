@@ -1,0 +1,41 @@
+[Unit]
+Description=Electrum Lite thin server (managed pruned Core)
+Documentation=file:///usr/local/share/doc/electrum-lite/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace with the unprivileged account that owns /srv/electrum-lite.
+User=electrum-lite
+Group=electrum-lite
+ExecStart=/usr/local/bin/electrum-lite \
+  --network mainnet \
+  --data-dir /srv/electrum-lite \
+  --core-dir /srv/electrum-lite-core \
+  --bitcoind /usr/local/bin/bitcoind \
+  --confirm-dedicated \
+  --confirm-pruned-mainnet \
+  --storage hdd \
+  managed-serve
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=180
+# Kill Core and Tor together with Lite. This is the guard that prevents Core
+# from pruning blocks that Lite has not indexed yet.
+KillMode=control-group
+KillSignal=SIGTERM
+LimitNOFILE=65536
+TasksMax=64
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# Tune after measuring; MemoryHigh applies reclaim pressure before OOM.
+MemoryHigh=3G
+MemoryMax=3.5G
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

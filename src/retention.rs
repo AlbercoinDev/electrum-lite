@@ -238,7 +238,11 @@ pub fn clean_prepared(
         audit.file_name().and_then(|n| n.to_str()) == Some(format!("audit-{suffix}").as_str()),
         "snapshot does not match completed generation"
     );
-    verify_current(&audit, &backup, format!("thin-v1:{network}").as_bytes())?;
+    verify_identity_and_tip(
+        &audit,
+        &backup,
+        format!("{}:{network}", crate::index::IDENTITY_PREFIX).as_bytes(),
+    )?;
     let proof_parent = proof.parent().context("proof parent missing")?;
     ensure!(
         fs::symlink_metadata(proof_parent)?.file_type().is_dir()
@@ -258,6 +262,24 @@ pub fn clean_prepared(
     fs::remove_file(proof)?;
     fs::File::open(maintenance)?.sync_all()?;
     fs::File::open(proof_parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Lightweight check for temporary-generation cleanup. The full key replay
+/// already happened before the prune; iterating a 100+ GB temporary index on
+/// every cleanup would make maintenance unusable on small servers.
+fn verify_identity_and_tip(audit: &Path, backup: &Path, expected_identity: &[u8]) -> Result<()> {
+    let audit = DB::open_for_read_only(&Options::default(), audit, false)?;
+    let backup = DB::open_for_read_only(&Options::default(), backup, false)?;
+    ensure!(
+        audit.get(b"identity")?.as_deref() == Some(expected_identity)
+            && backup.get(b"identity")?.as_deref() == Some(expected_identity),
+        "retention network identity mismatch"
+    );
+    ensure!(
+        audit.get(b"tip")? == backup.get(b"tip")?,
+        "retention generation tips differ"
+    );
     Ok(())
 }
 
@@ -318,7 +340,11 @@ pub fn verify_audit_snapshot(
         fs::canonicalize(audit)? != fs::canonicalize(snapshot)?,
         "audit and snapshot must be independent directories"
     );
-    verify_current(audit, snapshot, format!("thin-v1:{network}").as_bytes())
+    verify_current(
+        audit,
+        snapshot,
+        format!("{}:{network}", crate::index::IDENTITY_PREFIX).as_bytes(),
+    )
 }
 
 /// Select the highest independently verified supervisor audit with a complete
@@ -377,7 +403,13 @@ pub fn verified_audit_base(
     }
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (height, audit, backup) in candidates {
-        if verify_current(&audit, &backup, format!("thin-v1:{network}").as_bytes()).is_err() {
+        if verify_current(
+            &audit,
+            &backup,
+            format!("{}:{network}", crate::index::IDENTITY_PREFIX).as_bytes(),
+        )
+        .is_err()
+        {
             continue;
         }
         let db = DB::open_for_read_only(&Options::default(), &audit, false)?;
@@ -450,7 +482,7 @@ pub fn clean(
     verify_current(
         &current_audit,
         &current_backup,
-        format!("thin-v1:{network}").as_bytes(),
+        format!("{}:{network}", crate::index::IDENTITY_PREFIX).as_bytes(),
     )?;
     let mut removed = 0;
     for (audit, backup) in previous {
@@ -480,7 +512,10 @@ mod tests {
         let mut options = Options::default();
         options.create_if_missing(true);
         let db = DB::open(&options, path)?;
-        db.put(b"identity", b"thin-v1:regtest")?;
+        db.put(
+            b"identity",
+            format!("{}:regtest", crate::index::IDENTITY_PREFIX).as_bytes(),
+        )?;
         db.put(b"tip", 1000u32.to_be_bytes())?;
         db.put(b"data", value)?;
         drop(db);

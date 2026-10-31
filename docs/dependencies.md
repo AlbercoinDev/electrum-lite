@@ -9,7 +9,10 @@ rust-bitcoin se utilizan como bibliotecas genéricas.
 | bitcoin | 0.32.102 | CC0-1.0 |
 | rocksdb | 0.24.0 | Apache-2.0 |
 | librocksdb-sys / RocksDB | 0.17.3 / 10.4.2 | MIT / Apache-2.0 / BSD-3-Clause, según componente |
-| ureq | 2.12.1 | MIT OR Apache-2.0 |
+| ureq (json, tls, socks-proxy) | 2.12.1 | MIT OR Apache-2.0 |
+| rustls / webpki-roots | 0.23 / 1.0 | Apache-2.0 OR ISC / MPL-2.0 |
+| socks | 0.3.4 | MIT OR Apache-2.0 |
+| libc | 0.2 | MIT OR Apache-2.0 |
 | clap | 4.6.7 | MIT OR Apache-2.0 |
 | anyhow | 1.0.100 | MIT OR Apache-2.0 |
 | serde_json | 1.0.154 | MIT OR Apache-2.0 |

@@ -1,6 +1,6 @@
 use crate::{
     core::Core,
-    index::{key, script_hash, Index},
+    index::{key, script_hash, Index, ScriptHash},
 };
 use anyhow::{ensure, Context, Result};
 use bitcoin::{
@@ -13,9 +13,9 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 pub struct Mempool {
     pub raw: BTreeMap<Txid, Transaction>,
-    pub history: BTreeMap<[u8; 32], Vec<Value>>,
-    pub delta: BTreeMap<[u8; 32], i64>,
-    pub outputs: BTreeMap<OutPoint, ([u8; 32], u64, i32)>,
+    pub history: BTreeMap<ScriptHash, Vec<Value>>,
+    pub delta: BTreeMap<ScriptHash, i64>,
+    pub outputs: BTreeMap<OutPoint, (ScriptHash, u64, i32)>,
     pub spent: BTreeSet<OutPoint>,
 }
 impl Mempool {
@@ -94,10 +94,10 @@ impl Mempool {
                             .db
                             .get(key(b'C', &serialize(&op)))?
                             .context("mempool prevout unavailable")?;
-                        ensure!(coin.len() == 48, "corrupt confirmed coin");
+                        ensure!(coin.len() == 32, "corrupt confirmed coin");
                         (
-                            coin[..32].try_into()?,
-                            u64::from_le_bytes(coin[32..40].try_into()?),
+                            coin[..crate::index::SCRIPT_HASH_LEN].try_into()?,
+                            u64::from_le_bytes(coin[crate::index::SCRIPT_HASH_LEN..].try_into()?),
                         )
                     };
                     scripts.insert(s);
@@ -150,7 +150,7 @@ impl Mempool {
         }
         Ok(m)
     }
-    pub fn history(&self, index: &Index, s: &[u8; 32]) -> Result<Value> {
+    pub fn history(&self, index: &Index, s: &ScriptHash) -> Result<Value> {
         let mut h = index.history(s)?.as_array().context("history")?.clone();
         if let Some(rows) = self.history.get(s) {
             for row in rows {
@@ -163,7 +163,7 @@ impl Mempool {
         );
         Ok(json!(h))
     }
-    pub fn unspent(&self, index: &Index, s: &[u8; 32]) -> Result<Value> {
+    pub fn unspent(&self, index: &Index, s: &ScriptHash) -> Result<Value> {
         let mut out = Vec::new();
         for row in index.unspent(s)?.as_array().context("unspent")? {
             let id: Txid = row["tx_hash"].as_str().context("txid")?.parse()?;

@@ -6,6 +6,8 @@ pub mod index;
 pub mod mempool;
 pub mod net;
 pub mod prune;
+pub mod public_data;
+pub mod rest;
 pub mod retention;
 pub mod server;
 pub mod supervisor;

@@ -28,6 +28,15 @@ struct Args {
     /// Start a private Tor subprocess; requires the tor executable. No direct fallback.
     #[arg(long, conflicts_with = "socks_proxy")]
     tor: bool,
+    /// Storage profile: auto, hdd (default) or ssd.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "hdd", "ssd"])]
+    storage: String,
+    /// Optional Esplora endpoint(s), comma-separated; only block hashes are sent.
+    #[arg(long)]
+    esplora: Option<String>,
+    /// Allow public clearnet block reconstruction without Tor (privacy trade-off).
+    #[arg(long)]
+    allow_public_data: bool,
     /// Use an existing SOCKS5 proxy for historical P2P, with remote name resolution.
     #[arg(long)]
     socks_proxy: Option<String>,
@@ -38,6 +47,9 @@ struct Args {
     backup_dir: Option<PathBuf>,
     #[arg(long)]
     confirm_prune: bool,
+    /// Explicitly allow manual mainnet pruning (recovery depends on Lite's index).
+    #[arg(long)]
+    confirm_pruned_mainnet: bool,
     /// NEW semantic replay destination; retained for inspection.
     #[arg(long)]
     audit_dir: Option<PathBuf>,
@@ -48,15 +60,15 @@ struct Args {
     #[arg(long, default_value_t = 18444)]
     core_p2p_port: u16,
     /// Dedicated Bitcoin Core database cache in MiB; does not limit total RAM.
-    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(64..=1024))]
+    #[arg(long, default_value_t = 256, value_parser = clap::value_parser!(u32).range(64..=1024))]
     core_dbcache_mib: u32,
     #[arg(long)]
     confirm_dedicated: bool,
     #[arg(long)]
     auto_prune: bool,
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, default_value_t = 64)]
     pause_lag: u32,
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 8)]
     resume_lag: u32,
     /// Pause Core networking below this free-space reserve on either filesystem (MiB).
     #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(256..=1048576))]
@@ -132,6 +144,18 @@ fn run() -> Result<()> {
             .mut_arg("socks_proxy", |a| {
                 a.help("Proxy SOCKS5 existente para bloques históricos")
             })
+            .mut_arg("storage", |a| {
+                a.help("Perfil de almacenamiento: auto, hdd o ssd")
+            })
+            .mut_arg("esplora", |a| {
+                a.help("Endpoint(s) Esplora separados por comas; solo se envían hashes de bloque")
+            })
+            .mut_arg("allow_public_data", |a| {
+                a.help("Permitir reconstrucción pública sin Tor; reduce la privacidad")
+            })
+            .mut_arg("confirm_pruned_mainnet", |a| {
+                a.help("Confirmar poda mainnet; la recuperación depende del índice de Lite")
+            })
             .mut_arg("backup_dir", |a| {
                 a.help("Destino NUEVO para una copia de seguridad verificada")
             })
@@ -178,6 +202,15 @@ fn run() -> Result<()> {
     } else {
         a.socks_proxy
     };
+    if let Some(endpoints) = &a.esplora {
+        std::env::set_var("ELECTRUM_LITE_ESPLORA", endpoints);
+    }
+    if a.allow_public_data {
+        std::env::set_var("ELECTRUM_LITE_ALLOW_PUBLIC_DATA", "1");
+    }
+    if a.storage != "auto" {
+        std::env::set_var("ELECTRUM_LITE_STORAGE", &a.storage);
+    }
     if a.command == "managed-serve" {
         ensure!(
             a.control_socket.is_none(),
@@ -216,6 +249,7 @@ fn run() -> Result<()> {
                 min_free_mib: a.min_free_mib,
                 auto_prune: a.auto_prune,
                 prune_interval: a.prune_interval,
+                confirm_pruned_mainnet: a.confirm_pruned_mainnet,
                 peers: a.block_peer,
                 proxy,
             },
@@ -239,6 +273,16 @@ fn run() -> Result<()> {
         a.prepared_snapshot.is_none() || a.command == "prune",
         "prepared snapshot only applies to prune"
     );
+    let storage_arg = if a.storage == "auto" {
+        std::env::var("ELECTRUM_LITE_STORAGE").unwrap_or_else(|_| "auto".to_owned())
+    } else {
+        a.storage.clone()
+    };
+    let storage = match storage_arg.as_str() {
+        "ssd" => electrum_lite::index::StorageProfile::Ssd,
+        "hdd" => electrum_lite::index::StorageProfile::Hdd,
+        _ => electrum_lite::index::detect_storage_profile(&a.data_dir),
+    };
     let mut index = if let Some(snapshot) = &a.snapshot_dir {
         let metadata = std::fs::symlink_metadata(snapshot)?;
         ensure!(
@@ -276,7 +320,7 @@ fn run() -> Result<()> {
         {
             let check =
                 rocksdb::DB::open_for_read_only(&rocksdb::Options::default(), snapshot, false)?;
-            let identity = format!("thin-v1:{network}");
+            let identity = format!("{}:{network}", electrum_lite::index::IDENTITY_PREFIX);
             ensure!(
                 check.get(b"identity")?.as_deref() == Some(identity.as_bytes()),
                 "snapshot network identity mismatch"
@@ -286,29 +330,45 @@ fn run() -> Result<()> {
                 "snapshot name does not match its tip"
             );
         }
-        let checkpoint = Index::open(snapshot, network)?;
+        let checkpoint = Index::open_with_profile(snapshot, network, storage)?;
         ensure!(
             checkpoint.tip()? == Some(height),
             "snapshot name does not match its tip"
         );
         checkpoint
     } else {
-        Index::open(&root.join("index"), network)?
+        Index::open_with_profile(&root.join("index"), network, storage)?
     };
     index.fetcher.peers = a.block_peer;
-    index.fetcher.proxy = proxy;
+    index.fetcher.proxy = proxy.clone();
+    let allow_public =
+        a.allow_public_data || std::env::var_os("ELECTRUM_LITE_ALLOW_PUBLIC_DATA").is_some();
+    if proxy.is_some() || a.esplora.is_some() || allow_public {
+        index.public = Some(electrum_lite::public_data::Client::new(proxy.as_deref())?);
+    }
     if a.snapshot_dir.is_some() {
         index.cache = root.join("cache");
     }
-    let core = Core::new(
+    let mut core = Core::new(
         a.core_rpc,
         a.core_cookie
             .ok_or_else(|| anyhow::anyhow!("--core-cookie is required outside managed-serve"))?,
     )?;
+    if let Err(error) = core.enable_rest() {
+        eprintln!("Core REST unavailable; using slower JSON-RPC transport: {error:#}");
+    } else {
+        eprintln!(
+            "{}",
+            electrum_lite::i18n::text(
+                "Core REST transport enabled",
+                "Transporte REST de Core activado"
+            )
+        );
+    }
     match a.command.as_str() {
         "health" => println!(
             "{}",
-            serde_json::json!({"indexed_height":index.tip()?,"network":a.network,"engine":"thin-v1","experimental":true})
+            serde_json::json!({"indexed_height":index.tip()?,"network":a.network,"engine":"thin-v3-txnum","experimental":true})
         ),
         "sync" => index.sync_batch_with_cancel(&core, u32::MAX, &stop)?,
         "backup" => index.backup(
@@ -342,7 +402,10 @@ fn run() -> Result<()> {
                 a.confirm_prune,
                 "prune requires --confirm-prune and a dedicated offline Core"
             );
-            ensure!(network != Network::Bitcoin, "mainnet pruning is blocked");
+            ensure!(
+                network != Network::Bitcoin || a.confirm_pruned_mainnet,
+                "mainnet pruning requires --confirm-pruned-mainnet and an external backup policy"
+            );
             let info = core.call("getblockchaininfo", serde_json::json!([]))?;
             ensure!(
                 info["pruned"] == true && info["automatic_pruning"] == false,

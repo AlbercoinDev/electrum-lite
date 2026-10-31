@@ -82,6 +82,7 @@ pub struct Config {
     pub min_free_mib: u32,
     pub auto_prune: bool,
     pub prune_interval: u32,
+    pub confirm_pruned_mainnet: bool,
     pub peers: Vec<String>,
     pub proxy: Option<String>,
 }
@@ -92,14 +93,21 @@ impl OwnedChild {
         {
             use std::os::unix::process::CommandExt;
             c.process_group(0);
+            // If the supervisor dies (including SIGKILL), Core must not keep
+            // running and pruning blocks that Lite has not indexed.
+            unsafe {
+                c.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                    Ok(())
+                });
+            }
         }
         Ok(Self(c.stdin(Stdio::null()).spawn()?))
     }
     fn live(&mut self) -> Result<()> {
-        ensure!(
-            self.0.try_wait()?.is_none(),
-            "owned child exited unexpectedly"
-        );
+        if let Some(status) = self.0.try_wait()? {
+            bail!("owned child exited unexpectedly ({status})");
+        }
         Ok(())
     }
     fn stop(&mut self) -> Result<()> {
@@ -194,10 +202,27 @@ fn event(path: &Path, name: &str, extra: Value) -> Result<()> {
             "mantenimiento aplazado: la cadena de Core cambió durante la preparación",
         ),
         "shutdown" => crate::i18n::text("shutdown complete", "cierre completado"),
+        "startup_interrupted" => crate::i18n::text(
+            "startup interrupted; dedicated Core stopped",
+            "arranque interrumpido; Core dedicado detenido",
+        ),
         _ => name,
     };
     eprintln!("supervisor: {human} {extra}");
     Ok(())
+}
+fn log_tail(path: &Path, lines: usize) -> String {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let all: Vec<_> = text.lines().collect();
+            all[all.len().saturating_sub(lines)..].join("\n")
+        }
+        Err(error) => format!("(cannot read {}: {error})", path.display()),
+    }
+}
+fn core_live(node: &mut OwnedChild, log: &Path) -> Result<()> {
+    node.live()
+        .with_context(|| format!("dedicated Core failed; see {}", log.display()))
 }
 fn health(listen: SocketAddr) -> Result<Value> {
     let mut s = TcpStream::connect_timeout(&listen, Duration::from_secs(3))?;
@@ -428,10 +453,11 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     let cookie = network_dir.join(".cookie");
     let core = Core::new(c.core_rpc.clone(), cookie.clone())?;
     let pid = core_dir.join("electrum-lite.pid");
+    let core_log = maintenance.join("core.log");
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(maintenance.join("core.log"))?;
+        .open(&core_log)?;
     let mut command = Command::new(&c.bitcoind);
     command
         .arg(format!("-datadir={}", core_dir.display()))
@@ -439,16 +465,30 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
         .arg(format!("-pid={}", pid.display()))
         .args([
             "-server=1",
+            "-rest=1",
             "-listen=1",
             "-daemon=0",
             "-nosettings",
             "-prune=1",
             "-txindex=0",
+            "-blockfilterindex=0",
+            "-peerblockfilters=0",
+            "-disablewallet=1",
             "-listenonion=0",
             "-discover=0",
+            "-maxmempool=50",
+            "-par=1",
+            "-maxconnections=32",
+            "-rpcworkqueue=64",
+            "-rpcthreads=4",
         ])
         .arg(format!("-dbcache={}", c.core_dbcache_mib))
         .arg(format!("-rpcport={}", rpc_address.port()))
+        // Bind exactly the loopback address Lite will use. With the default
+        // (127.0.0.1 and ::1), Core can keep running when only IPv4 is taken,
+        // leaving Lite waiting for an RPC endpoint that never appears.
+        .arg(format!("-rpcbind={}", rpc_address.ip()))
+        .arg(format!("-rpcallowip={}", rpc_address.ip()))
         .arg(format!("-port={}", c.p2p_port))
         .arg(format!("-bind=127.0.0.1:{}", c.p2p_port))
         .stdout(Stdio::from(log.try_clone()?))
@@ -459,14 +499,35 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     if c.network == "regtest" {
         command.args(["-connect=0", "-dnsseed=0", "-fallbackfee=0.00001"]);
     }
+    eprintln!(
+        "supervisor: {} {}",
+        crate::i18n::text("starting dedicated Core", "iniciando Core dedicado"),
+        c.bitcoind.display()
+    );
     let mut node = OwnedChild::spawn(&mut command)?;
     let startup = Instant::now();
     loop {
-        node.live()?;
-        ensure!(!stop.load(Ordering::Relaxed), "startup interrupted");
+        if let Some(status) = node.0.try_wait()? {
+            bail!(
+                "dedicated Core exited during startup ({status}); see {}\n{}",
+                core_log.display(),
+                log_tail(&core_log, 20)
+            );
+        }
+        if stop.load(Ordering::Relaxed) {
+            node.stop()?;
+            event(
+                &events,
+                "startup_interrupted",
+                json!({"clean":true,"phase":"core_startup"}),
+            )?;
+            return Ok(());
+        }
         ensure!(
             startup.elapsed() < Duration::from_secs(60),
-            "dedicated Core startup timed out"
+            "dedicated Core startup timed out; check {} and whether {} is already in use",
+            core_log.display(),
+            rpc_address
         );
         // Do not authenticate to or stop an old Core using the same port/root.
         if fs::read_to_string(&pid)
@@ -520,7 +581,7 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
     };
     let discover_sources = c.peers.is_empty();
     while !stop.load(Ordering::Relaxed) {
-        node.live()?;
+        core_live(&mut node, &core_log)?;
         daemon.live()?;
         let state = match health(c.listen) {
             Ok(v) => {
@@ -562,6 +623,18 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
             }
         }
         let indexed = state["indexed_height"].as_u64();
+        // Core's automatic pruning must never overtake Lite's durable tip.
+        if let (Some(pruneheight), Some(indexed)) = (info["pruneheight"].as_u64(), indexed) {
+            // `pruneheight` is the lowest complete block Core still stores.
+            // If it is above Lite's durable tip, a block Lite still needs was
+            // deleted. A lower value is safe: Lite already indexed it.
+            if pruneheight > indexed.saturating_add(1) {
+                core.call("setnetworkactive", json!([false]))?;
+                bail!(
+                    "Core pruning reached height {pruneheight} but Lite is at {indexed}; refusing to continue"
+                );
+            }
+        }
         let lag = (u64::from(tip) + 1).saturating_sub(indexed.map_or(0, |n| n + 1));
         if free_checked.elapsed() >= Duration::from_secs(5) {
             free_bytes = available_bytes(&core_dir)?.min(available_bytes(&root)?);
@@ -748,7 +821,7 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                     !stop.load(Ordering::Relaxed),
                     "online audit interrupted; partial generations preserved"
                 );
-                node.live()?;
+                core_live(&mut node, &core_log)?;
                 daemon.live()?;
                 if reserve_checked.elapsed() >= Duration::from_secs(5) {
                     let free = available_bytes(&core_dir)?.min(available_bytes(&root)?);
@@ -804,7 +877,7 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                     !stop.load(Ordering::Relaxed),
                     "online backup interrupted; partial generations preserved"
                 );
-                node.live()?;
+                core_live(&mut node, &core_log)?;
                 daemon.live()?;
                 if reserve_checked.elapsed() >= Duration::from_secs(5) {
                     let free = available_bytes(&core_dir)?.min(available_bytes(&root)?);
@@ -901,7 +974,7 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                     !stop.load(Ordering::Relaxed),
                     "verification interrupted; owned Core will stop without resuming"
                 );
-                node.live()?;
+                core_live(&mut node, &core_log)?;
                 daemon.live()?;
                 let state = private_call(control, json!({"method":"verification-status"}))?;
                 match state["state"].as_str() {
@@ -942,7 +1015,7 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                     !stop.load(Ordering::Relaxed),
                     "maintenance interrupted; owned Core will stop without resuming"
                 );
-                node.live()?;
+                core_live(&mut node, &core_log)?;
                 daemon.live()?;
                 let state = private_call(control, json!({"method":"verification-status"}))?;
                 match state["state"].as_str() {
@@ -1014,10 +1087,19 @@ pub fn run(mut c: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 )?,
             }
             daemon.live()?;
-            // Refresh the reserve before deciding whether networking may resume.
+            // Resume immediately after maintenance when the disk reserve is
+            // healthy. Waiting for the normal hysteresis can leave Core offline
+            // indefinitely when free space sits between the minimum and the
+            // resume threshold.
             free_bytes = available_bytes(&core_dir)?.min(available_bytes(&root)?);
             free_checked = Instant::now();
-            paused = true;
+            if free_bytes >= minimum_free {
+                core.call("setnetworkactive", json!([true]))?;
+                paused = false;
+                event(&events, "backpressure_resume", json!({"lag":lag}))?;
+            } else {
+                paused = true;
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -1073,6 +1155,7 @@ mod tests {
             min_free_mib: 2048,
             auto_prune: false,
             prune_interval: 1,
+            confirm_pruned_mainnet: false,
             peers: Vec::new(),
             proxy: None,
         }

@@ -41,4 +41,5 @@ Antes de cambiar la política se necesitan pruebas en nodos desechables con
 extensiones y reorganizaciones antes, durante y después de la poda; cambios de
 mempool; fallos RPC y de disco; caída entre intención y confirmación; y recuperación
 de bloques sin fuentes externas. Las pruebas actuales no validan esas opciones.
-La poda de mainnet permanece bloqueada.
+La poda mainnet coordinada se implementó después de esta investigación; sigue
+sin validarse en mainnet y exige `--confirm-pruned-mainnet`.

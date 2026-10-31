@@ -20,7 +20,7 @@ with tarfile.open(a.output, "x:gz") as archive:
     archive.add(binary, arcname=f"{prefix}/bin/electrum-lite")
     for name in ["README.md", "AGENTS.md", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "build.rs", "install.sh", ".gitignore"]:
         archive.add(base / name, arcname=f"{prefix}/{name}")
-    for directory in ["src", "docs", "scripts"]:
+    for directory in ["src", "docs", "scripts", "contrib"]:
         for source in sorted((base / directory).rglob("*")):
             if source.is_file() and "__pycache__" not in source.parts:
                 archive.add(source, arcname=f"{prefix}/{source.relative_to(base)}")

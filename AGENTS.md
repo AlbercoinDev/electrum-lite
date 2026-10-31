@@ -8,7 +8,7 @@ descriptions focused on this application and its own design.
 Keep version `0.0.1-beta.1` unchanged unless explicitly requested. Do not alter
 existing Git tags. Preserve the app's safety requirements: fail closed,
 verify network identity and witness data, distinguish repeated TXID occurrences,
-bound resources, prohibit mainnet pruning, use isolated disposable test nodes,
+bound resources, prohibit uncoordinated mainnet pruning, use isolated disposable test nodes,
 and require explicit backups and new destinations. Never delete user data unless
 explicitly requested.
 

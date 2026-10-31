@@ -16,18 +16,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn script(v: &Value) -> Result<[u8; 32]> {
+fn script(v: &Value) -> Result<crate::index::ScriptHash> {
     let mut b = hex::decode(v.as_str().context("missing scripthash")?)?;
     ensure!(b.len() == 32, "invalid scripthash");
     b.reverse();
-    Ok(b.try_into().expect("checked length"))
+    Ok(b[..crate::index::SCRIPT_HASH_LEN]
+        .try_into()
+        .expect("checked length"))
 }
 fn number(v: &Value) -> Result<u32> {
     Ok(v.as_u64()
         .context("unsigned integer required")?
         .try_into()?)
 }
-fn status(index: &Index, mempool: &Mempool, s: &[u8; 32]) -> Result<Value> {
+fn status(index: &Index, mempool: &Mempool, s: &crate::index::ScriptHash) -> Result<Value> {
     let h = mempool.history(index, s)?;
     let rows = h.as_array().context("history")?;
     if rows.is_empty() {
@@ -490,6 +492,11 @@ pub fn serve(
         let mut ready = false;
         let mut sync_warning: Option<Instant> = None;
         let mut mempool = Mempool::default();
+        let mut mempool_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut status_cache: std::collections::BTreeMap<crate::index::ScriptHash, (u64, Value)> =
+            std::collections::BTreeMap::new();
+        let mut generation = 0u64;
+        let mut last_tip: Option<u32> = None;
         let mut verification: Option<mpsc::Receiver<Result<(u32, bitcoin::BlockHash)>>> = None;
         let mut verification_hold: Option<Instant> = None;
         let mut prepared: Option<PreparedVerification> = None;
@@ -567,7 +574,7 @@ pub fn serve(
                 && synced.elapsed() >= Duration::from_secs(1)
             {
                 ready = match index
-                    .sync_batch_with_cancel(&core, 64, &worker_stop)
+                    .sync_batch_with_cancel(&core, 512, &worker_stop)
                     .and_then(|()| {
                         let h = index.tip()?.context("empty index")?;
                         ensure!(
@@ -575,10 +582,29 @@ pub fn serve(
                                 == index.header(h)?.block_hash().to_string(),
                             "catching up"
                         );
-                        Mempool::load(&index, &core)
+                        {
+                            let ids = core.call("getrawmempool", json!([]))?;
+                            let ids: std::collections::BTreeSet<String> = ids
+                                .as_array()
+                                .context("mempool")?
+                                .iter()
+                                .map(|v| v.as_str().unwrap_or("").to_owned())
+                                .collect();
+                            let mempool_changed = ids != mempool_ids;
+                            if mempool_changed {
+                                mempool = Mempool::load(&index, &core)?;
+                                mempool_ids = ids;
+                            }
+                            let tip_now = index.tip()?;
+                            if mempool_changed || tip_now != last_tip {
+                                last_tip = tip_now;
+                                generation += 1;
+                                status_cache.clear();
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        }
                     }) {
-                    Ok(m) => {
-                        mempool = m;
+                    Ok(()) => {
                         if sync_warning.take().is_some() {
                             eprintln!(
                                 "{}",
@@ -918,24 +944,20 @@ pub fn serve(
                                 "chain changed; retry"
                             );
                         }
-                        if method.starts_with("blockchain.scripthash.") {
-                            let tip = index.tip()?.context("index empty")?;
-                            ensure!(
-                                core.call("getbestblockhash", json!([]))?
-                                    == index.header(tip)?.block_hash().to_string(),
-                                "chain changed; retry"
-                            );
-                            let ids = core.call("getrawmempool", json!([]))?;
-                            let ids: std::collections::BTreeSet<String> = ids
-                                .as_array()
-                                .context("mempool")?
-                                .iter()
-                                .map(|v| v.as_str().unwrap_or("").to_owned())
-                                .collect();
-                            ensure!(
-                                ids == mempool.raw.keys().map(ToString::to_string).collect(),
-                                "mempool changed; retry"
-                            );
+                        if method == "blockchain.scripthash.subscribe" {
+                            let scripthash = script(&params[0])?;
+                            if let Some((cached_generation, value)) = status_cache.get(&scripthash)
+                            {
+                                if *cached_generation == generation {
+                                    return Ok(value.clone());
+                                }
+                            }
+                            let value = status(&index, &mempool, &scripthash)?;
+                            if status_cache.len() >= 10_000 {
+                                status_cache.clear();
+                            }
+                            status_cache.insert(scripthash, (generation, value.clone()));
+                            return Ok(value);
                         }
                         dispatch(&index, &core, &mempool, method, params)
                     })();
@@ -964,7 +986,7 @@ pub fn serve(
     eprintln!(
         "{} {listen}; {}",
         crate::i18n::text("Electrum listening on", "Electrum escuchando en"),
-        crate::i18n::text("experimental thin-v1", "thin-v1 experimental")
+        crate::i18n::text("experimental thin-v3-txnum", "thin-v3-txnum experimental")
     );
     let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     #[cfg(unix)]

@@ -1,6 +1,7 @@
 # Electrum Lite — diseño y estado
 
-Versión `0.0.1-beta.1`, formato de almacenamiento `thin-v1`. Aplicación nueva,
+Versión `0.0.1-beta.1`, release `thin-v3-txnum-2026-10-31`, formato de
+almacenamiento `thin-v3-txnum`. Aplicación nueva,
 desarrollada desde cero en Rust como un único paquete y con RocksDB como biblioteca
 genérica de almacenamiento.
 
@@ -51,13 +52,16 @@ validadas. No se garantiza seguir la velocidad de IBD ni un tamaño final.
 7. TCP Electrum 1.4, consultas, suscripciones por polling y broadcast mediante Core.
 8. Descarga de bloques witness por P2P, validación y caché durable por hash.
 9. Transporte directo, SOCKS5 externo o proceso Tor privado iniciado por la app.
-   Ningún fallback de proxy a directo ni a API pública.
+   Ningún fallback de proxy a directo. Los bloques podados se reconstruyen con
+   una ventana alineada de 16 hashes de bloque a Esplora/onion; nunca se envían
+   scripthashes ni TXID.
 10. Checkpoint RocksDB a destino nuevo y comparación completa de claves/valores.
 11. Auditoría semántica: replay completo en índice nuevo, comparando todas las
     claves y valores; se conserva la generación auditada.
-12. Poda manual solo en redes de prueba: Core `prune=1`, P2P apagado, mempool
-    vacía, índice sincronizado, auditoría semántica, backup nuevo y marcador durable
-    antes del RPC.
+12. Poda coordinada: Core `prune=1` en modo gestionado; Lite comprueba
+    `pruneheight` y pausa la red si Core adelanta al índice durable. La poda manual
+    mainnet exige `--confirm-pruned-mainnet`. Sin backup externo, la recuperación
+    es un re-IBD completo.
 13. `managed-serve`: Core dedicado con marcador/configuración/PID verificados,
     backpressure configurable (por defecto 2000/200 bloques) y freno por espacio.
     Electrum sigue activo durante auditoría, backup y poda; Core pausa P2P para
@@ -81,7 +85,7 @@ validadas. No se garantiza seguir la velocidad de IBD ni un tamaño final.
   (no confundir el smoke TCP con GUI). Evidencia de regtest/Tor: `verification.md`.
 - Capacidad de mainnet, recursos, sincronización completa, ataques y energía.
 
-## Almacenamiento thin-v1
+## Almacenamiento thin-v3-txnum
 
 Todos los enteros de las claves ordenables usan big-endian. Los importes binarios
 usan little-endian. `serialize(OutPoint)` usa el formato de consenso de Bitcoin.
@@ -91,18 +95,26 @@ usan little-endian. `serialize(OutPoint)` usa el formato de consenso de Bitcoin.
 | identity | literal | formato y red |
 | tip | literal | altura u32 |
 | B | altura u32 | cabecera 80 B + TXIDs ordenados 32 B cada uno |
-| T | prefijo TXID 8 B + altura u32 + posición u32 | vacío |
-| H | SHA256(script) 32 B + altura u32 + posición u32 | vacío |
-| C | outpoint 36 B | script hash 32 B + importe u64 + altura u32 + posición u32 |
-| S | script hash 32 B + altura u32 + posición u32 + vout u32 | importe u64 |
-| U | altura u32 | preimágenes de claves modificadas |
+| N | altura u32 | primer TxNum u32 + número de transacciones u32 |
+| T | prefijo TXID 8 B + TxNum u32 | vacío |
+| H | SHA256(script) 24 B + TxNum u32 | vacío |
+| C | outpoint 36 B | script hash 24 B + importe u64 (sin altura/posición) |
+| S | script hash 24 B + TXID 32 B + vout u32 | altura u32 + importe u64 |
+| P | último TxNum del trozo u32 | offsets/tamaños de hasta 64 transacciones |
+| U | altura u32 | preimágenes y marcadores de restauración de UTXO |
 
-Los duplicados históricos de TXID se conservan como ocurrencias distintas en T.
-Las colisiones del prefijo TXID se resuelven comparando el hash **completo** del
-registro B. Historial y UTXO por script usan ocurrencias para evitar repetir TXIDs.
-El hash de script se invierte únicamente en la frontera Electrum.
+Cada transacción recibe un `TxNum` secuencial global. Historial y búsqueda por
+TXID usan 4 B de TxNum en lugar de altura+posición. El UTXO se identifica por
+script y outpoint, de modo que `/rest/spenttxouts` permite borrarlo sin leer la
+fila `C` del prevout. Las colisiones del prefijo TXID se resuelven comparando el
+hash completo del registro B. Los duplicados históricos de TXID se conservan.
+El hash de script usa 192 bits (24 B) y se invierte únicamente en la frontera
+Electrum. La probabilidad de colisión es despreciable; no hay post-filtrado.
 Cabecera, UTXO, historial, undo y tip se publican en un único WriteBatch durable.
-El reinicio usa la recuperación WAL de RocksDB; no relee todos los bloques.
+El commit rápido usa `/rest/spenttxouts` y no hace lecturas aleatorias de `C` por
+entrada. El undo guarda un marcador para las filas `S` gastadas y resuelve la
+altura original por `T` solo al revertir un bloque. El reinicio usa la
+recuperación WAL de RocksDB; no relee todos los bloques.
 Un corte puede perder un sufijo del lote aún sin fsync; Core manualmente podado
 conserva esos bloques y el siguiente arranque los vuelve a leer. Nunca se poda
 automáticamente basándose en un cursor aún no sincronizado a disco.
@@ -129,7 +141,7 @@ nodo existente. Nunca prueba poda en datos valiosos.
 `--auto-prune` autoriza mantenimiento en redes de prueba, no sobre nodos ajenos.
 Una poda solicitada pero sin completar deja `prune-pending` y bloquea más podas.
 No borrar ese marcador para saltarse el problema: inspeccionar Core y recuperar.
-La poda mainnet está prohibida en código, sin override.
+La poda mainnet solo se permite en modo gestionado o con `--confirm-pruned-mainnet`; exige que Core pode por detrás del tip durable de Lite y que el usuario acepte que la recuperación es un re-IBD completo.
 Se respeta además el umbral de altura 1000 de Core 31 en redes de prueba normales.
 Las auditorías de un prefijo ya podado recuperan y verifican bloques en memoria:
 no los incorporan a la caché de cartera. Tras un mantenimiento gestionado
