@@ -38,6 +38,14 @@ pub struct Index {
     pub fetcher: crate::net::Fetcher,
     pub cache: std::path::PathBuf,
 }
+#[derive(Default)]
+struct CommitTimings {
+    verify: std::time::Duration,
+    prepare: std::time::Duration,
+    undo: std::time::Duration,
+    write: std::time::Duration,
+    reused_preimages: u64,
+}
 pub fn script_hash(script: &[u8]) -> [u8; 32] {
     sha256::Hash::hash(script).to_byte_array()
 }
@@ -440,10 +448,19 @@ impl Index {
         Ok(deserialize(&self.block_meta(h)?[..80])?)
     }
     pub fn commit(&self, h: u32, block: &Block) -> Result<()> {
-        self.commit_with_sync(h, block, true)
+        self.commit_with_sync(h, block, true, &mut CommitTimings::default())
     }
-    fn commit_with_sync(&self, h: u32, block: &Block, durable: bool) -> Result<()> {
+    fn commit_with_sync(
+        &self,
+        h: u32,
+        block: &Block,
+        durable: bool,
+        timings: &mut CommitTimings,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
         crate::net::verify_at(block, block.block_hash(), self.network, h)?;
+        timings.verify += started.elapsed();
+        let started = std::time::Instant::now();
         match self.tip()? {
             Some(t) => ensure!(
                 h == t + 1 && block.header.prev_blockhash == self.header(t)?.block_hash(),
@@ -457,6 +474,9 @@ impl Index {
             ),
         }
         let mut delta: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+        // These are values read from the DB before this block, never values
+        // from delta. Keep absent values too: they are valid undo preimages.
+        let mut preimages: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
         let mut meta = serialize(&block.header);
         for (pos, tx) in block.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
@@ -473,7 +493,11 @@ impl Index {
                     let ck = key(b'C', &outpoint);
                     let coin = match delta.get(&ck) {
                         Some(v) => v.clone(),
-                        None => self.db.get(&ck)?,
+                        None => {
+                            let value = self.db.get(&ck)?;
+                            preimages.insert(ck.clone(), value.clone());
+                            value
+                        }
                     }
                     .context("missing prevout")?;
                     ensure!(coin.len() == 48, "corrupt coin");
@@ -502,7 +526,11 @@ impl Index {
                 let ck = key(b'C', &bytes);
                 let previous = match delta.get(&ck) {
                     Some(v) => v.clone(),
-                    None => self.db.get(&ck)?,
+                    None => {
+                        let value = self.db.get(&ck)?;
+                        preimages.insert(ck.clone(), value.clone());
+                        value
+                    }
                 };
                 if let Some(old) = previous {
                     ensure!(old.len() == 48, "corrupt previous coin");
@@ -531,11 +559,20 @@ impl Index {
         }
         delta.insert(height_key(b'B', h), Some(meta));
         delta.insert(b"tip".to_vec(), Some(h.to_be_bytes().to_vec()));
+        timings.prepare += started.elapsed();
+        let started = std::time::Instant::now();
         let mut undo = Vec::new();
         for k in delta.keys() {
             undo.extend((k.len() as u32).to_le_bytes());
             undo.extend(k);
-            match self.db.get(k)? {
+            let previous = match preimages.get(k) {
+                Some(value) => {
+                    timings.reused_preimages += 1;
+                    value.clone()
+                }
+                None => self.db.get(k)?,
+            };
+            match previous {
                 Some(v) => {
                     undo.extend((v.len() as u32).to_le_bytes());
                     undo.extend(v);
@@ -543,6 +580,8 @@ impl Index {
                 None => undo.extend(u32::MAX.to_le_bytes()),
             }
         }
+        timings.undo += started.elapsed();
+        let started = std::time::Instant::now();
         let mut batch = WriteBatch::default();
         for (k, v) in delta {
             match v {
@@ -557,6 +596,7 @@ impl Index {
         let mut options = write_options();
         options.set_sync(durable);
         self.db.write_opt(batch, &options)?;
+        timings.write += started.elapsed();
         Ok(())
     }
     pub fn rewind_one(&self) -> Result<()> {
@@ -671,6 +711,7 @@ impl Index {
             let mut fetch_time = std::time::Duration::ZERO;
             let mut hash_time = std::time::Duration::ZERO;
             let mut write_time = std::time::Duration::ZERO;
+            let mut timings = CommitTimings::default();
             let begun = std::time::Instant::now();
             let result = (|| -> Result<()> {
                 for expected in start..=end {
@@ -685,7 +726,12 @@ impl Index {
                     fetch_time += elapsed;
                     hash_time += hash_elapsed;
                     let writing = std::time::Instant::now();
-                    self.commit_with_sync(h, &block, h == end || (h - start + 1) % 64 == 0)?;
+                    self.commit_with_sync(
+                        h,
+                        &block,
+                        h == end || (h - start + 1) % 64 == 0,
+                        &mut timings,
+                    )?;
                     write_time += writing.elapsed();
                 }
                 Ok(())
@@ -699,15 +745,38 @@ impl Index {
                 let completed = u64::from(end) + 1;
                 let total = u64::from(core_height) + 1;
                 let percent = completed as f64 * 100.0 / total as f64;
-                eprintln!("{} {completed}/{total} ({percent:.2}%)", crate::i18n::text("indexed", "indexados"));
+                eprintln!(
+                    "{} {completed}/{total} ({percent:.2}%)",
+                    crate::i18n::text("indexed", "indexados")
+                );
                 eprintln!(
                     "  {}: {} | {}: {} ms | {}: {} ms | {}: {} ms | {}: {} ms ({})",
-                    crate::i18n::text("batch blocks", "bloques del lote"), end - start + 1,
-                    crate::i18n::text("total", "total"), begun.elapsed().as_millis(),
-                    crate::i18n::text("fetch", "descarga"), fetch_time.as_millis(),
-                    crate::i18n::text("hashes", "hashes"), hash_time.as_millis(),
-                    crate::i18n::text("index", "índice"), write_time.as_millis(),
-                    crate::i18n::text("fetch and indexing overlap", "descarga e indexado se solapan")
+                    crate::i18n::text("batch blocks", "bloques del lote"),
+                    end - start + 1,
+                    crate::i18n::text("total", "total"),
+                    begun.elapsed().as_millis(),
+                    crate::i18n::text("fetch", "descarga"),
+                    fetch_time.as_millis(),
+                    crate::i18n::text("hashes", "hashes"),
+                    hash_time.as_millis(),
+                    crate::i18n::text("index", "índice"),
+                    write_time.as_millis(),
+                    crate::i18n::text(
+                        "fetch and indexing overlap",
+                        "descarga e indexado se solapan"
+                    )
+                );
+                eprintln!(
+                    "  {}: {} ms | {}: {} ms | undo: {} ms | {}: {} ms | {}: {}",
+                    crate::i18n::text("verify", "verificación"),
+                    timings.verify.as_millis(),
+                    crate::i18n::text("prepare", "preparación"),
+                    timings.prepare.as_millis(),
+                    timings.undo.as_millis(),
+                    crate::i18n::text("write (including sync)", "escritura (incluye sync)"),
+                    timings.write.as_millis(),
+                    crate::i18n::text("preimages reused", "preimágenes reutilizadas"),
+                    timings.reused_preimages
                 );
             }
             Ok(())

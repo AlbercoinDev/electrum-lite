@@ -603,13 +603,17 @@ pub fn serve(
                                 Ok((indexed, core_height)) => {
                                     let lag = core_height.saturating_sub(indexed);
                                     if (lag > 100 || core_height <= indexed)
-                                        && sync_warning
-                                            .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
+                                        && sync_warning.is_none_or(|last| {
+                                            last.elapsed() >= Duration::from_secs(60)
+                                        })
                                     {
                                         if core_height > indexed {
                                             eprintln!(
                                                 "{}: {lag} {}",
-                                                crate::i18n::text("Bitcoin Core is ahead by", "Bitcoin Core va por delante"),
+                                                crate::i18n::text(
+                                                    "Bitcoin Core is ahead by",
+                                                    "Bitcoin Core va por delante"
+                                                ),
                                                 crate::i18n::text("blocks", "bloques")
                                             );
                                         } else {
@@ -623,7 +627,10 @@ pub fn serve(
                                 }
                                 Err(error) => eprintln!(
                                     "{}: {error:#}",
-                                    crate::i18n::text("Sync unavailable", "Sincronización no disponible")
+                                    crate::i18n::text(
+                                        "Sync unavailable",
+                                        "Sincronización no disponible"
+                                    )
                                 ),
                             }
                         } else {

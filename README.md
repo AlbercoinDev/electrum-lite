@@ -21,27 +21,30 @@ y el protocolo Electrum conservan sus nombres y formato originales.
 
 ### Binario listo para instalar o actualizar
 
-Instala `curl`, `coreutils` y `libstdc++` con el gestor de paquetes de tu
+Instala las dependencias con el gestor de paquetes de tu
 distribución. En Debian/Ubuntu:
 
 ```sh
-sudo apt-get update && sudo apt-get install -y curl coreutils libstdc++6
+sudo apt-get update && sudo apt-get install -y curl coreutils libstdc++6 python3 gnupg procps ca-certificates
 ```
 
-Después, esta línea instala o actualiza el binario en `~/.local/bin`:
+Después, esta línea instala o actualiza Lite y Bitcoin Core como usuario normal:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/scripts/install-release.sh -o /tmp/electrum-lite-installer.sh && sh /tmp/electrum-lite-installer.sh
 ```
 
 El instalador comprueba SHA256 contra el valor fijado en el script, comprueba que
-el binario arranca y conserva el ejecutable anterior con un nombre único. No toca
-datos, servicios ni Bitcoin Core. El checksum detecta errores o sustituciones del
+el binario arranca y conserva el ejecutable anterior con un nombre único. También
+instala o actualiza Core con las verificaciones y restricciones de la sección 2,
+antes de sustituir Lite. No inicia servicios ni modifica datos de nodos. Si Core
+falla, no sustituye Lite; si después falla la instalación de Lite, Core puede haber
+quedado actualizado. El checksum detecta errores o sustituciones del
 archivo, pero **no es una firma**: el script y el checksum se distribuyen mediante
 GitHub, por lo que dependen de la confianza en esa cuenta y en HTTPS. Puedes leer
 el script descargado antes de ejecutarlo. Esta compilación Linux x86-64 depende
 de glibc/libstdc++ compatibles con la máquina de compilación; no se garantiza en
-distribuciones antiguas. Bitcoin Core se instala por separado, como se explica abajo.
+distribuciones antiguas. Core se instala en el prefijo de usuario de la sección 2.
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
@@ -52,7 +55,7 @@ electrum-lite --version
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y build-essential clang libclang-dev pkg-config git curl python3
+sudo apt-get install -y build-essential clang libclang-dev pkg-config git curl python3 gnupg procps ca-certificates
 ```
 
 Instala Rust con el instalador oficial de https://rustup.rs. Para descargarlo
@@ -83,8 +86,10 @@ export PATH="$HOME/.local/bin:$PATH"
 electrum-lite --version
 ```
 
-No instala servicios, no inicia Core y no modifica nodos existentes. El binario
-previo se guarda como `electrum-lite.previous` al reinstalar.
+También instala o actualiza Bitcoin Core siguiendo las restricciones de la sección 2.
+No instala servicios, no inicia Core y no modifica datos de nodos existentes. El
+binario previo se guarda como `electrum-lite.previous` al reinstalar. Core siempre
+usa `~/.local`, aunque `PREFIX` cambie el destino de Lite.
 
 ### Instalar esta versión local sin recompilar
 
@@ -97,6 +102,7 @@ sha256sum -c electrum-lite-thin-managed-experimental-linux-x86_64.tar.gz.sha256
 mkdir electrum-lite-instalacion-nueva
 tar -xzf electrum-lite-thin-managed-experimental-linux-x86_64.tar.gz -C electrum-lite-instalacion-nueva
 cd electrum-lite-instalacion-nueva/electrum-lite-thin-experimental
+python3 scripts/install-bitcoin-core.py
 mkdir -p "$HOME/.local/bin"
 install -m 755 bin/electrum-lite "$HOME/.local/bin/electrum-lite"
 "$HOME/.local/bin/electrum-lite" --version
@@ -107,9 +113,10 @@ ni una release oficial. Guarda una copia del binario anterior antes de sustituir
 
 ## 2. Instalar Bitcoin Core para las pruebas
 
-### Debian/LMDE limpio: instalar o actualizar Core
+### Debian/LMDE limpio: instalar o actualizar Core por separado
 
-Ejecuta como usuario normal (pedirá contraseña de `sudo` para paquetes):
+Las instrucciones anteriores ya lo hacen por defecto. Para hacerlo por separado,
+ejecuta como usuario normal (pedirá contraseña de `sudo` para paquetes):
 
 ```sh
 sudo apt-get update && sudo apt-get install -y curl ca-certificates && curl -fsSL https://raw.githubusercontent.com/AlbercoinDev/electrum-lite/main/scripts/install-bitcoin-core.sh -o /tmp/electrum-lite-core-install.sh && sh /tmp/electrum-lite-core-install.sh

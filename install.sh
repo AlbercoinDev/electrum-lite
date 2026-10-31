@@ -3,6 +3,7 @@ set -eu
 cd "$(dirname "$0")"
 command -v cargo >/dev/null || { echo 'Install Rust using https://rustup.rs first (see README.md).' >&2; exit 1; }
 cargo build --release --locked
+python3 scripts/install-bitcoin-core.py
 destination="${PREFIX:-$HOME/.local}/bin"
 mkdir -p "$destination"
 if [ -f "$destination/electrum-lite" ]; then
@@ -10,4 +11,4 @@ if [ -f "$destination/electrum-lite" ]; then
 fi
 install -m 755 target/release/electrum-lite "$destination/electrum-lite"
 "$destination/electrum-lite" --version
-echo "Installed in $destination; add this directory to PATH. No node or service was started."
+echo "Installed in $destination; add this directory to PATH. No node or service was started and no node data was modified."
