@@ -1,7 +1,7 @@
 # Electrum Lite — diseño y estado
 
-Versión `0.0.1-beta.1`, release `thin-v3-txnum-fast-2026-10-31.1`, formato de
-almacenamiento `thin-v3-txnum`. Aplicación nueva,
+Versión `0.0.1-beta.1`, release `thin-v4-txids-2026-11-01`, formato de
+almacenamiento `thin-v4-txids`. Aplicación nueva,
 desarrollada desde cero en Rust como un único paquete y con RocksDB como biblioteca
 genérica de almacenamiento.
 
@@ -85,7 +85,7 @@ validadas. No se garantiza seguir la velocidad de IBD ni un tamaño final.
   (no confundir el smoke TCP con GUI). Evidencia de regtest/Tor: `verification.md`.
 - Capacidad de mainnet, recursos, sincronización completa, ataques y energía.
 
-## Almacenamiento thin-v3-txnum
+## Almacenamiento thin-v4-txids
 
 Todos los enteros de las claves ordenables usan big-endian. Los importes binarios
 usan little-endian. `serialize(OutPoint)` usa el formato de consenso de Bitcoin.
@@ -98,23 +98,22 @@ usan little-endian. `serialize(OutPoint)` usa el formato de consenso de Bitcoin.
 | N | altura u32 | primer TxNum u32 + número de transacciones u32 |
 | T | prefijo TXID 8 B + TxNum u32 | vacío |
 | H | SHA256(script) 24 B + TxNum u32 | vacío |
-| C | outpoint 36 B | script hash 24 B + importe u64 (sin altura/posición) |
 | S | script hash 24 B + TXID 32 B + vout u32 | altura u32 + importe u64 |
 | P | último TxNum del trozo u32 | offsets/tamaños de hasta 64 transacciones |
 | U | altura u32 | preimágenes y marcadores de restauración de UTXO |
 
 Cada transacción recibe un `TxNum` secuencial global. Historial y búsqueda por
-TXID usan 4 B de TxNum en lugar de altura+posición. El UTXO se identifica por
-script y outpoint, de modo que `/rest/spenttxouts` permite borrarlo sin leer la
-fila `C` del prevout. Las colisiones del prefijo TXID se resuelven comparando el
-hash completo del registro B. Los duplicados históricos de TXID se conservan.
+TXID usan 4 B de TxNum. Los TXID completos viven en `txids.dat` (32 B por TxNum,
+append-only); `B` guarda solo la cabecera de 80 B. El UTXO se identifica por
+script y outpoint y `/rest/spenttxouts` evita leer prevouts. No existe tabla `C`.
+El parser de bloques usa `bitcoin_slices` sin deserializar el bloque completo.
 El hash de script usa 192 bits (24 B) y se invierte únicamente en la frontera
 Electrum. La probabilidad de colisión es despreciable; no hay post-filtrado.
 Cabecera, UTXO, historial, undo y tip se publican en un único WriteBatch durable.
-El commit rápido usa `/rest/spenttxouts` y no hace lecturas aleatorias de `C` por
-entrada. El undo guarda un marcador para las filas `S` gastadas y resuelve la
-altura original por `T` solo al revertir un bloque. El reinicio usa la
-recuperación WAL de RocksDB; no relee todos los bloques.
+El commit usa `/rest/spenttxouts` y no hace lecturas de prevouts. El undo guarda
+un marcador para las filas `S` gastadas y resuelve la altura original por `T` al
+revertir. En fast-sync no se escribe undo: la reorg reindexa el bloque obsoleto.
+El reinicio usa WAL de RocksDB; no relee todos los bloques.
 Un corte puede perder un sufijo del lote aún sin fsync; Core manualmente podado
 conserva esos bloques y el siguiente arranque los vuelve a leer. Nunca se poda
 automáticamente basándose en un cursor aún no sincronizado a disco.
@@ -126,25 +125,20 @@ reconstruir en otra raíz. No hay reparación silenciosa ni compatibilidad con S
 Lite detecta CPU/RAM/cgroup/disco y reserva margen para el sistema, Core y Tor.
 `--fast-sync` agrupa 32 bloques por `WriteBatch`, desactiva WAL/autocompacciones,
 hace flush periódico, omite Merkle/witness de bloques de Core, no genera `txpos`
-y usa `spenttxouts=auto` (C en Signet/regtest, REST en mainnet). Al alcanzar el
+y usa `/rest/spenttxouts` siempre; Core debe arrancar con `-rest=1`. Al alcanzar el
 tip hace flush y vuelve al modo normal.
 
 La reorg en fast-sync no usa undo: reindexa el bloque obsoleto, borra sus claves
 y restaura UTXO desde `spenttxouts`; requiere Core REST. `server.health` publica
 `index_rate`, `bulk`, `durable_height` y el último lote.
 
-## Fase 4 opcional: fuera del alcance de esta release
+## Fase 4 implementada
 
-Las siguientes optimizaciones se evaluaron y **no se incluyen** en esta release:
+- `txids.dat` plano con offset `txnum * 32`; copiado en snapshot/backup y truncado en reorg.
+- parser cero-copia con `bitcoin_slices` en la ruta de sincronización.
+- tabla `C` eliminada; prevouts desde `/rest/spenttxouts` y mempool con `gettxout` batched.
 
-- fichero plano de TXIDs (`txnum * 32`) para sustituir la parte de TXIDs del LSM;
-- parser cero-copia con `bitcoin_slices`;
-- eliminar por completo la tabla `C` y resolver la mempool con `gettxout`.
-
-Motivo: cambian el formato de almacenamiento o el modelo de consulta y exigen
-reindexado/migración y una nueva ronda de validación. No son necesarias para el
-objetivo actual (budget automático, fast-sync, lotes, reorg por reindexado y
-verificación selectiva). Quedan como trabajo futuro, no como deuda oculta.
+El formato pasa a `thin-v4-txids`: requiere raíz nueva, sin migración in-place.
 
 ## Concurrencia inicial
 

@@ -1,12 +1,9 @@
 use crate::{
     core::Core,
-    index::{key, script_hash, Index, ScriptHash},
+    index::{script_hash, Index, ScriptHash},
 };
 use anyhow::{ensure, Context, Result};
-use bitcoin::{
-    consensus::{deserialize, serialize},
-    OutPoint, Transaction, Txid,
-};
+use bitcoin::{consensus::deserialize, OutPoint, Transaction, Txid};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,7 +38,7 @@ impl Mempool {
             .map(|(fee, size)| json!([fee, size]))
             .collect::<Vec<_>>()))
     }
-    pub fn load(index: &Index, core: &Core) -> Result<Self> {
+    pub fn load(_index: &Index, core: &Core) -> Result<Self> {
         let ids = core.call("getrawmempool", json!([]))?;
         let ids = ids.as_array().context("mempool list")?;
         ensure!(
@@ -60,6 +57,23 @@ impl Mempool {
             ensure!(tx.compute_txid() == id, "mempool txid mismatch");
             m.raw.insert(id, tx);
         }
+        let mut confirmed_points = BTreeSet::new();
+        for tx in m.raw.values() {
+            for input in &tx.input {
+                if !m.raw.contains_key(&input.previous_output.txid) {
+                    confirmed_points.insert(input.previous_output);
+                }
+            }
+        }
+        let points: Vec<_> = confirmed_points.into_iter().collect();
+        let resolved = core.get_txouts(&points)?;
+        let confirmed: BTreeMap<_, _> = points
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|(point, value)| {
+                value.map(|(script, amount)| (point, (script_hash(&script), amount)))
+            })
+            .collect();
         let mut pending: BTreeSet<Txid> = m.raw.keys().copied().collect();
         while !pending.is_empty() {
             let before = pending.len();
@@ -90,15 +104,7 @@ impl Mempool {
                     let (s, v) = if let Some((s, v, _)) = m.outputs.get(&op) {
                         (*s, *v)
                     } else {
-                        let coin = index
-                            .db
-                            .get(key(b'C', &serialize(&op)))?
-                            .context("mempool prevout unavailable")?;
-                        ensure!(coin.len() == 32, "corrupt confirmed coin");
-                        (
-                            coin[..crate::index::SCRIPT_HASH_LEN].try_into()?,
-                            u64::from_le_bytes(coin[crate::index::SCRIPT_HASH_LEN..].try_into()?),
-                        )
+                        *confirmed.get(&op).context("mempool prevout unavailable")?
                     };
                     scripts.insert(s);
                     *m.delta.entry(s).or_default() -= i64::try_from(v)?;

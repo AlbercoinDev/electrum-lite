@@ -13,6 +13,7 @@ rust-bitcoin se utilizan como bibliotecas genéricas.
 | rustls / webpki-roots | 0.23 / 1.0 | Apache-2.0 OR ISC / MPL-2.0 |
 | socks | 0.3.4 | MIT OR Apache-2.0 |
 | libc | 0.2 | MIT OR Apache-2.0 |
+| bitcoin_slices | 0.12.1 | MIT |
 | clap | 4.6.7 | MIT OR Apache-2.0 |
 | anyhow | 1.0.100 | MIT OR Apache-2.0 |
 | serde_json | 1.0.154 | MIT OR Apache-2.0 |

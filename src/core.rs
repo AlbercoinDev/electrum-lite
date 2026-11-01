@@ -1,9 +1,11 @@
 use anyhow::{ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use bitcoin::{consensus::deserialize, Block};
+use bitcoin::{consensus::deserialize, Block, OutPoint};
 use serde_json::{json, Value};
 use std::{fs, io::Read, path::PathBuf, time::Duration};
 
+pub type TxOutInfo = (Vec<u8>, u64);
+pub type TxOutLookup = Option<TxOutInfo>;
 #[derive(Clone)]
 pub struct Core {
     pub url: String,
@@ -104,6 +106,15 @@ impl Core {
     pub fn rest(&self) -> Option<&crate::rest::Rest> {
         self.rest.as_deref()
     }
+    pub fn block_bytes(&self, hash: &str) -> Result<Vec<u8>> {
+        let parsed: bitcoin::BlockHash = hash.parse()?;
+        if let Some(rest) = &self.rest {
+            if let Ok(bytes) = rest.block_bytes(parsed) {
+                return Ok(bytes);
+            }
+        }
+        Ok(bitcoin::consensus::serialize(&self.block(hash)?))
+    }
     pub fn block_binary(&self, hash: &str) -> Result<Block> {
         let parsed: bitcoin::BlockHash = hash.parse()?;
         if let Some(rest) = &self.rest {
@@ -112,6 +123,72 @@ impl Core {
             }
         }
         self.block(hash)
+    }
+    /// Resolve confirmed UTXOs for mempool prevouts. `include_mempool=false`
+    /// keeps outputs that are unspent on-chain even if a mempool tx spends them.
+    pub fn get_txouts(&self, points: &[OutPoint]) -> Result<Vec<TxOutLookup>> {
+        let mut result = Vec::with_capacity(points.len());
+        for chunk in points.chunks(100) {
+            let requests: Vec<_> = chunk
+                .iter()
+                .enumerate()
+                .map(|(id, point)| {
+                    json!({
+                        "jsonrpc":"1.0",
+                        "id":id,
+                        "method":"gettxout",
+                        "params":[point.txid.to_string(), point.vout, false]
+                    })
+                })
+                .collect();
+            let auth = STANDARD.encode(fs::read_to_string(&self.cookie)?.trim());
+            let response = match self
+                .agent
+                .post(&self.url)
+                .set("Authorization", &format!("Basic {auth}"))
+                .send_json(json!(requests))
+            {
+                Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+                Err(e) => return Err(e.into()),
+            };
+            let mut bytes = Vec::new();
+            response
+                .into_reader()
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 4 * 1024 * 1024, "txout batch too large");
+            let replies: Vec<Value> = serde_json::from_slice(&bytes)?;
+            ensure!(replies.len() == chunk.len(), "incomplete txout batch");
+            let mut batch: Vec<Option<TxOutLookup>> = vec![None; chunk.len()];
+            for reply in replies {
+                let id: usize = reply["id"]
+                    .as_u64()
+                    .context("missing txout id")?
+                    .try_into()?;
+                ensure!(id < chunk.len() && batch[id].is_none(), "invalid txout id");
+                ensure!(reply["error"].is_null(), "gettxout failed");
+                let value = &reply["result"];
+                batch[id] = Some(if value.is_null() {
+                    None
+                } else {
+                    let script = value["scriptPubKey"]["hex"]
+                        .as_str()
+                        .context("missing txout script")?;
+                    let btc = value["value"].as_f64().context("missing txout value")?;
+                    Some((
+                        hex::decode(script)?,
+                        bitcoin::Amount::from_btc(btc)?.to_sat(),
+                    ))
+                });
+            }
+            result.extend(
+                batch
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .context("incomplete txout batch")?,
+            );
+        }
+        Ok(result)
     }
     pub fn block(&self, hash: &str) -> Result<Block> {
         let v = self.call("getblock", json!([hash, 0]))?;

@@ -9,7 +9,7 @@ antiguos los reconstruye Lite con una ventana ciega de bloques públicos.
 
 - Debian/Ubuntu x86-64, terminal.
 - 4 GB RAM mínimo; 2 vCPU mínimo.
-- 300 GB de disco para el índice `thin-v3-txnum` (~150-180 GB), Core podado
+- 300 GB de disco para el índice `thin-v4-txids` (~150-180 GB), Core podado
   (~15 GB), caché (~3 GB) y margen de compactación.
 - SSD/NVMe recomendado. HDD SATA soportado, incluido 2,5" 5400 rpm, con más
   latencia en consultas en frío. Evitar discos SMR: las pausas de escritura
@@ -63,7 +63,7 @@ Puedes sobrescribirlo con `--cpu-budget`, `--memory-budget-mib`,
 
 `--fast-sync` usa lotes de 32 bloques, WAL/compacciones off, flush periódico,
 verificación hash-only para bloques de Core, `txpos` off y
-`spenttxouts=auto` (C en Signet/regtest, REST en mainnet). Al alcanzar el tip
+`/rest/spenttxouts` siempre; Core debe arrancar con `-rest=1`. Al alcanzar el tip
 vuelve al modo normal. El sufijo no flusheado se recupera desde Core.
 
 ## Perfil de almacenamiento
@@ -153,7 +153,7 @@ La ventana oculta el bloque exacto, no el patrón global de consultas.
   la primera vez (ventana + Tor); después se sirve de caché.
 - Sin backup, un fallo del disco implica re-IBD completo.
 
-## Actualización a `thin-v3-txnum`
+## Actualización a `thin-v4-txids`
 
 Esta release no migra índices `thin-v1`/`thin-v2` en el sitio. Detén el servicio,
 conserva el índice y el binario antiguos, y arranca con un data-dir nuevo. Si el

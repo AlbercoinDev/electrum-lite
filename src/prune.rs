@@ -123,10 +123,7 @@ mod tests {
         let index = Index::open(&root.join("index"), Network::Regtest)?;
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
         let hash = genesis.block_hash().to_string();
-        let mut meta = bitcoin::consensus::serialize(&genesis.header);
-        meta.extend(bitcoin::consensus::serialize(
-            &genesis.txdata[0].compute_txid(),
-        ));
+        let meta = bitcoin::consensus::serialize(&genesis.header);
         index.db.put(crate::index::height_key(b'B', 1000), meta)?;
         index.db.put(b"tip", 1000u32.to_be_bytes())?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -220,10 +217,7 @@ mod tests {
         std::fs::create_dir(&root)?;
         let index = Index::open(&root.join("index"), Network::Regtest)?;
         let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
-        let mut meta = bitcoin::consensus::serialize(&genesis.header);
-        meta.extend(bitcoin::consensus::serialize(
-            &genesis.txdata[0].compute_txid(),
-        ));
+        let meta = bitcoin::consensus::serialize(&genesis.header);
         index.db.put(crate::index::height_key(b'B', 1000), meta)?;
         index.db.put(b"tip", 1000u32.to_be_bytes())?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

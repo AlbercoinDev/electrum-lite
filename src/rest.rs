@@ -55,11 +55,14 @@ impl Rest {
         Ok(())
     }
 
-    pub fn block(&self, hash: BlockHash) -> Result<Block> {
+    pub fn block_bytes(&self, hash: BlockHash) -> Result<Vec<u8>> {
         let bytes = self.get(&format!("/rest/block/{hash}.bin"), 8 * 1024 * 1024)?;
         let block: Block = deserialize(&bytes)?;
         ensure!(block.block_hash() == hash, "REST block hash mismatch");
-        Ok(block)
+        Ok(bytes)
+    }
+    pub fn block(&self, hash: BlockHash) -> Result<Block> {
+        Ok(deserialize(&self.block_bytes(hash)?)?)
     }
 
     pub fn block_hash_by_height(&self, height: u32) -> Result<BlockHash> {

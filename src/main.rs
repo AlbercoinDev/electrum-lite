@@ -40,9 +40,6 @@ struct Args {
     /// Generate transaction offsets (txpos) during indexing.
     #[arg(long, default_value = "off", value_parser = ["off", "on"])]
     txpos: String,
-    /// Spent-output source: auto (C on Signet/regtest, REST on mainnet), always or never.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "always", "never"])]
-    spent_txouts: String,
     /// Override detected index workers.
     #[arg(long)]
     index_threads: Option<usize>,
@@ -262,8 +259,6 @@ fn run() -> Result<()> {
     let verify_core =
         std::env::var("ELECTRUM_LITE_VERIFY_CORE").unwrap_or_else(|_| a.verify_core.clone());
     let txpos = std::env::var("ELECTRUM_LITE_TXPOS").unwrap_or_else(|_| a.txpos.clone());
-    let spent_mode =
-        std::env::var("ELECTRUM_LITE_SPENT_TXOUTS").unwrap_or_else(|_| a.spent_txouts.clone());
     let index_workers = std::env::var("ELECTRUM_LITE_INDEX_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -273,7 +268,6 @@ fn run() -> Result<()> {
     }
     std::env::set_var("ELECTRUM_LITE_VERIFY_CORE", &verify_core);
     std::env::set_var("ELECTRUM_LITE_TXPOS", &txpos);
-    std::env::set_var("ELECTRUM_LITE_SPENT_TXOUTS", &spent_mode);
     std::env::set_var("ELECTRUM_LITE_INDEX_THREADS", index_workers.to_string());
     if let Some(cpu) = a.cpu_budget {
         std::env::set_var("ELECTRUM_LITE_CPU_BUDGET", cpu.to_string());
@@ -360,11 +354,6 @@ fn run() -> Result<()> {
             electrum_lite::index::VerifyCore::Hash
         },
         txpos: txpos == "on",
-        spent_mode: match spent_mode.as_str() {
-            "always" => electrum_lite::index::SpentMode::Always,
-            "never" => electrum_lite::index::SpentMode::Never,
-            _ => electrum_lite::index::SpentMode::Auto,
-        },
     };
     let mut index = if let Some(snapshot) = &a.snapshot_dir {
         let metadata = std::fs::symlink_metadata(snapshot)?;

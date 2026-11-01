@@ -72,6 +72,36 @@ def main():
         class Proxy(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
+            def do_GET(self):
+                path = self.path
+                if path.startswith("/rest/block/") and hold_audit.is_set():
+                    audit_waiting.set()
+                    if not release_audit.wait(timeout=20):
+                        raise RuntimeError("audit test gate timed out")
+                if hide_blocks and path.startswith("/rest/block/"):
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{rpcport}{path}",
+                    headers={"Authorization": self.headers.get("Authorization", "")},
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=30) as r:
+                        body = r.read()
+                        content_type = r.headers.get("Content-Type", "application/octet-stream")
+                        status = r.status
+                except urllib.error.HTTPError as e:
+                    body = e.read()
+                    content_type = e.headers.get("Content-Type", "application/octet-stream")
+                    status = e.code
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Type", content_type)
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_POST(self):
                 data = self.rfile.read(int(self.headers["Content-Length"]))
                 message = json.loads(data)
@@ -108,7 +138,7 @@ def main():
                     raise RuntimeError(r["error"])
                 return r["result"]
         try:
-            launch([a.bitcoind, "-regtest", f"-datadir={core_dir}", f"-rpcport={rpcport}", f"-port={p2pport}", "-server=1", "-listen=1", f"-bind=127.0.0.1:{p2pport}", "-connect=0", "-dnsseed=0", "-discover=0", "-prune=1", "-fallbackfee=0.00001"], "core")
+            launch([a.bitcoind, "-regtest", f"-datadir={core_dir}", f"-rpcport={rpcport}", f"-port={p2pport}", "-server=1", "-listen=1", f"-bind=127.0.0.1:{p2pport}", "-connect=0", "-dnsseed=0", "-discover=0", "-prune=1", "-rest=1", "-fallbackfee=0.00001"], "core")
             wait(lambda: cli("getblockcount") == 0, "Core startup")
             cli("createwallet", "smoke")
             miner = cli("getnewaddress")

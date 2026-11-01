@@ -95,7 +95,7 @@ fn owned_pair(fields: &BTreeMap<String, String>, maintenance: &Path) -> Result<(
 }
 
 fn known_file(name: &str) -> bool {
-    if matches!(name, "CURRENT" | "IDENTITY" | "LOCK" | "LOG") {
+    if matches!(name, "CURRENT" | "IDENTITY" | "LOCK" | "LOG" | "txids.dat") {
         return true;
     }
     if let Some(s) = name.strip_prefix("LOG.old.") {
@@ -284,6 +284,7 @@ fn verify_identity_and_tip(audit: &Path, backup: &Path, expected_identity: &[u8]
 }
 
 fn verify_current(audit: &Path, backup: &Path, expected_identity: &[u8]) -> Result<()> {
+    let (audit_path, backup_path) = (audit, backup);
     let audit = DB::open_for_read_only(&Options::default(), audit, false)?;
     let backup = DB::open_for_read_only(&Options::default(), backup, false)?;
     ensure!(
@@ -295,6 +296,13 @@ fn verify_current(audit: &Path, backup: &Path, expected_identity: &[u8]) -> Resu
     ensure!(
         audit.get(b"tip")?.as_deref() == Some(tip.as_slice()),
         "retention generation tips differ"
+    );
+    ensure!(
+        crate::index::files_equal(
+            &audit_path.join("txids.dat"),
+            &backup_path.join("txids.dat")
+        )?,
+        "retention txids differ"
     );
     let mut a = audit
         .iterator(IteratorMode::Start)
@@ -519,6 +527,7 @@ mod tests {
         db.put(b"tip", 1000u32.to_be_bytes())?;
         db.put(b"data", value)?;
         drop(db);
+        fs::write(path.join("txids.dat"), b"")?;
         Ok(())
     }
 

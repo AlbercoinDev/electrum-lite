@@ -1,7 +1,7 @@
 # Electrum Lite — servidor thin experimental
 
 **Versión `0.0.1-beta.1`.** Release experimental actual:
-[**`thin-v3-txnum-fast-2026-10-31.1`**](https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31.1).
+[**`thin-v4-txids-2026-11-01`**](https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v4-txids-2026-11-01).
 Servidor Electrum en Rust construido desde cero:
 Core valida, RocksDB conserva índices y los bloques históricos ausentes se obtienen
 completos por P2P. Tor opcional. Para bloques que Core ya podó, Lite pide el bloque crudo a Esplora/onion: nunca envía scripthashes ni TXID.
@@ -134,10 +134,9 @@ Comprobación desde otra terminal:
 python3 scripts/query.py server.health
 ```
 
-### Actualizar desde `thin-v1` o `thin-v2`
+### Actualizar desde `thin-v1`, `thin-v2` o `thin-v3`
 
-La release actual usa **`thin-v3-txnum`** (TxNum/txpos y commit con
-`/rest/spenttxouts`). **No hay migración in-place**: un índice antiguo se rechaza
+La release actual usa **`thin-v4-txids`** (TXIDs en fichero plano, TxNum/txpos, `bitcoin_slices` y sin tabla `C`). **No hay migración in-place**: un índice antiguo se rechaza
 con `wrong network or database format`. No borres el índice anterior; muévelo a
 otra ruta y conserva el binario antiguo junto a él.
 
@@ -572,7 +571,7 @@ electrum-lite --network regtest --data-dir /ruta/lite \
 El checkpoint es el directorio del índice, no el data root. Para restaurarlo,
 con Lite detenido, copia a **OTRA** raíz: `/otra-raiz/regtest/index`, conservando
 fuente y backup. Sirve con `--data-dir /otra-raiz`. Nunca mezcles generaciones ni
-abras thin-v3-txnum con un binario incompatible. Conserva este binario con el backup.
+abras thin-v4-txids con un binario incompatible. Conserva este binario con el backup.
 Los hardlinks de un checkpoint no protegen frente a fallo del disco: copia fuera.
 
 La poda manual con auditoría completa es experimental. Solo un Core dedicado,
@@ -584,17 +583,20 @@ descargas históricas; sin backup externo no hay recuperación local.
 Si hay `prune-pending`, una operación anterior quedó incierta: conservar todo y
 revisar/recuperar antes de continuar. No borrar el marcador para eludir el bloqueo.
 
-## Fase 4 opcional no incluida
+## Fase 4 implementada
 
-El fichero plano de TXIDs, el parser `bitcoin_slices` y la eliminación completa de
-la tabla `C` no forman parte de esta release. Requieren otro formato/migración y
-validación adicional; se documentan como trabajo futuro. Lo incluido y probado
-es el presupuesto automático, `--fast-sync`, lotes de 32 bloques, reorg por
-reindexado y verificación selectiva de Core.
+El formato `thin-v4-txids` incluye el fichero plano `txids.dat` (`txnum * 32`),
+el parser cero-copia `bitcoin_slices` en el camino de sincronización y la
+eliminación completa de la tabla `C`. Los prevouts se obtienen de
+`/rest/spenttxouts`; por eso **Core debe arrancar con `-rest=1`** para indexar.
+La mempool resuelve prevouts confirmados con `gettxout` batched.
+
+`txids.dat` se copia en snapshots/backups y se trunca en reorgs. No hay tabla
+`C`, por lo que no existe el antiguo índice outpoint→script.
 
 ## Límites importantes
 
-- Índice `thin-v3-txnum` (hash de script de 24 B, TxNum y txpos), lotes de hasta 512 bloques, pipeline de dos lectores, REST binario local y commit con `/rest/spenttxouts` sin leer prevouts. Sin backup integrado obligatorio: la recuperación es re-IBD.
+- Índice `thin-v4-txids` (hash de script 24 B, TxNum/txpos, TXIDs en fichero plano), lotes de 32 bloques, parser `bitcoin_slices`, REST binario local y commit con `/rest/spenttxouts`; sin tabla `C`. Sin backup integrado obligatorio: la recuperación es re-IBD.
 - Reconstrucción histórica por ventana de 16 bloques, solo hashes de bloque, Tor/onion y verificación completa. Sin garantía de anonimato.
 - Mempool máximo 10000 transacciones / 32 MiB; fuera de presupuesto falla cerrado.
 - Historial/UTXO máximo 100000 resultados; error, nunca truncado.

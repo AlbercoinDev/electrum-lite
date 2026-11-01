@@ -448,13 +448,13 @@ La matriz de scripts, comandos y límites de ejecución está en
 [`testing.md`](testing.md). La disponibilidad de una herramienta no equivale a
 haber ejecutado o aprobado una prueba.
 
-## Revisión `thin-v3-txnum` (release `thin-v3-txnum-fast-2026-10-31.1`)
+## Revisión `thin-v4-txids` (release `thin-v4-txids-2026-11-01`)
 
 Release publicada:
-<https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v3-txnum-fast-2026-10-31.1>.
+<https://github.com/AlbercoinDev/electrum-lite/releases/tag/thin-v4-txids-2026-11-01>.
 Assets: binario `electrum-lite`, paquete tar.gz, checksum e
 `install-release.sh`. SHA256 del binario:
-`31817299545bf244feff70f0e00252f4b176f7264f6cebf06077b4c18ac487e3`.
+`802a0a6832fa4b1fa1ccdeb0b2343f19c4136ab715e9c39b1f858c5bfcaea908`.
 
 Se implementaron el motor local, el esquema de 24 B, la reconstrucción por
 ventana ciega, el perfil HDD/4 GB y la coordinación de poda mainnet. Evidencia
@@ -480,9 +480,10 @@ lote y commit individual, y reorg en fast-sync reindexando el bloque obsoleto
 con un Core REST simulado (`fast_sync_reorg_reindexes_stale_block`).
 
 La prueba unitaria `spent_txouts_avoid_prevout_reads_and_restore_on_rewind`
-borra la fila `C` del prevout antes del commit, indexa un gasto usando
-`SpentOut`, comprueba `tx_position` y revierte el bloque: el UTXO se restaura
-desde el marcador de undo sin haber leído `C`.
+indexa un gasto con `SpentOut`, comprueba `tx_position`, verifica el fichero
+plano de TXIDs y que no exista ninguna clave `C`, y revierte el bloque. La prueba
+`batched_and_single_commits_produce_identical_rows` compara el commit individual
+con el parser cero-copia `bitcoin_slices` y el commit por lotes.
 
 El smoke gestionado se ejecutó tanto con el modo normal como con
 `ELECTRUM_LITE_FAST_SYNC=1 ELECTRUM_LITE_VERIFY_CORE=hash ELECTRUM_LITE_TXPOS=off
